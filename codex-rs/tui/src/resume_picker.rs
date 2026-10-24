@@ -2144,6 +2144,11 @@ impl PickerState {
 }
 
 fn row_from_app_server_thread(thread: Thread) -> Option<Row> {
+    // SIDE is an implementation detail of the paired research workspace. Users resume MAIN;
+    // its independently durable SIDE is discovered and attached after MAIN finishes replaying.
+    if crate::app::is_persistent_side_thread(&thread) {
+        return None;
+    }
     let thread_id = match ThreadId::from_string(&thread.id) {
         Ok(thread_id) => thread_id,
         Err(err) => {
@@ -6925,9 +6930,9 @@ session_picker_view = "dense"
     }
 
     #[test]
-    fn app_server_row_keeps_pathless_threads() {
+    fn app_server_row_keeps_pathless_main_and_hides_side_threads() {
         let thread_id = ThreadId::new();
-        let thread = Thread {
+        let mut thread = Thread {
             originator: None,
             environments: None,
             id: thread_id.to_string(),
@@ -6962,11 +6967,21 @@ session_picker_view = "dense"
             turns: Vec::new(),
         };
 
-        let row = row_from_app_server_thread(thread).expect("row should be preserved");
+        let row = row_from_app_server_thread(thread.clone()).expect("row should be preserved");
 
         assert_eq!(row.path, None);
         assert_eq!(row.thread_id, Some(thread_id));
         assert_eq!(row.thread_name, Some(String::from("Named thread")));
+
+        thread.thread_source = Some(codex_app_server_protocol::ThreadSource::Feature(format!(
+            "{}:{thread_id}",
+            crate::app_server_session::PERSISTENT_SIDE_THREAD_SOURCE_PREFIX
+        )));
+        assert!(row_from_app_server_thread(thread.clone()).is_none());
+
+        thread.thread_source = None;
+        thread.name = Some(format!("AI Lab SIDE · parent {thread_id}"));
+        assert!(row_from_app_server_thread(thread).is_none());
     }
 
     #[test]

@@ -188,7 +188,10 @@ fn wait_for_reflowed_screen(terminal: &mut PtyCodex, text: &str) -> Result<()> {
         let contents = terminal.screen_contents();
         let screen = contents
             .lines()
-            .map(|line| line.split_once('│').map_or(line, |(main, _)| main))
+            .map(|line| {
+                let panes = line.split('│').collect::<Vec<_>>();
+                if panes.len() >= 4 { panes[1] } else { panes[0] }
+            })
             .flat_map(str::split_whitespace)
             .collect::<String>();
         if screen.contains(&expected) {

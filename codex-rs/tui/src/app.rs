@@ -4,6 +4,7 @@
 //! the focused app submodules.
 
 pub(crate) use self::agents_overview::PendingWorktree;
+pub(crate) use self::side::is_persistent_side_thread;
 use crate::AppServerTarget;
 use crate::app_backtrack::BacktrackState;
 use crate::app_command::AppCommand;

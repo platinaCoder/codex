@@ -15,8 +15,23 @@ use crate::motion::MotionMode;
 use crate::pager_overlay::TranscriptHistoryState;
 use crate::transcript_view::ViewAction;
 use ratatui::widgets::Block;
+use ratatui::widgets::BorderType;
 use ratatui::widgets::Borders;
 use ratatui::widgets::Widget;
+
+const PAIRED_WORKSPACE_MIN_WIDTH: u16 = 48;
+const PAIRED_WORKSPACE_MIN_HEIGHT: u16 = 10;
+const PAIRED_WORKSPACE_OUTER_MARGIN: u16 = 1;
+const PAIRED_WORKSPACE_GAP: u16 = 2;
+
+fn paired_pane_inner(area: Rect) -> Rect {
+    Rect::new(
+        area.x.saturating_add(1),
+        area.y.saturating_add(1),
+        area.width.saturating_sub(2),
+        area.height.saturating_sub(2),
+    )
+}
 
 impl App {
     /// Copy draft selections before key shortcuts, or after mouse layout has been refreshed.
@@ -121,16 +136,27 @@ impl App {
         screen_size: Size,
     ) -> Result<Rect> {
         if let Some((main_thread_id, side_thread_id)) = self.paired_main_and_side()
-            && screen_size.width >= 40
-            && screen_size.height >= 8
+            && screen_size.width >= PAIRED_WORKSPACE_MIN_WIDTH
+            && screen_size.height >= PAIRED_WORKSPACE_MIN_HEIGHT
         {
-            let left_width = screen_size.width / 2;
-            let left = Rect::new(/*x*/ 0, /*y*/ 0, left_width, screen_size.height);
+            let workspace = Rect::new(
+                PAIRED_WORKSPACE_OUTER_MARGIN,
+                PAIRED_WORKSPACE_OUTER_MARGIN,
+                screen_size
+                    .width
+                    .saturating_sub(PAIRED_WORKSPACE_OUTER_MARGIN * 2),
+                screen_size
+                    .height
+                    .saturating_sub(PAIRED_WORKSPACE_OUTER_MARGIN * 2),
+            );
+            let pane_width = workspace.width.saturating_sub(PAIRED_WORKSPACE_GAP);
+            let left_width = pane_width / 2;
+            let left = Rect::new(workspace.x, workspace.y, left_width, workspace.height);
             let right = Rect::new(
-                left_width,
-                /*y*/ 0,
-                screen_size.width - left_width,
-                screen_size.height,
+                workspace.x + left_width + PAIRED_WORKSPACE_GAP,
+                workspace.y,
+                pane_width - left_width,
+                workspace.height,
             );
             let active_is_main = self.current_displayed_thread_id() == Some(main_thread_id);
             let (active_area, inactive_area, inactive_id, active_title, inactive_title) =
@@ -140,12 +166,7 @@ impl App {
                     (right, left, main_thread_id, "SIDE • focused", "MAIN")
                 };
             let mut inactive_state = self.paired_pane_states.remove(&inactive_id);
-            let active_inner = Rect::new(
-                active_area.x,
-                active_area.y + 1,
-                active_area.width,
-                active_area.height - 1,
-            );
+            let active_inner = paired_pane_inner(active_area);
             let result = self.render_owned_transcript_in_area(
                 tui,
                 screen_size,
@@ -276,7 +297,7 @@ impl App {
         let mut blossom_tick = None;
         let mut transcript_bottom = available.saturating_sub(u16::from(composer_gap.is_none()));
         if let Some(paired) = paired.as_mut() {
-            let width = paired.inactive_area.width.saturating_sub(1);
+            let width = paired_pane_inner(paired.inactive_area).width;
             if let Some(state) = paired.state.as_mut() {
                 state
                     .transcript_view
@@ -287,26 +308,14 @@ impl App {
         tui.draw(screen_size.height, |frame| {
             if let Some(paired) = paired.as_mut() {
                 let area = paired.inactive_area;
-                let divider = if area.x == 0 {
-                    Borders::RIGHT
-                } else {
-                    Borders::LEFT
-                };
                 ratatui::widgets::Clear.render(area, frame.buffer);
-                Block::default().borders(divider).render(area, frame.buffer);
-                ratatui::widgets::Paragraph::new(
-                    ratatui::text::Line::from(format!(" {} ", paired.inactive_title)).dim(),
-                )
-                .render(
-                    Rect::new(area.x + 1, area.y, area.width.saturating_sub(1), 1),
-                    frame.buffer,
-                );
-                let inner = Rect::new(
-                    area.x + 1,
-                    area.y + 1,
-                    area.width.saturating_sub(1),
-                    area.height.saturating_sub(1),
-                );
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(ratatui::style::Style::default().dim())
+                    .title(ratatui::text::Line::from(format!(" {} ", paired.inactive_title)).dim())
+                    .render(area, frame.buffer);
+                let inner = paired_pane_inner(area);
                 if let Some(state) = paired.state.as_mut() {
                     state
                         .transcript_view
@@ -319,30 +328,26 @@ impl App {
                     .wrap(ratatui::widgets::Wrap { trim: false })
                     .render(
                         Rect::new(
-                            area.x + 2,
-                            area.y + 2,
-                            area.width.saturating_sub(3),
-                            area.height.saturating_sub(2),
+                            inner.x + 1,
+                            inner.y + 1,
+                            inner.width.saturating_sub(2),
+                            inner.height.saturating_sub(2),
                         ),
                         frame.buffer,
                     );
                 }
-                ratatui::widgets::Paragraph::new(
-                    ratatui::text::Line::from(format!(
-                        " {} · ctrl+h/j/k/l focus ",
-                        paired.active_title
-                    ))
-                    .bold(),
-                )
-                .render(
-                    Rect::new(
-                        paired.active_area.x,
-                        paired.active_area.y,
-                        paired.active_area.width,
-                        /*height*/ 1,
-                    ),
-                    frame.buffer,
-                );
+                ratatui::widgets::Clear.render(paired.active_area, frame.buffer);
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .title(
+                        ratatui::text::Line::from(format!(
+                            " {} · ctrl+h/j/k/l focus ",
+                            paired.active_title
+                        ))
+                        .bold(),
+                    )
+                    .render(paired.active_area, frame.buffer);
             }
             chat_widget.rendered_selection.borrow_mut().areas.clear();
             ratatui::widgets::Clear.render(

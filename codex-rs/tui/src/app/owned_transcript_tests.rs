@@ -107,6 +107,11 @@ async fn paired_workspace_renders_main_and_side_in_one_frame() -> Result<()> {
     assert!(rendered.contains("SIDE_VISIBLE_MARKER"), "{rendered}");
     assert!(rendered.contains("MAIN • focused"), "{rendered}");
     assert!(rendered.contains("SIDE"), "{rendered}");
+    assert!(rendered.contains('╭'), "{rendered}");
+    assert!(rendered.contains('╮'), "{rendered}");
+    assert!(rendered.contains('╰'), "{rendered}");
+    assert!(rendered.contains('╯'), "{rendered}");
+    assert!(rendered.lines().next().is_some_and(str::is_empty));
     tui.set_owned_screen(/*owned*/ false)?;
     Ok(())
 }

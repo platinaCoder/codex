@@ -52,6 +52,19 @@ Do not modify files, source, git state, permissions, configuration, or any other
 
 You may instruct the paired main thread by calling send_message_to_thread with the MAIN thread id supplied below. Use that channel for concrete advice, corrections, requests, or conclusions that MAIN should act on. Do not pretend that a message was delivered unless the tool succeeds."#;
 
+pub(crate) fn is_persistent_side_thread(thread: &codex_app_server_protocol::Thread) -> bool {
+    matches!(
+        thread.thread_source.as_ref(),
+        Some(ThreadSource::Feature(source))
+            if source
+                .strip_prefix(PERSISTENT_SIDE_THREAD_SOURCE_PREFIX)
+                .is_some_and(|suffix| suffix.starts_with(':'))
+    ) || thread
+        .name
+        .as_deref()
+        .is_some_and(|name| name.starts_with(SIDE_THREAD_NAME_PREFIX))
+}
+
 fn upsert_projected_item(
     items: &mut Vec<((String, String), ThreadItem)>,
     turn_id: &str,
@@ -429,8 +442,7 @@ impl App {
             if let Some(side_thread_id) = response.data.into_iter().find_map(|thread| {
                 let is_marked_side = matches!(
                     thread.thread_source.as_ref(),
-                    Some(ThreadSource::Feature(source))
-                        if source == &source_marker
+                    Some(ThreadSource::Feature(source)) if source == &source_marker
                 );
                 ((is_marked_side || thread.name.as_deref() == Some(name.as_str()))
                     && thread
