@@ -133,34 +133,35 @@ impl App {
                 screen_size.height,
             );
             let active_is_main = self.current_displayed_thread_id() == Some(main_thread_id);
-            let (active_area, inactive_area, inactive_id) = if active_is_main {
-                (left, right, side_thread_id)
-            } else {
-                (right, left, main_thread_id)
-            };
-            self.render_inactive_paired_pane(
-                tui,
-                inactive_area,
-                inactive_id,
-                if active_is_main { "SIDE" } else { "MAIN" },
-            )?;
-            self.render_paired_pane_header(
-                tui,
-                active_area,
+            let (active_area, inactive_area, inactive_id, active_title, inactive_title) =
                 if active_is_main {
-                    "MAIN • focused"
+                    (left, right, side_thread_id, "MAIN • focused", "SIDE")
                 } else {
-                    "SIDE • focused"
-                },
-                /*focused*/ true,
-            )?;
+                    (right, left, main_thread_id, "SIDE • focused", "MAIN")
+                };
+            let mut inactive_state = self.paired_pane_states.remove(&inactive_id);
             let active_inner = Rect::new(
                 active_area.x,
                 active_area.y + 1,
                 active_area.width,
                 active_area.height - 1,
             );
-            return self.render_owned_transcript_in_area(tui, screen_size, active_inner);
+            let result = self.render_owned_transcript_in_area(
+                tui,
+                screen_size,
+                active_inner,
+                Some(PairedPaneRender {
+                    state: inactive_state.as_mut(),
+                    active_area,
+                    inactive_area,
+                    active_title,
+                    inactive_title,
+                }),
+            );
+            if let Some(inactive_state) = inactive_state {
+                self.paired_pane_states.insert(inactive_id, inactive_state);
+            }
+            return result;
         }
         self.render_owned_transcript_in_area(
             tui,
@@ -171,87 +172,8 @@ impl App {
                 screen_size.width,
                 screen_size.height,
             ),
+            None,
         )
-    }
-
-    fn render_paired_pane_header(
-        &mut self,
-        tui: &mut tui::Tui,
-        area: Rect,
-        title: &str,
-        focused: bool,
-    ) -> Result<()> {
-        let title = if focused {
-            ratatui::text::Line::from(format!(" {title} · ctrl+h/j/k/l focus ")).bold()
-        } else {
-            ratatui::text::Line::from(format!(" {title} ")).dim()
-        };
-        tui.draw(area.height, |frame| {
-            ratatui::widgets::Paragraph::new(title).render(
-                Rect::new(area.x, area.y, area.width, /*height*/ 1),
-                frame.buffer,
-            );
-        })?;
-        Ok(())
-    }
-
-    fn render_inactive_paired_pane(
-        &mut self,
-        tui: &mut tui::Tui,
-        area: Rect,
-        thread_id: ThreadId,
-        title: &str,
-    ) -> Result<()> {
-        let divider = if area.x == 0 {
-            Borders::RIGHT
-        } else {
-            Borders::LEFT
-        };
-        let Some(state) = self.paired_pane_states.get_mut(&thread_id) else {
-            tui.draw(area.height, |frame| {
-                Block::default().borders(divider).render(area, frame.buffer);
-                ratatui::widgets::Paragraph::new(
-                    ratatui::text::Line::from(format!(" {title} ")).dim(),
-                )
-                .render(
-                    Rect::new(area.x + 1, area.y, area.width.saturating_sub(1), 1),
-                    frame.buffer,
-                );
-                ratatui::widgets::Paragraph::new(
-                    "Persistent chat is ready. Focus this pane to load its transcript.",
-                )
-                .dim()
-                .wrap(ratatui::widgets::Wrap { trim: false })
-                .render(
-                    Rect::new(
-                        area.x + 2,
-                        area.y + 2,
-                        area.width.saturating_sub(3),
-                        area.height.saturating_sub(2),
-                    ),
-                    frame.buffer,
-                );
-            })?;
-            return Ok(());
-        };
-        let inner = Rect::new(
-            area.x + 1,
-            area.y + 1,
-            area.width.saturating_sub(1),
-            area.height.saturating_sub(1),
-        );
-        tui.draw(area.height, |frame| {
-            Block::default().borders(divider).render(area, frame.buffer);
-            ratatui::widgets::Paragraph::new(ratatui::text::Line::from(format!(" {title} ")).dim())
-                .render(
-                    Rect::new(area.x + 1, area.y, area.width.saturating_sub(1), 1),
-                    frame.buffer,
-                );
-            state
-                .transcript_view
-                .render(inner, frame.buffer, &state.transcript_cells);
-        })?;
-        Ok(())
     }
 
     fn render_owned_transcript_in_area(
@@ -259,6 +181,7 @@ impl App {
         tui: &mut tui::Tui,
         screen_size: Size,
         pane: Rect,
+        mut paired: Option<PairedPaneRender<'_>>,
     ) -> Result<Rect> {
         self.chat_widget.sync_warnings(&self.transcript_cells);
         let motion = MotionMode::from_animations_enabled(
@@ -352,7 +275,75 @@ impl App {
         let mut feedback_tick = None;
         let mut blossom_tick = None;
         let mut transcript_bottom = available.saturating_sub(u16::from(composer_gap.is_none()));
+        if let Some(paired) = paired.as_mut() {
+            let width = paired.inactive_area.width.saturating_sub(1);
+            if let Some(state) = paired.state.as_mut() {
+                state
+                    .transcript_view
+                    .sync_history_tail(&state.transcript_cells);
+                state.transcript_view.prepare_width(width);
+            }
+        }
         tui.draw(screen_size.height, |frame| {
+            if let Some(paired) = paired.as_mut() {
+                let area = paired.inactive_area;
+                let divider = if area.x == 0 {
+                    Borders::RIGHT
+                } else {
+                    Borders::LEFT
+                };
+                ratatui::widgets::Clear.render(area, frame.buffer);
+                Block::default().borders(divider).render(area, frame.buffer);
+                ratatui::widgets::Paragraph::new(
+                    ratatui::text::Line::from(format!(" {} ", paired.inactive_title)).dim(),
+                )
+                .render(
+                    Rect::new(area.x + 1, area.y, area.width.saturating_sub(1), 1),
+                    frame.buffer,
+                );
+                let inner = Rect::new(
+                    area.x + 1,
+                    area.y + 1,
+                    area.width.saturating_sub(1),
+                    area.height.saturating_sub(1),
+                );
+                if let Some(state) = paired.state.as_mut() {
+                    state
+                        .transcript_view
+                        .render(inner, frame.buffer, &state.transcript_cells);
+                } else {
+                    ratatui::widgets::Paragraph::new(
+                        "Persistent chat is ready. Loading its transcript…",
+                    )
+                    .dim()
+                    .wrap(ratatui::widgets::Wrap { trim: false })
+                    .render(
+                        Rect::new(
+                            area.x + 2,
+                            area.y + 2,
+                            area.width.saturating_sub(3),
+                            area.height.saturating_sub(2),
+                        ),
+                        frame.buffer,
+                    );
+                }
+                ratatui::widgets::Paragraph::new(
+                    ratatui::text::Line::from(format!(
+                        " {} · ctrl+h/j/k/l focus ",
+                        paired.active_title
+                    ))
+                    .bold(),
+                )
+                .render(
+                    Rect::new(
+                        paired.active_area.x,
+                        paired.active_area.y,
+                        paired.active_area.width,
+                        /*height*/ 1,
+                    ),
+                    frame.buffer,
+                );
+            }
             chat_widget.rendered_selection.borrow_mut().areas.clear();
             ratatui::widgets::Clear.render(
                 Rect::new(pane.x, pane.y, pane.width, available),

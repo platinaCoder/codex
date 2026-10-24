@@ -1227,6 +1227,16 @@ impl App {
         } else if previous_pending_status.is_some() {
             self.clear_side_parent_action_status(thread_id);
         }
+        if self.current_displayed_thread_id() != Some(thread_id)
+            && self.paired_pane_states.contains_key(&thread_id)
+            && self.pending_paired_pane_refreshes.insert(thread_id)
+        {
+            let app_event_tx = self.app_event_tx.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(tui::TARGET_FRAME_INTERVAL).await;
+                app_event_tx.send(AppEvent::RefreshPairedPane { thread_id });
+            });
+        }
         self.refresh_pending_thread_approvals().await;
         Ok(())
     }

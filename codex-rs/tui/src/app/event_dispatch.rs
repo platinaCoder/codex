@@ -3146,6 +3146,11 @@ impl App {
                     tracing::warn!(%err, %side_thread_id, "failed to sync MAIN context into SIDE");
                 }
             }
+            AppEvent::RefreshPairedPane { thread_id } => {
+                self.pending_paired_pane_refreshes.remove(&thread_id);
+                self.refresh_paired_pane_projection(thread_id).await;
+                tui.frame_requester().schedule_frame();
+            }
             AppEvent::OpenSkillsList => {
                 self.chat_widget.open_skills_list();
             }

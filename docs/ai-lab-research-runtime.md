@@ -6,6 +6,8 @@ This fork turns the Codex TUI into the runtime shell for the AI Lab. The change 
 
 Every new or resumed primary conversation is paired with a durable SIDE conversation. The panes are displayed next to each other when the terminal is at least 40 columns wide and 8 rows tall.
 
+Both panes are painted in the same terminal frame. The unfocused pane remains visible and receives a live read-only projection of its persisted thread events, including streamed assistant text, reasoning summaries, plans, and tool lifecycle items. A task can therefore keep running visibly in MAIN while keyboard input is focused in SIDE, and vice versa.
+
 - MAIN and SIDE have different UUIDv7 thread IDs, rollout histories, runtime state, drafts, and transcript view state.
 - The SIDE records the MAIN UUID only as pairing metadata. Closing Codex or returning focus to MAIN does not delete SIDE.
 - New SIDE threads carry a persisted `ai_lab_side:<MAIN_UUID>` thread-source marker. Older SIDE threads can still be recovered from their generated `AI Lab SIDE · parent <UUID>` title.

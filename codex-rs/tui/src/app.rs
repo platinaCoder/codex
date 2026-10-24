@@ -539,6 +539,14 @@ struct PairedPaneState {
     transcript_cells: Vec<Arc<dyn HistoryCell>>,
 }
 
+struct PairedPaneRender<'a> {
+    state: Option<&'a mut PairedPaneState>,
+    active_area: Rect,
+    inactive_area: Rect,
+    active_title: &'static str,
+    inactive_title: &'static str,
+}
+
 pub(crate) struct App {
     feature_write_lock: Arc<tokio::sync::Mutex<()>>,
     config_notification_test_generation: u64,
@@ -648,6 +656,8 @@ pub(crate) struct App {
     abandoned_side_threads: HashSet<ThreadId>,
     /// UI state is independent per durable MAIN/SIDE thread, just like their histories.
     paired_pane_states: HashMap<ThreadId, PairedPaneState>,
+    /// Coalesce background transcript projection work to the terminal frame cadence.
+    pending_paired_pane_refreshes: HashSet<ThreadId>,
     /// AI Lab runtime default: every primary chat owns an independent durable SIDE.
     research_workspace_enabled: bool,
     active_thread_id: Option<ThreadId>,

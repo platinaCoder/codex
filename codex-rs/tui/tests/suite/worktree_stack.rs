@@ -142,14 +142,17 @@ async fn picker_side_worktree_fork_and_cd_run_on_the_production_stack() -> Resul
     let forked = wait_for_owned_worktrees(&mut terminal, &worktrees, &root, /*count*/ 1)?;
     // The header changes before the queued history replay has finished attaching.
     // Wait for the transition acknowledgement before submitting another command.
-    terminal.wait_for_screen(&format!(
-        "Working directory changed to: {}",
-        forked[0].root.display()
-    ))?;
+    wait_for_reflowed_screen(
+        &mut terminal,
+        &format!("Working directory changed to: {}", forked[0].root.display()),
+    )?;
     terminal.ensure_running()?;
 
     submit(&mut terminal, &format!("/cd {}", root.display()))?;
-    terminal.wait_for_screen(&format!("Working directory changed to: {}", root.display()))?;
+    wait_for_reflowed_screen(
+        &mut terminal,
+        &format!("Working directory changed to: {}", root.display()),
+    )?;
     terminal.ensure_running()?;
 
     submit(&mut terminal, "/worktree")?;
@@ -169,12 +172,35 @@ async fn picker_side_worktree_fork_and_cd_run_on_the_production_stack() -> Resul
         worktrees.owner(&forked[0].root)? != worktrees.owner(&second.root)?,
         "new worktree reused the forked thread owner"
     );
-    terminal.wait_for_screen(&format!(
-        "Working directory changed to: {}",
-        second.root.display()
-    ))?;
+    wait_for_reflowed_screen(
+        &mut terminal,
+        &format!("Working directory changed to: {}", second.root.display()),
+    )?;
     terminal.ensure_running()?;
     Ok(())
+}
+
+fn wait_for_reflowed_screen(terminal: &mut PtyCodex, text: &str) -> Result<()> {
+    let expected = text.split_whitespace().collect::<String>();
+    let deadline = Instant::now() + Duration::from_secs(/*secs*/ 30);
+    loop {
+        terminal.read_output(Duration::from_millis(/*millis*/ 50))?;
+        let contents = terminal.screen_contents();
+        let screen = contents
+            .lines()
+            .map(|line| line.split_once('│').map_or(line, |(main, _)| main))
+            .flat_map(str::split_whitespace)
+            .collect::<String>();
+        if screen.contains(&expected) {
+            return Ok(());
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "missing reflowed {text:?}; screen:\n{}",
+            terminal.screen_contents()
+        );
+        terminal.ensure_running()?;
+    }
 }
 
 fn submit(terminal: &mut PtyCodex, input: &str) -> Result<()> {

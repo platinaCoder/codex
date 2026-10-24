@@ -52,6 +52,111 @@ Do not modify files, source, git state, permissions, configuration, or any other
 
 You may instruct the paired main thread by calling send_message_to_thread with the MAIN thread id supplied below. Use that channel for concrete advice, corrections, requests, or conclusions that MAIN should act on. Do not pretend that a message was delivered unless the tool succeeds."#;
 
+fn upsert_projected_item(
+    items: &mut Vec<((String, String), ThreadItem)>,
+    turn_id: &str,
+    item: ThreadItem,
+) {
+    let key = (turn_id.to_string(), item.id().to_string());
+    if let Some((_, existing)) = items.iter_mut().find(|(candidate, _)| *candidate == key) {
+        *existing = item;
+    } else {
+        items.push((key, item));
+    }
+}
+
+fn projected_items(snapshot: &ThreadEventSnapshot) -> Vec<ThreadItem> {
+    let mut items = Vec::new();
+    for turn in &snapshot.turns {
+        for item in &turn.items {
+            upsert_projected_item(&mut items, &turn.id, item.clone());
+        }
+    }
+    for event in &snapshot.events {
+        let ThreadBufferedEvent::Notification(notification) = event else {
+            continue;
+        };
+        match notification.as_ref() {
+            ServerNotification::ItemStarted(notification) => {
+                upsert_projected_item(&mut items, &notification.turn_id, notification.item.clone());
+            }
+            ServerNotification::ItemCompleted(notification) => {
+                upsert_projected_item(&mut items, &notification.turn_id, notification.item.clone());
+            }
+            ServerNotification::TurnCompleted(notification) => {
+                for item in &notification.turn.items {
+                    upsert_projected_item(&mut items, &notification.turn.id, item.clone());
+                }
+            }
+            ServerNotification::AgentMessageDelta(notification) => {
+                let key = (notification.turn_id.clone(), notification.item_id.clone());
+                if let Some((_, ThreadItem::AgentMessage { text, .. })) =
+                    items.iter_mut().find(|(candidate, _)| *candidate == key)
+                {
+                    text.push_str(&notification.delta);
+                } else {
+                    upsert_projected_item(
+                        &mut items,
+                        &notification.turn_id,
+                        ThreadItem::AgentMessage {
+                            id: notification.item_id.clone(),
+                            text: notification.delta.clone(),
+                            phase: None,
+                            memory_citation: None,
+                            delivery: None,
+                            questions: None,
+                        },
+                    );
+                }
+            }
+            ServerNotification::PlanDelta(notification) => {
+                let key = (notification.turn_id.clone(), notification.item_id.clone());
+                if let Some((_, ThreadItem::Plan { text, .. })) =
+                    items.iter_mut().find(|(candidate, _)| *candidate == key)
+                {
+                    text.push_str(&notification.delta);
+                } else {
+                    upsert_projected_item(
+                        &mut items,
+                        &notification.turn_id,
+                        ThreadItem::Plan {
+                            id: notification.item_id.clone(),
+                            text: notification.delta.clone(),
+                        },
+                    );
+                }
+            }
+            ServerNotification::ReasoningSummaryTextDelta(notification) => {
+                let key = (notification.turn_id.clone(), notification.item_id.clone());
+                if let Some((_, ThreadItem::Reasoning { summary, .. })) =
+                    items.iter_mut().find(|(candidate, _)| *candidate == key)
+                {
+                    let index = usize::try_from(notification.summary_index).unwrap_or_default();
+                    if summary.len() <= index {
+                        summary.resize(index + 1, String::new());
+                    }
+                    summary[index].push_str(&notification.delta);
+                } else {
+                    let index = usize::try_from(notification.summary_index).unwrap_or_default();
+                    let mut summary = vec![String::new(); index + 1];
+                    summary[index].push_str(&notification.delta);
+                    upsert_projected_item(
+                        &mut items,
+                        &notification.turn_id,
+                        ThreadItem::Reasoning {
+                            id: notification.item_id.clone(),
+                            summary,
+                            content: Vec::new(),
+                        },
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    items.into_iter().map(|(_, item)| item).collect()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum SideParentStatus {
     NeedsInput,
@@ -107,6 +212,8 @@ impl SideParentStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_app_server_protocol::AgentMessageDeltaNotification;
+    use codex_app_server_protocol::ItemStartedNotification;
     use pretty_assertions::assert_eq;
 
     #[test]
@@ -131,6 +238,39 @@ mod tests {
         assert!(text.contains("Any tool calls or outputs visible before this boundary happened"));
         assert!(text.contains("Sub-agents are off-limits in this side conversation."));
         assert!(text.contains("Do not modify files"));
+    }
+
+    #[test]
+    fn projected_items_include_streaming_background_agent_text() {
+        let thread_id = ThreadId::new().to_string();
+        let mut store = ThreadEventStore::new(/*capacity*/ 32);
+        store.push_notification(ServerNotification::ItemStarted(ItemStartedNotification {
+            thread_id: thread_id.clone(),
+            turn_id: "turn-1".into(),
+            item: ThreadItem::AgentMessage {
+                id: "message-1".into(),
+                text: String::new(),
+                phase: None,
+                memory_citation: None,
+                delivery: None,
+                questions: None,
+            },
+            started_at_ms: 0,
+        }));
+        store.push_notification(ServerNotification::AgentMessageDelta(
+            AgentMessageDeltaNotification {
+                thread_id,
+                turn_id: "turn-1".into(),
+                item_id: "message-1".into(),
+                delta: "background task is still updating".into(),
+            },
+        ));
+
+        let items = projected_items(&store.snapshot());
+        assert!(items.iter().any(|item| {
+            matches!(item, ThreadItem::AgentMessage { text, .. }
+                if text == "background task is still updating")
+        }));
     }
 
     #[test]
@@ -223,6 +363,34 @@ impl SideThreadState {
 }
 
 impl App {
+    pub(super) async fn refresh_paired_pane_projection(&mut self, thread_id: ThreadId) {
+        if self.current_displayed_thread_id() == Some(thread_id)
+            || !self.paired_pane_states.contains_key(&thread_id)
+        {
+            return;
+        }
+        let Some(channel) = self.thread_event_channels.get(&thread_id) else {
+            return;
+        };
+        let snapshot = channel.store.lock().await.snapshot();
+        let Some(session) = snapshot.session.as_ref() else {
+            return;
+        };
+        let cells = crate::thread_transcript::thread_items_to_transcript_cells(
+            Some(thread_id),
+            &session.cwd,
+            projected_items(&snapshot),
+            crate::thread_transcript::RawReasoningVisibility::Hidden,
+            Some(&self.config),
+        );
+        if cells.is_empty() {
+            return;
+        }
+        if let Some(state) = self.paired_pane_states.get_mut(&thread_id) {
+            state.transcript_cells = cells;
+        }
+    }
+
     fn side_thread_name(parent_thread_id: ThreadId) -> String {
         format!("{SIDE_THREAD_NAME_PREFIX}{parent_thread_id}")
     }
@@ -428,8 +596,8 @@ impl App {
 
     async fn initialize_inactive_side_pane(
         &mut self,
-        tui: &mut tui::Tui,
-        app_server: &mut AppServerSession,
+        _tui: &mut tui::Tui,
+        _app_server: &mut AppServerSession,
         parent_thread_id: ThreadId,
         side_thread_id: ThreadId,
     ) {
@@ -438,17 +606,14 @@ impl App {
         {
             return;
         }
-        if let Err(err) = Box::pin(self.select_agent_thread(tui, app_server, side_thread_id)).await
-        {
-            tracing::warn!(%err, %side_thread_id, "failed to initialize inactive SIDE pane");
-            return;
-        }
-        if self.active_thread_id == Some(side_thread_id)
-            && let Err(err) =
-                Box::pin(self.select_agent_thread(tui, app_server, parent_thread_id)).await
-        {
-            tracing::warn!(%err, %parent_thread_id, "failed to restore MAIN focus after initializing SIDE pane");
-        }
+        self.paired_pane_states.insert(
+            side_thread_id,
+            PairedPaneState {
+                transcript_view: Default::default(),
+                transcript_cells: Vec::new(),
+            },
+        );
+        self.refresh_paired_pane_projection(side_thread_id).await;
     }
 
     pub(super) fn set_side_parent_status(

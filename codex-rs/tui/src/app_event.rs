@@ -431,6 +431,11 @@ pub(crate) enum AppEvent {
         message: String,
     },
 
+    /// Rebuild the read-only transcript projection for an unfocused MAIN/SIDE pane.
+    RefreshPairedPane {
+        thread_id: ThreadId,
+    },
+
     /// Submit an op to the specified thread, regardless of current focus.
     SubmitThreadOp {
         thread_id: ThreadId,
