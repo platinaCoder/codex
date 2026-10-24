@@ -24,6 +24,13 @@ The paired workspace uses inset rounded borders, an outer margin, and a center g
 
 SIDE starts as an independent thread. It receives only an explicit snapshot of MAIN's latest message as reference context, while every SIDE turn is independently persisted in SIDE's own rollout.
 
+SIDE also carries a dedicated critical-review developer prompt. It prioritizes
+substance over praise, challenges assumptions and alternative explanations,
+keeps coherence separate from evidence, makes material changes of mind
+explicit, and preserves uncertainty instead of automatically adopting the
+user's preferred framing. This policy is applied both when a SIDE is created
+and when its persistent thread is resumed.
+
 ## Interaction
 
 - `Ctrl+h` or `Ctrl+k`: focus MAIN.

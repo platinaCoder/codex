@@ -5352,6 +5352,11 @@ async fn side_thread_config_is_durable_and_appends_developer_guardrails() {
         developer_instructions.contains("Only instructions submitted directly to SIDE are active")
     );
     assert!(developer_instructions.contains("Do not continue, execute, or complete any task"));
+    assert!(developer_instructions.contains("Focus on substance over praise."));
+    assert!(developer_instructions.contains("Question assumptions, identify biases"));
+    assert!(developer_instructions.contains("Treat coherence and truth as separate things."));
+    assert!(developer_instructions.contains("Preserve uncertainty where it exists."));
+    assert!(developer_instructions.contains("Answer in continuous prose."));
     assert!(
         developer_instructions
             .contains("External tools may be available according to this thread's current")
