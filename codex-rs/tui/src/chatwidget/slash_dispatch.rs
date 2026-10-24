@@ -409,6 +409,16 @@ impl ChatWidget {
             SlashCommand::Side | SlashCommand::Btw => {
                 self.request_empty_side_conversation(cmd);
             }
+            SlashCommand::Infer => {
+                self.app_event_tx.send(AppEvent::StartInference {
+                    model: "best".to_string(),
+                });
+                self.append_message_history_entry("/infer best".to_string());
+            }
+            SlashCommand::Close => {
+                self.app_event_tx.send(AppEvent::CloseInference);
+                self.append_message_history_entry("/close".to_string());
+            }
             SlashCommand::Agents => {
                 self.app_event_tx.send(AppEvent::OpenAgentsOverview);
             }
@@ -1095,6 +1105,13 @@ impl ChatWidget {
                     self.clear_live_goal_submission();
                 }
             }
+            SlashCommand::Infer if !trimmed.is_empty() => {
+                let model = trimmed.to_string();
+                self.app_event_tx.send(AppEvent::StartInference {
+                    model: model.clone(),
+                });
+                self.append_message_history_entry(format!("/infer {model}"));
+            }
             SlashCommand::Side | SlashCommand::Btw if !trimmed.is_empty() => {
                 let Some(parent_thread_id) = self.thread_id else {
                     let command = cmd.command();
@@ -1343,6 +1360,8 @@ impl ChatWidget {
             | SlashCommand::Goal
             | SlashCommand::Side
             | SlashCommand::Btw
+            | SlashCommand::Infer
+            | SlashCommand::Close
             | SlashCommand::Keymap
             | SlashCommand::Agents
             | SlashCommand::MultiAgents

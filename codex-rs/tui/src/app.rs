@@ -245,6 +245,7 @@ mod turn_tips;
 pub(crate) use new_session::has_launch_setting;
 mod clipboard;
 mod footer_selection;
+pub(crate) mod inference;
 mod native_history;
 mod owned_transcript;
 mod pending_interactive_replay;
@@ -545,8 +546,8 @@ struct PairedPaneRender<'a> {
     state: Option<&'a mut PairedPaneState>,
     active_area: Rect,
     inactive_area: Rect,
-    active_title: &'static str,
-    inactive_title: &'static str,
+    active_title: String,
+    inactive_title: String,
 }
 
 pub(crate) struct App {
@@ -662,6 +663,8 @@ pub(crate) struct App {
     pending_paired_pane_refreshes: HashSet<ThreadId>,
     /// AI Lab runtime default: every primary chat owns an independent durable SIDE.
     research_workspace_enabled: bool,
+    /// Ephemeral local-model conversation. This state is never written to Codex history.
+    infer_pane: Option<inference::InferPaneState>,
     active_thread_id: Option<ThreadId>,
     active_thread_rx: Option<mpsc::Receiver<ThreadBufferedEvent>>,
     primary_thread_id: Option<ThreadId>,
@@ -1002,6 +1005,30 @@ impl App {
         } else {
             event
         };
+
+        if let TuiEvent::Key(key) = &event
+            && self.handle_inference_focus_key(*key)
+        {
+            tui.frame_requester().schedule_frame();
+            return Ok(AppRunControl::Continue);
+        }
+        if self.inference_focused() {
+            match &event {
+                TuiEvent::Key(key)
+                    if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
+                {
+                    self.handle_inference_key(*key);
+                    tui.frame_requester().schedule_frame();
+                    return Ok(AppRunControl::Continue);
+                }
+                TuiEvent::Paste(pasted) => {
+                    self.handle_inference_paste(pasted);
+                    tui.frame_requester().schedule_frame();
+                    return Ok(AppRunControl::Continue);
+                }
+                _ => {}
+            }
+        }
 
         self.cancel_primed_browsing_for_event(&event);
         let voice_toggle = |app: &Self, key: KeyEvent| {

@@ -117,6 +117,59 @@ async fn paired_workspace_renders_main_and_side_in_one_frame() -> Result<()> {
 }
 
 #[tokio::test]
+async fn inference_pane_renders_below_both_chats_and_tracks_keyboard_focus() -> Result<()> {
+    let mut app = crate::app::test_support::make_test_app().await;
+    let main_thread_id = ThreadId::new();
+    let side_thread_id = ThreadId::new();
+    attach_thread(&mut app, main_thread_id);
+    app.active_thread_id = Some(main_thread_id);
+    app.primary_thread_id = Some(main_thread_id);
+    app.research_workspace_enabled = true;
+    app.side_threads
+        .insert(side_thread_id, SideThreadState::new(main_thread_id));
+    app.transcript_cells = vec![user_cell("MAIN_WITH_INFER_MARKER")];
+    app.paired_pane_states.insert(
+        side_thread_id,
+        PairedPaneState {
+            transcript_view: Default::default(),
+            transcript_cells: vec![user_cell("SIDE_WITH_INFER_MARKER")],
+        },
+    );
+    app.install_test_inference("demo-model");
+
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    let size = Size::new(/*width*/ 100, /*height*/ 32);
+    tui.terminal.resize(size)?;
+    tui.set_owned_screen(/*owned*/ true)?;
+    app.render_owned_transcript(&mut tui, size)?;
+
+    let rendered = buffer_text(crate::custom_terminal::test_support::last_rendered_buffer(
+        &tui.terminal,
+    ));
+    assert!(rendered.contains("MAIN_WITH_INFER_MARKER"), "{rendered}");
+    assert!(rendered.contains("SIDE_WITH_INFER_MARKER"), "{rendered}");
+    assert!(rendered.contains("INFER_VISIBLE_MARKER"), "{rendered}");
+    assert!(
+        rendered.contains("INFER • focused · demo-model"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("MAIN • focused"), "{rendered}");
+
+    assert!(
+        app.handle_inference_focus_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL,))
+    );
+    app.render_owned_transcript(&mut tui, size)?;
+    let rendered = buffer_text(crate::custom_terminal::test_support::last_rendered_buffer(
+        &tui.terminal,
+    ));
+    assert!(rendered.contains("MAIN • focused"), "{rendered}");
+    assert!(!rendered.contains("INFER • focused"), "{rendered}");
+
+    tui.set_owned_screen(/*owned*/ false)?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn external_writer_escape_returns_to_command_center_without_editing() -> Result<()> {
     for (detailed, scrolled, offline) in [
         (false, false, false),

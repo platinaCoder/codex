@@ -436,6 +436,20 @@ pub(crate) enum AppEvent {
         thread_id: ThreadId,
     },
 
+    /// Start a model-agnostic, non-persistent local inference conversation.
+    StartInference {
+        model: String,
+    },
+
+    /// Terminate and forget the ephemeral inference conversation.
+    CloseInference,
+
+    /// Lifecycle or response event emitted by the active inference adapter.
+    InferenceRuntimeUpdate {
+        session_id: Uuid,
+        update: crate::app::inference::InferenceRuntimeUpdate,
+    },
+
     /// Submit an op to the specified thread, regardless of current focus.
     SubmitThreadOp {
         thread_id: ThreadId,

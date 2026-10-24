@@ -3151,6 +3151,26 @@ impl App {
                 self.refresh_paired_pane_projection(thread_id).await;
                 tui.frame_requester().schedule_frame();
             }
+            AppEvent::StartInference { model } => {
+                if let Err(error) = self.start_inference(model) {
+                    self.chat_widget
+                        .add_error_message(format!("Failed to start INFER: {error}"));
+                }
+                tui.frame_requester().schedule_frame();
+            }
+            AppEvent::CloseInference => {
+                if !self.close_inference() {
+                    self.chat_widget.add_info_message(
+                        "INFER is not open.".to_string(),
+                        /*hint*/ None,
+                    );
+                }
+                tui.frame_requester().schedule_frame();
+            }
+            AppEvent::InferenceRuntimeUpdate { session_id, update } => {
+                self.apply_inference_update(session_id, update);
+                tui.frame_requester().schedule_frame();
+            }
             AppEvent::OpenSkillsList => {
                 self.chat_widget.open_skills_list();
             }

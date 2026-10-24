@@ -47,6 +47,8 @@ pub enum SlashCommand {
     Agents,
     Side,
     Btw,
+    Infer,
+    Close,
     Copy,
     Export,
     Raw,
@@ -146,6 +148,8 @@ impl SlashCommand {
             SlashCommand::Side | SlashCommand::Btw => {
                 "start a side conversation in an ephemeral fork"
             }
+            SlashCommand::Infer => "open an ephemeral local-model inference chat",
+            SlashCommand::Close => "close the ephemeral inference pane",
             SlashCommand::Permissions => "choose what Codex is allowed to do",
             SlashCommand::Keymap => "remap TUI shortcuts",
             SlashCommand::Vim => "toggle Vim mode for the composer",
@@ -195,6 +199,7 @@ impl SlashCommand {
                 | SlashCommand::Pets
                 | SlashCommand::Side
                 | SlashCommand::Btw
+                | SlashCommand::Infer
                 | SlashCommand::Resume
         )
     }
@@ -215,6 +220,8 @@ impl SlashCommand {
                 | SlashCommand::Pwd
                 | SlashCommand::Usage
                 | SlashCommand::Ide
+                | SlashCommand::Infer
+                | SlashCommand::Close
         )
     }
 
@@ -242,6 +249,8 @@ impl SlashCommand {
                 | SlashCommand::Rollout
                 | SlashCommand::Copy
                 | SlashCommand::Raw
+                | SlashCommand::Infer
+                | SlashCommand::Close
         )
     }
 
@@ -305,7 +314,9 @@ impl SlashCommand {
             | SlashCommand::Quit
             | SlashCommand::Exit
             | SlashCommand::Side
-            | SlashCommand::Btw => true,
+            | SlashCommand::Btw
+            | SlashCommand::Infer
+            | SlashCommand::Close => true,
             SlashCommand::Rollout => true,
             SlashCommand::TestApproval => true,
             SlashCommand::Agents | SlashCommand::MultiAgents => true,

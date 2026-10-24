@@ -103,6 +103,7 @@ pub(crate) async fn make_test_app() -> Box<App> {
         paired_pane_states: HashMap::new(),
         pending_paired_pane_refreshes: HashSet::new(),
         research_workspace_enabled: false,
+        infer_pane: None,
         active_thread_id: None,
         active_thread_rx: None,
         primary_thread_id: None,

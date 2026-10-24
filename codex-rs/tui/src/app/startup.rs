@@ -1045,6 +1045,7 @@ See the Codex keymap documentation for supported actions and examples."
             paired_pane_states: HashMap::new(),
             pending_paired_pane_refreshes: HashSet::new(),
             research_workspace_enabled: true,
+            infer_pane: None,
             active_thread_id: None,
             active_thread_rx: None,
             primary_thread_id: None,

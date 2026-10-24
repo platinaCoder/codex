@@ -23,6 +23,9 @@ const PAIRED_WORKSPACE_MIN_WIDTH: u16 = 48;
 const PAIRED_WORKSPACE_MIN_HEIGHT: u16 = 10;
 const PAIRED_WORKSPACE_OUTER_MARGIN: u16 = 1;
 const PAIRED_WORKSPACE_GAP: u16 = 2;
+const INFERENCE_WORKSPACE_GAP: u16 = 1;
+const INFERENCE_PANE_MIN_HEIGHT: u16 = 8;
+const PRIMARY_WORKSPACE_MIN_HEIGHT: u16 = 7;
 
 fn paired_pane_inner(area: Rect) -> Rect {
     Rect::new(
@@ -135,11 +138,10 @@ impl App {
         tui: &mut tui::Tui,
         screen_size: Size,
     ) -> Result<Rect> {
-        if let Some((main_thread_id, side_thread_id)) = self.paired_main_and_side()
-            && screen_size.width >= PAIRED_WORKSPACE_MIN_WIDTH
-            && screen_size.height >= PAIRED_WORKSPACE_MIN_HEIGHT
-        {
-            let workspace = Rect::new(
+        let infer_render = self.inference_render_data();
+        let decorated_workspace = infer_render.is_some() || self.paired_main_and_side().is_some();
+        let workspace = if decorated_workspace {
+            Rect::new(
                 PAIRED_WORKSPACE_OUTER_MARGIN,
                 PAIRED_WORKSPACE_OUTER_MARGIN,
                 screen_size
@@ -148,22 +150,88 @@ impl App {
                 screen_size
                     .height
                     .saturating_sub(PAIRED_WORKSPACE_OUTER_MARGIN * 2),
-            );
-            let pane_width = workspace.width.saturating_sub(PAIRED_WORKSPACE_GAP);
+            )
+        } else {
+            Rect::new(
+                /*x*/ 0,
+                /*y*/ 0,
+                screen_size.width,
+                screen_size.height,
+            )
+        };
+        let (primary_workspace, infer_area) = if infer_render.is_some()
+            && workspace.height > PRIMARY_WORKSPACE_MIN_HEIGHT + INFERENCE_WORKSPACE_GAP
+        {
+            let infer_height = (workspace.height * 2 / 5)
+                .max(INFERENCE_PANE_MIN_HEIGHT)
+                .min(
+                    workspace
+                        .height
+                        .saturating_sub(PRIMARY_WORKSPACE_MIN_HEIGHT + INFERENCE_WORKSPACE_GAP),
+                );
+            let primary_height = workspace
+                .height
+                .saturating_sub(infer_height + INFERENCE_WORKSPACE_GAP);
+            (
+                Rect::new(workspace.x, workspace.y, workspace.width, primary_height),
+                Some(Rect::new(
+                    workspace.x,
+                    workspace.y + primary_height + INFERENCE_WORKSPACE_GAP,
+                    workspace.width,
+                    infer_height,
+                )),
+            )
+        } else {
+            (workspace, None)
+        };
+        let infer = infer_area.zip(infer_render);
+        if let Some((main_thread_id, side_thread_id)) = self.paired_main_and_side()
+            && primary_workspace.width >= PAIRED_WORKSPACE_MIN_WIDTH
+            && primary_workspace.height >= PAIRED_WORKSPACE_MIN_HEIGHT
+        {
+            let pane_width = primary_workspace.width.saturating_sub(PAIRED_WORKSPACE_GAP);
             let left_width = pane_width / 2;
-            let left = Rect::new(workspace.x, workspace.y, left_width, workspace.height);
+            let left = Rect::new(
+                primary_workspace.x,
+                primary_workspace.y,
+                left_width,
+                primary_workspace.height,
+            );
             let right = Rect::new(
-                workspace.x + left_width + PAIRED_WORKSPACE_GAP,
-                workspace.y,
+                primary_workspace.x + left_width + PAIRED_WORKSPACE_GAP,
+                primary_workspace.y,
                 pane_width - left_width,
-                workspace.height,
+                primary_workspace.height,
             );
             let active_is_main = self.current_displayed_thread_id() == Some(main_thread_id);
+            let chat_focused = !self.inference_focused();
             let (active_area, inactive_area, inactive_id, active_title, inactive_title) =
                 if active_is_main {
-                    (left, right, side_thread_id, "MAIN • focused", "SIDE")
+                    (
+                        left,
+                        right,
+                        side_thread_id,
+                        if chat_focused {
+                            "MAIN • focused"
+                        } else {
+                            "MAIN"
+                        }
+                        .to_string(),
+                        "SIDE".to_string(),
+                    )
                 } else {
-                    (right, left, main_thread_id, "SIDE • focused", "MAIN")
+                    (
+                        right,
+                        left,
+                        main_thread_id,
+                        if chat_focused {
+                            "SIDE • focused"
+                        } else {
+                            "SIDE"
+                        }
+                        .to_string(),
+                        "MAIN".to_string(),
+                    )
                 };
             let mut inactive_state = self.paired_pane_states.remove(&inactive_id);
             let active_inner = paired_pane_inner(active_area);
@@ -178,23 +246,14 @@ impl App {
                     active_title,
                     inactive_title,
                 }),
+                infer,
             );
             if let Some(inactive_state) = inactive_state {
                 self.paired_pane_states.insert(inactive_id, inactive_state);
             }
             return result;
         }
-        self.render_owned_transcript_in_area(
-            tui,
-            screen_size,
-            Rect::new(
-                /*x*/ 0,
-                /*y*/ 0,
-                screen_size.width,
-                screen_size.height,
-            ),
-            None,
-        )
+        self.render_owned_transcript_in_area(tui, screen_size, primary_workspace, None, infer)
     }
 
     fn render_owned_transcript_in_area(
@@ -203,6 +262,7 @@ impl App {
         screen_size: Size,
         pane: Rect,
         mut paired: Option<PairedPaneRender<'_>>,
+        infer: Option<(Rect, inference::InferPaneRenderData)>,
     ) -> Result<Rect> {
         self.chat_widget.sync_warnings(&self.transcript_cells);
         let motion = MotionMode::from_animations_enabled(
@@ -472,6 +532,12 @@ impl App {
             rendered_cursor = foreground.cursor_pos(foreground_area);
             if let Some(position) = rendered_cursor {
                 frame.set_cursor_style(foreground.cursor_style(foreground_area));
+                frame.set_cursor_position(position);
+            }
+            if let Some((infer_area, infer_data)) = infer.as_ref()
+                && let Some(position) =
+                    super::inference::render_inference_pane(infer_data, *infer_area, frame.buffer)
+            {
                 frame.set_cursor_position(position);
             }
             if chat_widget.no_modal_or_popup_active() {

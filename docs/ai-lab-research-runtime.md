@@ -1,6 +1,8 @@
-# AI Lab paired research runtime
+# AI Lab research runtime
 
-This fork turns the Codex TUI into the runtime shell for the AI Lab. The change is runtime-only; it does not alter the EGRU model or its experiments.
+This fork turns the Codex TUI into the runtime shell for the AI Lab. Its pane,
+thread, and adapter orchestration are runtime changes; model integrations remain
+separate and do not imply an architecture or checkpoint change.
 
 ## MAIN and SIDE
 
@@ -25,7 +27,7 @@ SIDE starts as an independent thread. It receives only an explicit snapshot of M
 ## Interaction
 
 - `Ctrl+h` or `Ctrl+k`: focus MAIN.
-- `Ctrl+l` or `Ctrl+j`: focus SIDE.
+- `Ctrl+l` or `Ctrl+j`: focus SIDE when INFER is closed.
 - `/side`: focus the existing SIDE, or create it if the automatic setup was deferred until MAIN had its first persisted message.
 - Keyboard scrolling and composer input apply only to the focused pane. Each pane restores its own transcript position when focus changes.
 - `Ctrl+C` from an idle SIDE returns focus to MAIN without deleting or unsubscribing SIDE.
@@ -34,6 +36,33 @@ The runtime injects the newest completed MAIN user or assistant message into SID
 
 SIDE may advise or instruct MAIN through `send_message_to_thread` using the paired MAIN UUID. Delivery is explicit and does not merge the two histories.
 
+## Ephemeral INFER pane
+
+`/infer <model>` starts a registered local-model adapter and opens a rounded,
+full-width chat pane below MAIN and SIDE. `/infer` alone uses the registry's
+`best` alias. While INFER is open, pane focus is:
+
+- `Ctrl+h` or `Ctrl+k`: MAIN;
+- `Ctrl+l`: SIDE;
+- `Ctrl+j`: INFER.
+
+Only the focused pane accepts keyboard input and scrolling. MAIN and SIDE keep
+rendering and processing work while INFER owns input.
+
+INFER is deliberately session-local. `/close` works from the Codex composer or
+inside INFER, terminates the model subprocess, and drops the entire inference
+transcript and model state. Nothing from INFER is written to Codex thread
+history or restored on resume.
+
+The pane is architecture-neutral. It resolves `runtime/inference.toml` from the
+lab root and communicates with the selected adapter over the documented JSONL
+protocol. EGRU is the first adapter, not a runtime dependency; future models can
+be added without changing TUI code. See `../INFERENCE_RUNTIME.md` in the lab
+repository for the registry and protocol contract.
+
 ## Research provenance
 
-Results that use this behavior depend on a **runtime change**. They should not be attributed to an EGRU model or architecture change unless the experiment also modifies files under the model program.
+Results that use MAIN/SIDE behavior depend on a **runtime change**. INFER itself
+is also a runtime change. The Stage-20B JSONL wrapper is a **model integration
+adapter change**, not an EGRU architecture or parameter change. Experimental
+results must record which adapter/model/checkpoint was selected.

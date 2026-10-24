@@ -3301,6 +3301,37 @@ async fn slash_fork_with_name_requests_named_fork() {
 }
 
 #[tokio::test]
+async fn slash_infer_uses_default_or_explicit_model() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    chat.dispatch_command(SlashCommand::Infer);
+    assert_matches!(
+        rx.try_recv(),
+        Ok(AppEvent::StartInference { model }) if model == "best"
+    );
+
+    chat.dispatch_command_with_args(
+        SlashCommand::Infer,
+        "adapter:checkpoint".to_string(),
+        Vec::new(),
+    );
+    assert_matches!(
+        rx.try_recv(),
+        Ok(AppEvent::StartInference { model }) if model == "adapter:checkpoint"
+    );
+}
+
+#[tokio::test]
+async fn slash_close_is_available_in_side_conversations() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.set_side_conversation_active(/*active*/ true);
+
+    chat.dispatch_command(SlashCommand::Close);
+
+    assert_matches!(rx.try_recv(), Ok(AppEvent::CloseInference));
+}
+
+#[tokio::test]
 async fn slash_app_requests_desktop_handoff() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     let thread_id = ThreadId::new();
