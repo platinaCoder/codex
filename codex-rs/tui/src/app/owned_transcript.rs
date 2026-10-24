@@ -14,6 +14,8 @@ use crate::keymap::keymap_action_ids;
 use crate::motion::MotionMode;
 use crate::pager_overlay::TranscriptHistoryState;
 use crate::transcript_view::ViewAction;
+use ratatui::widgets::Block;
+use ratatui::widgets::Borders;
 use ratatui::widgets::Widget;
 
 impl App {
@@ -118,6 +120,146 @@ impl App {
         tui: &mut tui::Tui,
         screen_size: Size,
     ) -> Result<Rect> {
+        if let Some((main_thread_id, side_thread_id)) = self.paired_main_and_side()
+            && screen_size.width >= 40
+            && screen_size.height >= 8
+        {
+            let left_width = screen_size.width / 2;
+            let left = Rect::new(/*x*/ 0, /*y*/ 0, left_width, screen_size.height);
+            let right = Rect::new(
+                left_width,
+                /*y*/ 0,
+                screen_size.width - left_width,
+                screen_size.height,
+            );
+            let active_is_main = self.current_displayed_thread_id() == Some(main_thread_id);
+            let (active_area, inactive_area, inactive_id) = if active_is_main {
+                (left, right, side_thread_id)
+            } else {
+                (right, left, main_thread_id)
+            };
+            self.render_inactive_paired_pane(
+                tui,
+                inactive_area,
+                inactive_id,
+                if active_is_main { "SIDE" } else { "MAIN" },
+            )?;
+            self.render_paired_pane_header(
+                tui,
+                active_area,
+                if active_is_main {
+                    "MAIN • focused"
+                } else {
+                    "SIDE • focused"
+                },
+                /*focused*/ true,
+            )?;
+            let active_inner = Rect::new(
+                active_area.x,
+                active_area.y + 1,
+                active_area.width,
+                active_area.height - 1,
+            );
+            return self.render_owned_transcript_in_area(tui, screen_size, active_inner);
+        }
+        self.render_owned_transcript_in_area(
+            tui,
+            screen_size,
+            Rect::new(
+                /*x*/ 0,
+                /*y*/ 0,
+                screen_size.width,
+                screen_size.height,
+            ),
+        )
+    }
+
+    fn render_paired_pane_header(
+        &mut self,
+        tui: &mut tui::Tui,
+        area: Rect,
+        title: &str,
+        focused: bool,
+    ) -> Result<()> {
+        let title = if focused {
+            ratatui::text::Line::from(format!(" {title} · ctrl+h/j/k/l focus ")).bold()
+        } else {
+            ratatui::text::Line::from(format!(" {title} ")).dim()
+        };
+        tui.draw(area.height, |frame| {
+            ratatui::widgets::Paragraph::new(title).render(
+                Rect::new(area.x, area.y, area.width, /*height*/ 1),
+                frame.buffer,
+            );
+        })?;
+        Ok(())
+    }
+
+    fn render_inactive_paired_pane(
+        &mut self,
+        tui: &mut tui::Tui,
+        area: Rect,
+        thread_id: ThreadId,
+        title: &str,
+    ) -> Result<()> {
+        let divider = if area.x == 0 {
+            Borders::RIGHT
+        } else {
+            Borders::LEFT
+        };
+        let Some(state) = self.paired_pane_states.get_mut(&thread_id) else {
+            tui.draw(area.height, |frame| {
+                Block::default().borders(divider).render(area, frame.buffer);
+                ratatui::widgets::Paragraph::new(
+                    ratatui::text::Line::from(format!(" {title} ")).dim(),
+                )
+                .render(
+                    Rect::new(area.x + 1, area.y, area.width.saturating_sub(1), 1),
+                    frame.buffer,
+                );
+                ratatui::widgets::Paragraph::new(
+                    "Persistent chat is ready. Focus this pane to load its transcript.",
+                )
+                .dim()
+                .wrap(ratatui::widgets::Wrap { trim: false })
+                .render(
+                    Rect::new(
+                        area.x + 2,
+                        area.y + 2,
+                        area.width.saturating_sub(3),
+                        area.height.saturating_sub(2),
+                    ),
+                    frame.buffer,
+                );
+            })?;
+            return Ok(());
+        };
+        let inner = Rect::new(
+            area.x + 1,
+            area.y + 1,
+            area.width.saturating_sub(1),
+            area.height.saturating_sub(1),
+        );
+        tui.draw(area.height, |frame| {
+            Block::default().borders(divider).render(area, frame.buffer);
+            ratatui::widgets::Paragraph::new(ratatui::text::Line::from(format!(" {title} ")).dim())
+                .render(
+                    Rect::new(area.x + 1, area.y, area.width.saturating_sub(1), 1),
+                    frame.buffer,
+                );
+            state
+                .transcript_view
+                .render(inner, frame.buffer, &state.transcript_cells);
+        })?;
+        Ok(())
+    }
+
+    fn render_owned_transcript_in_area(
+        &mut self,
+        tui: &mut tui::Tui,
+        screen_size: Size,
+        pane: Rect,
+    ) -> Result<Rect> {
         self.chat_widget.sync_warnings(&self.transcript_cells);
         let motion = MotionMode::from_animations_enabled(
             self.local_settings.tui.animations && self.local_settings.tui.effects.shimmer,
@@ -128,8 +270,8 @@ impl App {
         } else {
             "esc latest"
         };
-        self.sync_owned_transcript(screen_size.width);
-        let transcript_width = self.chat_widget.history_wrap_width(screen_size.width);
+        self.sync_owned_transcript(pane.width);
+        let transcript_width = self.chat_widget.history_wrap_width(pane.width);
         let composer_hint = if self
             .chat_widget
             .rendered_selection
@@ -158,8 +300,7 @@ impl App {
         let mut composer_gap = (!self.chat_widget.has_active_view()
             && !self.chat_widget.is_external_writer_view())
         .then(crate::bottom_pane::ComposerGap::default);
-        let mut prompt_footer =
-            self.prompt_navigation_footer(screen_size.width.saturating_sub(/*rhs*/ 2));
+        let mut prompt_footer = self.prompt_navigation_footer(pane.width.saturating_sub(/*rhs*/ 2));
         let chat_widget = &self.chat_widget;
         let view = &mut self.transcript_view;
         let active_key = chat_widget.active_cell_transcript_key();
@@ -169,17 +310,14 @@ impl App {
             tui.frame_requester().schedule_frame();
         }
         let footer_area = crate::bottom_pane::inset_footer_hint_area(Rect::new(
-            /*x*/ 0,
-            /*y*/ 0,
-            screen_size.width,
-            /*height*/ 1,
+            pane.x, pane.y, pane.width, /*height*/ 1,
         ));
         let footer = view.footer_with_navigation(footer_area.width, motion, latest_navigation);
         // Cap the whole composer (including padding and hints) at two-thirds of the screen,
         // but allow at least 8 rows on small screens, without exceeding the screen itself.
-        let max_composer_height = ((u32::from(screen_size.height) * 2 / 3) as u16)
+        let max_composer_height = ((u32::from(pane.height) * 2 / 3) as u16)
             .max(8)
-            .min(screen_size.height);
+            .min(pane.height);
         let bottom =
             chat_widget.bottom_pane_renderable(crate::bottom_pane::ComposerRenderOptions {
                 max_height: Some(max_composer_height),
@@ -197,18 +335,16 @@ impl App {
             .selected_index_for_present_view(AGENTS_OVERVIEW_VIEW_ID)
             .is_some();
         let bottom_height = if dashboard_visible {
-            screen_size.height
+            pane.height
         } else {
-            bottom
-                .desired_height(screen_size.width)
-                .min(screen_size.height)
+            bottom.desired_height(pane.width).min(pane.height)
         };
         drop(bottom);
-        let available = screen_size.height.saturating_sub(bottom_height);
+        let available = pane.height.saturating_sub(bottom_height);
         let mut bottom_area = Rect::new(
-            /*x*/ 0,
-            screen_size.height.saturating_sub(bottom_height),
-            screen_size.width,
+            pane.x,
+            pane.y + pane.height.saturating_sub(bottom_height),
+            pane.width,
             bottom_height,
         );
         let mut rendered_cursor = None;
@@ -219,16 +355,11 @@ impl App {
         tui.draw(screen_size.height, |frame| {
             chat_widget.rendered_selection.borrow_mut().areas.clear();
             ratatui::widgets::Clear.render(
-                Rect::new(/*x*/ 0, /*y*/ 0, screen_size.width, available),
+                Rect::new(pane.x, pane.y, pane.width, available),
                 frame.buffer,
             );
             let mut completion_tip_area = view.render_with_turn_tip_space(
-                Rect::new(
-                    /*x*/ 0,
-                    /*y*/ 0,
-                    transcript_width,
-                    transcript_bottom,
-                ),
+                Rect::new(pane.x, pane.y, transcript_width, transcript_bottom),
                 frame.buffer,
                 &self.transcript_cells,
                 completion_tip,
@@ -269,27 +400,17 @@ impl App {
                     ..Default::default()
                 });
             footer_height_changed = !dashboard_visible
-                && bottom
-                    .desired_height(screen_size.width)
-                    .min(screen_size.height)
-                    != bottom_height;
+                && bottom.desired_height(pane.width).min(pane.height) != bottom_height;
             if footer_height_changed && composer_gap.as_ref().is_some_and(|gap| gap.needs_separator)
             {
-                bottom_area.height = bottom
-                    .desired_height(screen_size.width)
-                    .min(screen_size.height);
-                bottom_area.y = screen_size.height.saturating_sub(bottom_area.height);
+                bottom_area.height = bottom.desired_height(pane.width).min(pane.height);
+                bottom_area.y = pane.y + pane.height.saturating_sub(bottom_area.height);
                 // Resolve controls with the compact viewport first, then make room for
                 // their separator. Resizing must not preserve a stale return control.
                 ratatui::widgets::Clear.render(bottom_area, frame.buffer);
-                transcript_bottom = bottom_area.y;
+                transcript_bottom = bottom_area.y.saturating_sub(pane.y);
                 completion_tip_area = view.render_with_turn_tip_space(
-                    Rect::new(
-                        /*x*/ 0,
-                        /*y*/ 0,
-                        transcript_width,
-                        transcript_bottom,
-                    ),
+                    Rect::new(pane.x, pane.y, transcript_width, transcript_bottom),
                     frame.buffer,
                     &self.transcript_cells,
                     completion_tip,
@@ -301,7 +422,7 @@ impl App {
                 .borrow_mut()
                 .render_first_screen(
                     Rect {
-                        width: screen_size.width,
+                        width: pane.width,
                         ..view.remaining_area()
                     },
                     frame.buffer,
@@ -320,8 +441,8 @@ impl App {
             } else {
                 (available > 0).then(|| {
                     Rect::new(
-                        /*x*/ 0,
-                        available - 1,
+                        pane.x,
+                        pane.y + available - 1,
                         transcript_width,
                         /*height*/ 1,
                     )
@@ -342,16 +463,11 @@ impl App {
                 .rendered_selection
                 .borrow_mut()
                 .render(frame.buffer);
-            chat_widget.note_rendered_width(screen_size.width);
+            chat_widget.note_rendered_width(pane.width);
             let dialog = chat_widget.centered_dialog();
             let (foreground, foreground_area): (&dyn Renderable, Rect) =
                 if let Some(dialog) = &dialog {
-                    let area = Rect::new(
-                        /*x*/ 0,
-                        /*y*/ 0,
-                        screen_size.width,
-                        screen_size.height,
-                    );
+                    let area = Rect::new(pane.x, pane.y, pane.width, pane.height);
                     dialog.render(area, frame.buffer);
                     (dialog, area)
                 } else {

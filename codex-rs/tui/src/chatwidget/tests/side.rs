@@ -218,6 +218,7 @@ async fn side_aliases_without_args_start_empty_side_conversations() {
             Ok(AppEvent::StartSide {
                 parent_thread_id: emitted_parent_thread_id,
                 user_message: None,
+                activate: true,
             }) if emitted_parent_thread_id == parent_thread_id
         );
         assert!(
@@ -249,6 +250,7 @@ async fn side_aliases_request_forked_questions_while_task_running() {
             Ok(AppEvent::StartSide {
                 parent_thread_id: emitted_parent_thread_id,
                 user_message: Some(user_message),
+                activate: true,
             }) if emitted_parent_thread_id == parent_thread_id
                 && user_message
                     == UserMessage {

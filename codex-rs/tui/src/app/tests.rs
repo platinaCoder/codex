@@ -772,6 +772,31 @@ async fn enqueue_primary_thread_session_replays_buffered_approval_after_attach()
 }
 
 #[tokio::test]
+async fn research_workspace_enqueues_side_for_every_primary_session() -> Result<()> {
+    let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+    let thread_id = ThreadId::new();
+    app.research_workspace_enabled = true;
+
+    app.enqueue_primary_thread_session(
+        test_thread_session(thread_id, test_path_buf("/tmp/project")),
+        Vec::new(),
+    )
+    .await?;
+
+    assert!(
+        std::iter::from_fn(|| app_event_rx.try_recv().ok()).any(|event| matches!(
+            event,
+            AppEvent::StartSide {
+                parent_thread_id,
+                user_message: None,
+                activate: false,
+            } if parent_thread_id == thread_id
+        ))
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn resolved_buffered_approval_does_not_become_actionable_after_drain() -> Result<()> {
     let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
     let thread_id = ThreadId::new();
@@ -3170,6 +3195,7 @@ async fn handle_start_side_seeds_navigation_before_thread_started() -> Result<()
         &mut app_server,
         parent_thread_id,
         /*user_message*/ None,
+        /*activate*/ true,
     ))
     .await?;
 
@@ -3226,6 +3252,7 @@ async fn handle_start_side_seeds_navigation_before_thread_started() -> Result<()
         &mut app_server,
         parent_thread_id,
         /*user_message*/ None,
+        /*activate*/ true,
     ))
     .await?;
     assert_eq!(app.active_thread_id, Some(side_thread_id));
@@ -3268,6 +3295,47 @@ async fn handle_start_side_seeds_navigation_before_thread_started() -> Result<()
     );
 
     app_server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn blank_primary_thread_gets_an_independent_persistent_side() -> Result<()> {
+    let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+    let config = app.chat_widget.config_ref().clone();
+    let mut app_server = Box::pin(crate::start_embedded_app_server_for_picker(&config)).await?;
+    let started = app_server.start_thread(&config).await?;
+    let parent_thread_id = started.session.thread_id;
+    app.enqueue_primary_thread_session(started.session, started.turns)
+        .await?;
+    while app_event_rx.try_recv().is_ok() {}
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+
+    Box::pin(app.handle_start_side(
+        &mut tui,
+        &mut app_server,
+        parent_thread_id,
+        /*user_message*/ None,
+        /*activate*/ false,
+    ))
+    .await?;
+
+    let side_thread_id = app
+        .side_thread_for_parent(parent_thread_id)
+        .expect("blank MAIN should receive a SIDE immediately");
+    assert_ne!(side_thread_id, parent_thread_id);
+    assert_eq!(app.active_thread_id, Some(parent_thread_id));
+    assert!(app.paired_pane_states.contains_key(&side_thread_id));
+    let stored_side = app_server
+        .thread_read(side_thread_id, /*include_turns*/ false)
+        .await?;
+    assert!(!stored_side.ephemeral);
+    assert_eq!(
+        stored_side.thread_source,
+        Some(codex_app_server_protocol::ThreadSource::Feature(format!(
+            "{}:{parent_thread_id}",
+            crate::app_server_session::PERSISTENT_SIDE_THREAD_SOURCE_PREFIX
+        )))
+    );
     Ok(())
 }
 
@@ -5221,14 +5289,15 @@ fn agent_picker_item_name_snapshot() {
 }
 
 #[tokio::test]
-async fn side_fork_config_is_ephemeral_and_appends_developer_guardrails() {
+async fn side_fork_config_is_durable_and_appends_developer_guardrails() {
     let app = make_test_app().await;
+    let parent_thread_id = ThreadId::from_u128(/*value*/ 23);
     let original_approval_policy = app.config.permissions.approval_policy.value();
     let original_sandbox_policy = app.config.legacy_sandbox_policy();
 
-    let fork_config = app.side_fork_config();
+    let fork_config = app.side_fork_config(parent_thread_id);
 
-    assert!(fork_config.ephemeral);
+    assert!(!fork_config.ephemeral);
     assert_eq!(
         fork_config.permissions.approval_policy.value(),
         original_approval_policy
@@ -5262,12 +5331,14 @@ async fn side_fork_config_is_ephemeral_and_appends_developer_guardrails() {
     assert!(developer_instructions.contains("non-mutating inspection"));
     assert!(developer_instructions.contains("Do not modify files"));
     assert!(developer_instructions.contains("Do not request escalated permissions"));
+    assert!(developer_instructions.contains(&parent_thread_id.to_string()));
     assert!(app.transcript_cells.is_empty());
 }
 
 #[tokio::test]
 async fn side_fork_config_inherits_parent_thread_runtime_settings() {
     let mut app = make_test_app().await;
+    let parent_thread_id = ThreadId::new();
     app.config.model = Some("persisted-default-model".to_string());
     app.config.model_reasoning_effort = Some(ReasoningEffortConfig::Low);
 
@@ -5288,7 +5359,7 @@ async fn side_fork_config_inherits_parent_thread_runtime_settings() {
     app.chat_widget
         .set_approvals_reviewer(ApprovalsReviewer::AutoReview);
 
-    let fork_config = app.side_fork_config();
+    let fork_config = app.side_fork_config(parent_thread_id);
 
     assert_eq!(
         (
@@ -5330,12 +5401,7 @@ async fn side_start_block_message_allows_replacing_open_side_conversation() {
     assert_eq!(app.side_start_block_message(), None);
 
     app.active_thread_id = Some(side_thread_id);
-    assert_eq!(
-        app.side_start_block_message(),
-        Some(
-            "A side conversation is already open. Press ctrl + c to return before starting another."
-        )
-    );
+    assert_eq!(app.side_start_block_message(), None);
 
     app.side_threads.remove(&side_thread_id);
     assert_eq!(app.side_start_block_message(), None);
@@ -5565,9 +5631,9 @@ async fn side_parent_status_prioritizes_input_over_approval() -> Result<()> {
     assert_snapshot!(
         format!("{input_footer}\n{approval_footer}\n{cleared_footer}"),
         @"
-    Side from main thread · main needs input · ⌃/ to switch · ⌃c to close
-    Side from main thread · main needs approval · ⌃/ to switch · ⌃c to close
-    Side from main thread · ⌃/ to switch · ⌃c to close
+    Side from main thread · main needs input · ⌃/ to switch · ctrl+h/j/k/l to focus
+    Side from main thread · main needs approval · ⌃/ to switch · ctrl+h/j/k/l to focus
+    Side from main thread · ⌃/ to switch · ctrl+h/j/k/l to focus
     "
     );
 
@@ -5575,7 +5641,7 @@ async fn side_parent_status_prioritizes_input_over_approval() -> Result<()> {
 }
 
 #[tokio::test]
-async fn side_thread_snapshot_hides_forked_parent_transcript() {
+async fn side_thread_snapshot_preserves_durable_lineage_and_history() {
     let parent_thread_id = ThreadId::new();
     let side_thread_id = ThreadId::new();
     let mut store = ThreadEventStore::new(/*capacity*/ 4);
@@ -5603,8 +5669,8 @@ async fn side_thread_snapshot_hides_forked_parent_transcript() {
 
     let stored_session = store.session.as_ref().expect("side session");
     assert_eq!(stored_session.thread_id, side_thread_id);
-    assert_eq!(stored_session.forked_from_id, None);
-    assert_eq!(store.turns, Vec::<Turn>::new());
+    assert_eq!(stored_session.forked_from_id, Some(parent_thread_id));
+    assert_eq!(store.turns.len(), 1);
     assert_eq!(store.active_turn_id(), None);
 }
 
@@ -5914,7 +5980,7 @@ async fn side_restore_user_message_puts_inline_question_back_in_composer() {
 }
 
 #[tokio::test]
-async fn side_discard_selection_only_closes_the_active_side() {
+async fn side_pair_remains_linked_when_focus_returns_to_main() {
     let mut app = make_test_app().await;
     let parent_thread_id = ThreadId::new();
     let side_thread_id = ThreadId::new();
@@ -5923,23 +5989,16 @@ async fn side_discard_selection_only_closes_the_active_side() {
         .insert(side_thread_id, SideThreadState::new(parent_thread_id));
 
     assert_eq!(
-        app.side_thread_to_discard_after_switch(side_thread_id),
-        None
-    );
-    assert_eq!(
-        app.side_thread_to_discard_after_switch(parent_thread_id),
-        Some(side_thread_id)
+        app.paired_main_and_side(),
+        Some((parent_thread_id, side_thread_id))
     );
 
     app.active_thread_id = Some(parent_thread_id);
     assert_eq!(
-        app.side_thread_to_discard_after_switch(ThreadId::new()),
-        None
+        app.paired_main_and_side(),
+        Some((parent_thread_id, side_thread_id))
     );
-    assert_eq!(
-        app.side_thread_to_discard_after_switch(side_thread_id),
-        None
-    );
+    assert!(app.side_threads.contains_key(&side_thread_id));
 }
 
 #[tokio::test]
@@ -6012,7 +6071,7 @@ async fn discard_side_thread_keeps_local_state_when_server_close_fails() -> Resu
 #[tokio::test]
 async fn background_side_cleanup_removes_local_state_and_ignores_late_events() -> Result<()> {
     let (mut app, mut events, _ops) = make_test_app_with_channels().await;
-    let mut app_server =
+    let app_server =
         crate::start_embedded_app_server_for_picker(app.chat_widget.config_ref()).await?;
     let parent_thread_id = ThreadId::new();
     let side_thread_id = ThreadId::new();
@@ -6034,8 +6093,8 @@ async fn background_side_cleanup_removes_local_state_and_ignores_late_events() -
             tokio::spawn(std::future::pending::<()>()),
         ),
     );
-    app.discard_side_thread_in_background(&mut app_server, side_thread_id)
-        .await;
+    app.abandoned_side_threads.insert(side_thread_id);
+    app.discard_thread_local_state(side_thread_id).await;
 
     assert_matches!(
         events.try_recv(),
@@ -6472,6 +6531,8 @@ async fn make_test_app() -> Box<App> {
         agents_overview: Default::default(),
         side_threads: HashMap::new(),
         abandoned_side_threads: HashSet::new(),
+        paired_pane_states: HashMap::new(),
+        research_workspace_enabled: false,
         active_thread_id: None,
         active_thread_rx: None,
         primary_thread_id: None,
@@ -6598,6 +6659,8 @@ pub(super) async fn make_test_app_with_channels() -> (
             agents_overview: Default::default(),
             side_threads: HashMap::new(),
             abandoned_side_threads: HashSet::new(),
+            paired_pane_states: HashMap::new(),
+            research_workspace_enabled: false,
             active_thread_id: None,
             active_thread_rx: None,
             primary_thread_id: None,

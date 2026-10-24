@@ -986,6 +986,45 @@ impl App {
         thread_id: ThreadId,
         notification: ServerNotification,
     ) -> Result<()> {
+        let completed_main_message = if self.research_workspace_enabled
+            && self.primary_thread_id == Some(thread_id)
+            && let ServerNotification::ItemCompleted(completed) = &notification
+        {
+            match &completed.item {
+                ThreadItem::AgentMessage { text, .. } if !text.trim().is_empty() => {
+                    Some(format!("Assistant: {text}"))
+                }
+                ThreadItem::UserMessage { content, .. } => {
+                    let text = content
+                        .iter()
+                        .filter_map(|input| match input {
+                            codex_app_server_protocol::UserInput::Text { text, .. } => {
+                                Some(text.as_str())
+                            }
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    (!text.trim().is_empty()).then(|| format!("User: {text}"))
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let Some(message) = completed_main_message {
+            if self.side_thread_for_parent(thread_id).is_none() {
+                self.app_event_tx.send(AppEvent::StartSide {
+                    parent_thread_id: thread_id,
+                    user_message: None,
+                    activate: false,
+                });
+            }
+            self.app_event_tx.send(AppEvent::SyncSideFromMain {
+                parent_thread_id: thread_id,
+                message,
+            });
+        }
         self.deliver_background_voice_notification(thread_id, &notification);
         if self.abandoned_side_threads.contains(&thread_id) {
             return Ok(());
@@ -1483,6 +1522,13 @@ impl App {
         self.chat_widget
             .set_initial_user_message_submit_suppressed(/*suppressed*/ false);
         self.chat_widget.submit_initial_user_message_if_pending();
+        if self.research_workspace_enabled {
+            self.app_event_tx.send(AppEvent::StartSide {
+                parent_thread_id: thread_id,
+                user_message: None,
+                activate: false,
+            });
+        }
         Ok(())
     }
 

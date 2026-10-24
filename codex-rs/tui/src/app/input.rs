@@ -9,6 +9,24 @@ use crate::app_backtrack::SIDE_EDIT_PREVIOUS_UNAVAILABLE_MESSAGE;
 use crate::keymap::bindings_for_action;
 use crate::keymap::keymap_action_ids;
 
+fn paired_focus_target(
+    key_event: KeyEvent,
+    main_thread_id: ThreadId,
+    side_thread_id: ThreadId,
+) -> Option<ThreadId> {
+    if crate::key_hint::ctrl(KeyCode::Char('h')).is_press(key_event)
+        || crate::key_hint::ctrl(KeyCode::Char('k')).is_press(key_event)
+    {
+        Some(main_thread_id)
+    } else if crate::key_hint::ctrl(KeyCode::Char('l')).is_press(key_event)
+        || crate::key_hint::ctrl(KeyCode::Char('j')).is_press(key_event)
+    {
+        Some(side_thread_id)
+    } else {
+        None
+    }
+}
+
 impl App {
     pub(super) fn should_recover_vim_insert_escape(&self, key_event: KeyEvent) -> bool {
         let active_contexts = self.active_keymap_contexts();
@@ -567,17 +585,13 @@ impl App {
             }
         }
 
-        if side_return_shortcut_matches(key_event)
-            && self.maybe_return_from_side(tui, app_server).await
-        {
+        if side_return_shortcut_matches(key_event) && self.maybe_return_from_side() {
             return;
         }
 
         let app_keymap_shortcuts_available = self.app_keymap_shortcuts_available();
         if app_keymap_shortcuts_available
-            && self
-                .handle_shared_app_keymap_action(tui, app_server, key_event)
-                .await
+            && Box::pin(self.handle_shared_app_keymap_action(tui, app_server, key_event)).await
         {
             return;
         }
@@ -689,6 +703,15 @@ impl App {
         app_server: &mut AppServerSession,
         key_event: KeyEvent,
     ) -> bool {
+        if let Some((main_thread_id, side_thread_id)) = self.paired_main_and_side() {
+            let target = paired_focus_target(key_event, main_thread_id, side_thread_id);
+            if let Some(target) = target {
+                if self.current_displayed_thread_id() != Some(target) {
+                    self.app_event_tx.send(AppEvent::SelectAgentThread(target));
+                }
+                return true;
+            }
+        }
         if self.keymap.app.open_warnings.is_pressed(key_event) {
             self.verify_managed_daemon().await;
             self.chat_widget.open_warnings(&self.transcript_cells);
@@ -810,6 +833,41 @@ mod ownership_tests;
 #[cfg(test)]
 mod tests {
     use super::super::test_support::make_test_app;
+    use super::*;
+
+    #[test]
+    fn paired_focus_uses_ctrl_hjkl_and_ignores_plain_keys() {
+        let main = ThreadId::from_u128(/*value*/ 1);
+        let side = ThreadId::from_u128(/*value*/ 2);
+        for key in ['h', 'k'] {
+            assert_eq!(
+                paired_focus_target(
+                    KeyEvent::new(KeyCode::Char(key), KeyModifiers::CONTROL),
+                    main,
+                    side,
+                ),
+                Some(main)
+            );
+        }
+        for key in ['j', 'l'] {
+            assert_eq!(
+                paired_focus_target(
+                    KeyEvent::new(KeyCode::Char(key), KeyModifiers::CONTROL),
+                    main,
+                    side,
+                ),
+                Some(side)
+            );
+        }
+        assert_eq!(
+            paired_focus_target(
+                KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE),
+                main,
+                side,
+            ),
+            None
+        );
+    }
 
     #[tokio::test]
     async fn app_keymap_shortcuts_are_disabled_while_keymap_view_is_active() {

@@ -1478,6 +1478,7 @@ impl ChatWidget {
         self.thread_rename_block_message = None;
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn set_thread_rename_block_message(&mut self, message: impl Into<String>) {
         self.thread_rename_block_message = Some(message.into());
     }

@@ -114,6 +114,7 @@ impl ChatWidget {
         self.app_event_tx.send(AppEvent::StartSide {
             parent_thread_id,
             user_message,
+            activate: true,
         });
     }
 

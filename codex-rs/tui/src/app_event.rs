@@ -417,10 +417,18 @@ pub(crate) enum AppEvent {
     /// Switch the active thread to the selected agent.
     SelectAgentThread(ThreadId),
 
-    /// Fork the current thread into a transient side conversation.
+    /// Restore or create the durable side conversation paired with a main thread.
     StartSide {
         parent_thread_id: ThreadId,
         user_message: Option<UserMessage>,
+        /// Move keyboard focus to SIDE. Automatic workspace setup leaves MAIN focused.
+        activate: bool,
+    },
+
+    /// Inject the newest MAIN assistant message into its independently persisted SIDE.
+    SyncSideFromMain {
+        parent_thread_id: ThreadId,
+        message: String,
     },
 
     /// Submit an op to the specified thread, regardless of current focus.

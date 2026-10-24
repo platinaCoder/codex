@@ -3113,16 +3113,38 @@ impl App {
                 );
             }
             AppEvent::SelectAgentThread(thread_id) => {
-                self.select_agent_thread(tui, app_server, thread_id)
-                    .await?;
+                Box::pin(self.select_agent_thread(tui, app_server, thread_id)).await?;
             }
             AppEvent::StartSide {
                 parent_thread_id,
                 user_message,
+                activate,
             } => {
-                return self
-                    .handle_start_side(tui, app_server, parent_thread_id, user_message)
+                return Box::pin(self.handle_start_side(
+                        tui,
+                        app_server,
+                        parent_thread_id,
+                        user_message,
+                        activate,
+                    ))
                     .await;
+            }
+            AppEvent::SyncSideFromMain {
+                parent_thread_id,
+                message,
+            } => {
+                if let Some(side_thread_id) = self.side_thread_for_parent(parent_thread_id)
+                    && let Err(err) = Box::pin(app_server.thread_inject_items(
+                            side_thread_id,
+                            vec![Self::side_main_context_item(
+                                parent_thread_id,
+                                Some(&message),
+                            )],
+                        ))
+                    .await
+                {
+                    tracing::warn!(%err, %side_thread_id, "failed to sync MAIN context into SIDE");
+                }
             }
             AppEvent::OpenSkillsList => {
                 self.chat_widget.open_skills_list();

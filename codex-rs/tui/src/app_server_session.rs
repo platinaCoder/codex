@@ -168,6 +168,7 @@ const JSONRPC_INVALID_REQUEST: i64 = -32600;
 const JSONRPC_METHOD_NOT_FOUND: i64 = -32601;
 const JSONRPC_INVALID_PARAMS: i64 = -32602;
 pub(crate) const EXTERNAL_AGENT_CONFIG_IMPORT_IN_PROGRESS_MESSAGE: &str = "A previous external agent import is still running. Wait for it to finish before importing again.";
+pub(crate) const PERSISTENT_SIDE_THREAD_SOURCE_PREFIX: &str = "ai_lab_side";
 const THREAD_SETTINGS_UPDATE_METHOD: &str = "thread/settings/update";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -902,7 +903,54 @@ impl AppServerSession {
         remote_cwd_override: Option<&std::path::Path>,
         selected_profile: Option<&PermissionProfileSelection>,
     ) -> Result<AppServerStartedThread> {
+        self.start_thread_with_source(
+            local_settings,
+            config,
+            session_start_source,
+            remote_cwd_override,
+            selected_profile,
+            ThreadSource::User,
+        )
+        .await
+    }
+
+    pub(crate) async fn start_side_thread(
+        &mut self,
+        local_settings: &LocalSettings,
+        config: &Config,
+        parent_thread_id: ThreadId,
+        selected_profile: Option<&PermissionProfileSelection>,
+    ) -> Result<AppServerStartedThread> {
+        self.start_thread_with_source(
+            local_settings,
+            config,
+            /*session_start_source*/ None,
+            /*remote_cwd_override*/ None,
+            selected_profile,
+            ThreadSource::Feature(format!(
+                "{PERSISTENT_SIDE_THREAD_SOURCE_PREFIX}:{parent_thread_id}"
+            )),
+        )
+        .await
+    }
+
+    async fn start_thread_with_source(
+        &mut self,
+        local_settings: &LocalSettings,
+        config: &Config,
+        session_start_source: Option<ThreadStartSource>,
+        remote_cwd_override: Option<&std::path::Path>,
+        selected_profile: Option<&PermissionProfileSelection>,
+        thread_source: ThreadSource,
+    ) -> Result<AppServerStartedThread> {
         let request_id = self.next_request_id();
+        let is_persistent_side = matches!(
+            &thread_source,
+            ThreadSource::Feature(source)
+                if source
+                    .strip_prefix(PERSISTENT_SIDE_THREAD_SOURCE_PREFIX)
+                    .is_some_and(|suffix| suffix.starts_with(':'))
+        );
         let session_config = self.session_config_with_effective_service_tier(config);
         let mut params = thread_start_params_from_config(
             &session_config,
@@ -910,6 +958,13 @@ impl AppServerSession {
             remote_cwd_override.or(self.remote_cwd_override.as_deref()),
             session_start_source,
         );
+        params.thread_source = Some(thread_source);
+        if is_persistent_side {
+            params.developer_instructions = with_terminal_visualization_instructions(
+                config,
+                config.developer_instructions.clone(),
+            );
+        }
         params.model_provider = self
             .model_provider_override
             .clone()
@@ -1100,6 +1155,11 @@ impl AppServerSession {
                 self.remote_cwd_override.as_deref(),
             )
         };
+        if presentation == ForkPresentation::SideConversation {
+            params.thread_source = Some(ThreadSource::Feature(format!(
+                "{PERSISTENT_SIDE_THREAD_SOURCE_PREFIX}:{thread_id}"
+            )));
+        }
         params.model_provider = match config_source {
             ForkConfigSource::Local => self
                 .model_provider_override
@@ -4048,6 +4108,15 @@ mod tests {
         assert_eq!(app_server.next_request_id, next_request_id + 1);
         assert_eq!(side.session.forked_from_id, Some(source_thread_id));
         assert_eq!(side.turns, Vec::<Turn>::new());
+        let stored_side = app_server
+            .thread_read(side.session.thread_id, /*include_turns*/ false)
+            .await?;
+        assert_eq!(
+            stored_side.thread_source,
+            Some(ThreadSource::Feature(format!(
+                "{PERSISTENT_SIDE_THREAD_SOURCE_PREFIX}:{source_thread_id}"
+            )))
+        );
         assert!(app_server.has_older_history(source_thread_id));
         assert!(
             !app_server

@@ -534,6 +534,11 @@ struct InitialHistoryReplayBuffer {
     was_truncated: bool,
 }
 
+struct PairedPaneState {
+    transcript_view: crate::transcript_view::TranscriptView,
+    transcript_cells: Vec<Arc<dyn HistoryCell>>,
+}
+
 pub(crate) struct App {
     feature_write_lock: Arc<tokio::sync::Mutex<()>>,
     config_notification_test_generation: u64,
@@ -641,6 +646,10 @@ pub(crate) struct App {
     agents_overview: agents_overview::AgentsOverviewState,
     side_threads: HashMap<ThreadId, SideThreadState>,
     abandoned_side_threads: HashSet<ThreadId>,
+    /// UI state is independent per durable MAIN/SIDE thread, just like their histories.
+    paired_pane_states: HashMap<ThreadId, PairedPaneState>,
+    /// AI Lab runtime default: every primary chat owns an independent durable SIDE.
+    research_workspace_enabled: bool,
     active_thread_id: Option<ThreadId>,
     active_thread_rx: Option<mpsc::Receiver<ThreadBufferedEvent>>,
     primary_thread_id: Option<ThreadId>,

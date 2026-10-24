@@ -33,6 +33,24 @@ pub(super) struct LoadedSubagentBackfill {
 }
 
 impl App {
+    #[inline(never)]
+    fn save_paired_pane_state(&mut self, thread_id: ThreadId) {
+        self.paired_pane_states.insert(
+            thread_id,
+            PairedPaneState {
+                transcript_view: std::mem::take(&mut self.transcript_view),
+                transcript_cells: self.transcript_cells.clone(),
+            },
+        );
+    }
+
+    #[inline(never)]
+    fn restore_paired_pane_state(&mut self, thread_id: ThreadId) {
+        if let Some(saved) = self.paired_pane_states.remove(&thread_id) {
+            self.transcript_view = saved.transcript_view;
+        }
+    }
+
     pub(super) async fn open_agent_picker(&mut self, app_server: &mut AppServerSession) {
         let backfill = if self.primary_thread_id.is_none() {
             self.backfill_loaded_subagent_threads(app_server).await
@@ -690,6 +708,10 @@ impl App {
         self.active_thread_id = Some(thread_id);
         self.active_thread_rx = Some(receiver);
 
+        if let Some(previous_thread_id) = previous_thread_id {
+            self.save_paired_pane_state(previous_thread_id);
+        }
+
         self.recap.note_focus_gained();
         self.recap = recap::RecapState::default();
 
@@ -701,6 +723,7 @@ impl App {
         self.schedule_recap_check(thread_id, now);
 
         self.render_thread_snapshot(tui, app_server, thread_id, snapshot, !is_replay_only)?;
+        self.restore_paired_pane_state(thread_id);
         if is_replay_only
             && self
                 .thread_event_channels

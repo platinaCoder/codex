@@ -100,6 +100,8 @@ pub(crate) async fn make_test_app() -> Box<App> {
         agents_overview: Default::default(),
         side_threads: HashMap::new(),
         abandoned_side_threads: HashSet::new(),
+        paired_pane_states: HashMap::new(),
+        research_workspace_enabled: false,
         active_thread_id: None,
         active_thread_rx: None,
         primary_thread_id: None,
