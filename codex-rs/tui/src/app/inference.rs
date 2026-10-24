@@ -705,21 +705,23 @@ impl App {
             self.set_inference_focus(true);
             return true;
         }
-        let target = self.paired_main_and_side().and_then(|(main, side)| {
-            if crate::key_hint::ctrl(KeyCode::Char('h')).is_press(key)
-                || crate::key_hint::ctrl(KeyCode::Char('k')).is_press(key)
-            {
-                Some(main)
-            } else if crate::key_hint::ctrl(KeyCode::Char('l')).is_press(key) {
-                Some(side)
-            } else {
-                None
-            }
-        });
-        if let Some(target) = target {
+        if crate::key_hint::ctrl(KeyCode::Char('h')).is_press(key)
+            || crate::key_hint::ctrl(KeyCode::Char('k')).is_press(key)
+        {
             self.set_inference_focus(false);
-            if self.current_displayed_thread_id() != Some(target) {
-                self.app_event_tx.send(AppEvent::SelectAgentThread(target));
+            if let Some((main, _side)) = self.paired_main_and_side()
+                && self.current_displayed_thread_id() != Some(main)
+            {
+                self.app_event_tx.send(AppEvent::SelectAgentThread(main));
+            }
+            return true;
+        }
+        if crate::key_hint::ctrl(KeyCode::Char('l')).is_press(key)
+            && let Some((_main, side)) = self.paired_main_and_side()
+        {
+            self.set_inference_focus(false);
+            if self.current_displayed_thread_id() != Some(side) {
+                self.app_event_tx.send(AppEvent::SelectAgentThread(side));
             }
             return true;
         }
@@ -1002,5 +1004,21 @@ model = "checkpoint-small"
             pane.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             InferInputAction::Close
         ));
+    }
+
+    #[tokio::test]
+    async fn ctrl_h_leaves_inference_without_a_paired_side_thread() {
+        let mut app = crate::app::test_support::make_test_app().await;
+        app.install_test_inference("demo");
+        assert!(app.inference_focused());
+
+        assert!(
+            app.handle_inference_focus_key(KeyEvent::new(
+                KeyCode::Char('h'),
+                KeyModifiers::CONTROL,
+            ))
+        );
+
+        assert!(!app.inference_focused());
     }
 }
