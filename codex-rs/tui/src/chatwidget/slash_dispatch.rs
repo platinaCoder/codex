@@ -411,9 +411,9 @@ impl ChatWidget {
             }
             SlashCommand::Infer => {
                 self.app_event_tx.send(AppEvent::StartInference {
-                    model: "best".to_string(),
+                    model: String::new(),
                 });
-                self.append_message_history_entry("/infer best".to_string());
+                self.append_message_history_entry("/infer".to_string());
             }
             SlashCommand::Close => {
                 self.app_event_tx.send(AppEvent::CloseInference);

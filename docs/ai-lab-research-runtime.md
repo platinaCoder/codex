@@ -40,7 +40,7 @@ SIDE may advise or instruct MAIN through `send_message_to_thread` using the pair
 
 `/infer <model>` starts a registered local-model adapter and opens a rounded,
 full-width chat pane below MAIN and SIDE. `/infer` alone uses the registry's
-`best` alias. While INFER is open, pane focus is:
+`default_model`. While INFER is open, pane focus is:
 
 - `Ctrl+h` or `Ctrl+k`: MAIN;
 - `Ctrl+l`: SIDE;

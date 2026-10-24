@@ -41,6 +41,7 @@ const INFERENCE_REGISTRY: &str = "runtime/inference.toml";
 #[derive(Debug, Deserialize)]
 struct InferenceRegistry {
     version: u32,
+    default_model: Option<String>,
     adapters: BTreeMap<String, AdapterConfig>,
     #[serde(default)]
     models: BTreeMap<String, ModelConfig>,
@@ -61,6 +62,7 @@ struct ModelConfig {
 }
 
 struct ResolvedAdapter {
+    target: String,
     label: String,
     command: Vec<String>,
     cwd: PathBuf,
@@ -196,6 +198,13 @@ fn resolve_adapter(target: &str, starts: &[&Path]) -> anyhow::Result<ResolvedAda
             registry_path.display()
         );
     }
+    let target = if target.trim().is_empty() {
+        registry.default_model.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("{INFERENCE_REGISTRY} has no default_model; use /infer <model>")
+        })?
+    } else {
+        target.trim()
+    };
     let (adapter_name, model) = if let Some(model) = registry.models.get(target) {
         (model.adapter.as_str(), model.model.as_str())
     } else if let Some((adapter, model)) = target.split_once(':') {
@@ -232,6 +241,7 @@ fn resolve_adapter(target: &str, starts: &[&Path]) -> anyhow::Result<ResolvedAda
         .map(|(key, value)| (key.clone(), expand(value, &lab_root, model)))
         .collect();
     Ok(ResolvedAdapter {
+        target: target.to_string(),
         label: adapter_name.to_string(),
         command,
         cwd,
@@ -418,7 +428,7 @@ impl InferPaneState {
         let runtime_task = tokio::spawn(run_adapter(child, request_rx, app_event_tx, session_id));
         Ok(Self {
             session_id,
-            target,
+            target: resolved.target,
             adapter: resolved.label,
             focused: true,
             status: InferStatus::Loading,
@@ -663,11 +673,7 @@ impl InferPaneState {
 
 impl App {
     pub(super) fn start_inference(&mut self, target: String) -> anyhow::Result<()> {
-        let target = if target.trim().is_empty() {
-            "best".to_string()
-        } else {
-            target.trim().to_string()
-        };
+        let target = target.trim().to_string();
         let state = InferPaneState::start(
             target,
             &[self.config.cwd.as_path(), self.launch_cwd.as_path()],
@@ -946,6 +952,7 @@ mod tests {
             runtime.join("inference.toml"),
             r#"
 version = 1
+default_model = "small"
 [adapters.demo]
 command = ["{lab_root}/python", "adapter.py", "{model}"]
 cwd = "{lab_root}/models/demo"
@@ -960,6 +967,10 @@ model = "checkpoint-small"
         assert_eq!(alias.label, "demo");
         assert_eq!(alias.command[2], "checkpoint-small");
         assert_eq!(alias.cwd, root.path().join("models/demo"));
+
+        let default = resolve_adapter("", &[root.path()]).expect("default alias");
+        assert_eq!(default.target, "small");
+        assert_eq!(default.command[2], "checkpoint-small");
 
         let explicit = resolve_adapter("demo:other", &[root.path()]).expect("explicit target");
         assert_eq!(explicit.command[2], "other");

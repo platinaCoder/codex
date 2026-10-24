@@ -3307,7 +3307,7 @@ async fn slash_infer_uses_default_or_explicit_model() {
     chat.dispatch_command(SlashCommand::Infer);
     assert_matches!(
         rx.try_recv(),
-        Ok(AppEvent::StartInference { model }) if model == "best"
+        Ok(AppEvent::StartInference { model }) if model.is_empty()
     );
 
     chat.dispatch_command_with_args(
