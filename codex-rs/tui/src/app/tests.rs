@@ -3336,6 +3336,43 @@ async fn blank_primary_thread_gets_an_independent_persistent_side() -> Result<()
             crate::app_server_session::PERSISTENT_SIDE_THREAD_SOURCE_PREFIX
         )))
     );
+    assert_eq!(
+        stored_side.forked_from_id, None,
+        "SIDE must own an independent rollout instead of inheriting MAIN history"
+    );
+
+    crate::init_state_db_for_app_server_target(&app.config, &crate::AppServerTarget::Embedded)
+        .await?
+        .expect("state database")
+        .set_thread_preview_if_empty(side_thread_id, "Persistent SIDE history")
+        .await
+        .expect("seed persistent SIDE preview");
+
+    super::side_pair_registry::forget_pair_if_matches(
+        app.local_settings.codex_home.as_path(),
+        parent_thread_id,
+        side_thread_id,
+    )?;
+    assert_eq!(
+        super::side_pair_registry::paired_side(
+            app.local_settings.codex_home.as_path(),
+            parent_thread_id
+        ),
+        None
+    );
+    assert_eq!(
+        app.find_persisted_side_thread(&mut app_server, parent_thread_id)
+            .await,
+        Some(side_thread_id),
+        "legacy reverse-only SIDE metadata should migrate to the MAIN lookup registry"
+    );
+    assert_eq!(
+        super::side_pair_registry::paired_side(
+            app.local_settings.codex_home.as_path(),
+            parent_thread_id
+        ),
+        Some(side_thread_id)
+    );
     Ok(())
 }
 
@@ -5289,35 +5326,30 @@ fn agent_picker_item_name_snapshot() {
 }
 
 #[tokio::test]
-async fn side_fork_config_is_durable_and_appends_developer_guardrails() {
+async fn side_thread_config_is_durable_and_appends_developer_guardrails() {
     let app = make_test_app().await;
     let parent_thread_id = ThreadId::from_u128(/*value*/ 23);
     let original_approval_policy = app.config.permissions.approval_policy.value();
     let original_sandbox_policy = app.config.legacy_sandbox_policy();
 
-    let fork_config = app.side_fork_config(parent_thread_id);
+    let side_config = app.side_thread_config(parent_thread_id);
 
-    assert!(!fork_config.ephemeral);
+    assert!(!side_config.ephemeral);
     assert_eq!(
-        fork_config.permissions.approval_policy.value(),
+        side_config.permissions.approval_policy.value(),
         original_approval_policy
     );
-    assert_eq!(fork_config.legacy_sandbox_policy(), original_sandbox_policy);
-    let developer_instructions = fork_config
+    assert_eq!(side_config.legacy_sandbox_policy(), original_sandbox_policy);
+    let developer_instructions = side_config
         .developer_instructions
         .as_deref()
         .expect("side developer instructions");
     assert!(
         developer_instructions.contains("You are in a side conversation, not the main thread.")
     );
+    assert!(developer_instructions.contains("Explicitly injected MAIN context is provided only"));
     assert!(
-        developer_instructions
-            .contains("inherited fork history is provided only as reference context")
-    );
-    assert!(
-        developer_instructions.contains(
-            "Only instructions submitted after the side-conversation boundary are active"
-        )
+        developer_instructions.contains("Only instructions submitted directly to SIDE are active")
     );
     assert!(developer_instructions.contains("Do not continue, execute, or complete any task"));
     assert!(
@@ -5325,8 +5357,7 @@ async fn side_fork_config_is_durable_and_appends_developer_guardrails() {
             .contains("External tools may be available according to this thread's current")
     );
     assert!(
-        developer_instructions
-            .contains("Any MCP or external tool calls or outputs visible in the inherited")
+        developer_instructions.contains("Do not infer active instructions from reference context")
     );
     assert!(developer_instructions.contains("non-mutating inspection"));
     assert!(developer_instructions.contains("Do not modify files"));
@@ -5336,7 +5367,7 @@ async fn side_fork_config_is_durable_and_appends_developer_guardrails() {
 }
 
 #[tokio::test]
-async fn side_fork_config_inherits_parent_thread_runtime_settings() {
+async fn side_thread_config_inherits_parent_thread_runtime_settings() {
     let mut app = make_test_app().await;
     let parent_thread_id = ThreadId::new();
     app.config.model = Some("persisted-default-model".to_string());
@@ -5359,16 +5390,16 @@ async fn side_fork_config_inherits_parent_thread_runtime_settings() {
     app.chat_widget
         .set_approvals_reviewer(ApprovalsReviewer::AutoReview);
 
-    let fork_config = app.side_fork_config(parent_thread_id);
+    let side_config = app.side_thread_config(parent_thread_id);
 
     assert_eq!(
         (
-            fork_config.model.as_deref(),
-            fork_config.model_reasoning_effort,
-            fork_config.service_tier.as_deref(),
-            fork_config.permissions.approval_policy.value(),
-            fork_config.permissions.permission_profile(),
-            fork_config.approvals_reviewer,
+            side_config.model.as_deref(),
+            side_config.model_reasoning_effort,
+            side_config.service_tier.as_deref(),
+            side_config.permissions.approval_policy.value(),
+            side_config.permissions.permission_profile(),
+            side_config.approvals_reviewer,
         ),
         (
             Some("parent-thread-model"),
@@ -6147,6 +6178,12 @@ async fn discard_closed_side_thread_removes_local_state_without_server_rpc() {
     app.active_thread_id = Some(side_thread_id);
     app.side_threads
         .insert(side_thread_id, SideThreadState::new(parent_thread_id));
+    super::side_pair_registry::remember_pair(
+        app.local_settings.codex_home.as_path(),
+        parent_thread_id,
+        side_thread_id,
+    )
+    .expect("persist MAIN/SIDE pair");
     app.thread_event_channels
         .insert(side_thread_id, ThreadEventChannel::new(/*capacity*/ 4));
     app.agent_navigation.upsert(
@@ -6162,6 +6199,14 @@ async fn discard_closed_side_thread_removes_local_state_without_server_rpc() {
     assert!(!app.side_threads.contains_key(&side_thread_id));
     assert!(!app.thread_event_channels.contains_key(&side_thread_id));
     assert_eq!(app.agent_navigation.get(&side_thread_id), None);
+    assert_eq!(
+        super::side_pair_registry::paired_side(
+            app.local_settings.codex_home.as_path(),
+            parent_thread_id
+        ),
+        Some(side_thread_id),
+        "local shutdown must not delete the durable resume pair"
+    );
 }
 
 #[tokio::test]

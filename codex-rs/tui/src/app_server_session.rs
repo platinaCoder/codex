@@ -1084,6 +1084,13 @@ impl AppServerSession {
         .await
     }
 
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "retained for compatibility tests and old SIDE rollouts"
+        )
+    )]
     pub(crate) async fn fork_side_thread(
         &mut self,
         local_settings: &LocalSettings,
