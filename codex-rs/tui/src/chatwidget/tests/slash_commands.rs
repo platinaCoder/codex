@@ -3332,6 +3332,28 @@ async fn slash_close_is_available_in_side_conversations() {
 }
 
 #[tokio::test]
+async fn slash_main_is_explicit_user_authorized_paired_dispatch() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let side_thread_id = ThreadId::new();
+    chat.thread_id = Some(side_thread_id);
+    chat.set_side_conversation_active(/*active*/ true);
+
+    chat.dispatch_command_with_args(
+        SlashCommand::Main,
+        "check the retention result".to_string(),
+        Vec::new(),
+    );
+
+    assert_matches!(
+        rx.try_recv(),
+        Ok(AppEvent::SendToPairedMain {
+            side_thread_id: actual,
+            message,
+        }) if actual == side_thread_id && message == "check the retention result"
+    );
+}
+
+#[tokio::test]
 async fn slash_app_requests_desktop_handoff() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     let thread_id = ThreadId::new();

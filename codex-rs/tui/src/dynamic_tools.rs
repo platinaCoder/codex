@@ -42,6 +42,7 @@ use codex_app_server_protocol::ThreadResumeResponse;
 use codex_app_server_protocol::ThreadSetNameParams;
 use codex_app_server_protocol::ThreadSetNameResponse;
 use codex_app_server_protocol::ThreadSortKey;
+use codex_app_server_protocol::ThreadSource;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStatus;
 use codex_app_server_protocol::ThreadStatusChangedNotification;
@@ -65,17 +66,26 @@ use serde_json::Value;
 use serde_json::json;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::path::Path;
+use std::path::PathBuf;
 use std::time::Duration;
 use tokio::sync::broadcast;
 use tokio::time::Instant;
 use uuid::Uuid;
+use walkdir::WalkDir;
+
+use crate::app_server_session::PERSISTENT_SIDE_THREAD_SOURCE_PREFIX;
 
 #[path = "dynamic_tools_response.rs"]
 mod response;
 
 pub(crate) const NAMESPACE: &str = "codex_tui";
-pub(crate) const DELEGATION_TOOLS: [&str; 3] =
-    ["create_thread", "send_message_to_thread", "fork_thread"];
+pub(crate) const DELEGATION_TOOLS: [&str; 4] = [
+    "create_thread",
+    "send_message_to_thread",
+    "send_message_to_main",
+    "fork_thread",
+];
 const DEFAULT_LIST_LIMIT: u32 = 10;
 const MAX_LIST_LIMIT: u32 = 50;
 const DEFAULT_READ_TURN_LIMIT: u32 = 1;
@@ -87,6 +97,9 @@ const MAX_INPUT_BYTES: usize = 1_000;
 const MAX_DELEGATED_INPUT_BYTES: usize = MAX_INPUT_BYTES + 256;
 const MAX_WAIT_TARGETS: usize = 8;
 const MAX_WAIT_TIMEOUT_MS: u64 = 120_000;
+const MAX_WORKSPACE_FILE_BYTES: u64 = 256 * 1024;
+const MAX_WORKSPACE_RESULTS: usize = 200;
+const MAX_WORKSPACE_VISITED_FILES: usize = 5_000;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -125,6 +138,33 @@ struct SendArguments {
     thread_id: String,
     prompt: String,
     model: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PairedMainSendArguments {
+    prompt: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WorkspacePathArguments {
+    path: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WorkspaceReadArguments {
+    path: String,
+    max_chars: Option<usize>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WorkspaceSearchArguments {
+    query: String,
+    path: Option<String>,
+    max_results: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -202,6 +242,37 @@ pub(crate) fn tool_specs() -> Vec<DynamicToolSpec> {
                 "timeoutMs": {"type": "integer", "minimum": 0, "maximum": MAX_WAIT_TIMEOUT_MS}
             }),
             vec!["targets"],
+        ),
+        (
+            "read_workspace_file",
+            "Read a UTF-8 text file under the calling task's workspace without executing commands or changing filesystem state.",
+            json!({
+                "path": {"type": "string", "minLength": 1},
+                "maxChars": {"type": "integer", "minimum": 1, "maximum": MAX_OUTPUT_CHARS}
+            }),
+            vec!["path"],
+        ),
+        (
+            "list_workspace_directory",
+            "List one directory under the calling task's workspace without executing commands or changing filesystem state.",
+            json!({"path": {"type": "string"}}),
+            Vec::new(),
+        ),
+        (
+            "search_workspace_text",
+            "Search UTF-8 text files under the calling task's workspace. Results are bounded and this tool never executes commands or changes filesystem state.",
+            json!({
+                "query": {"type": "string", "minLength": 1, "maxLength": 256},
+                "path": {"type": "string"},
+                "maxResults": {"type": "integer", "minimum": 1, "maximum": MAX_WORKSPACE_RESULTS}
+            }),
+            vec!["query"],
+        ),
+        (
+            "send_message_to_main",
+            "Send advice only to this SIDE conversation's durably paired MAIN thread. The target is resolved by the runtime and cannot be selected by the model. Proactive sends require user approval; use /main for an explicit user-directed send.",
+            json!({"prompt": prompt}),
+            vec!["prompt"],
         ),
         (
             "send_message_to_thread",
@@ -336,6 +407,140 @@ async fn execute_inner(
             .map(|server| HashMap::from([(key, server.clone())]))
     });
     match params.tool.as_str() {
+        "read_workspace_file" => {
+            let arguments: WorkspaceReadArguments = parse_arguments(params.arguments)?;
+            let source = read_thread(&handle, &params.thread_id).await?;
+            let root = canonical_workspace_root(source.cwd.as_path())?;
+            let path = resolve_workspace_path(&root, &arguments.path)?;
+            let metadata = std::fs::metadata(&path).map_err(|error| error.to_string())?;
+            if !metadata.is_file() {
+                return Err("path is not a regular file".to_string());
+            }
+            if metadata.len() > MAX_WORKSPACE_FILE_BYTES {
+                return Err(format!(
+                    "file exceeds the {MAX_WORKSPACE_FILE_BYTES}-byte read-only limit"
+                ));
+            }
+            let bytes = std::fs::read(&path).map_err(|error| error.to_string())?;
+            let text =
+                String::from_utf8(bytes).map_err(|_| "file is not valid UTF-8 text".to_string())?;
+            let max_chars = arguments.max_chars.unwrap_or(MAX_OUTPUT_CHARS);
+            if !(1..=MAX_OUTPUT_CHARS).contains(&max_chars) {
+                return Err(format!("maxChars must be between 1 and {MAX_OUTPUT_CHARS}"));
+            }
+            let truncated = text.chars().count() > max_chars;
+            let text = text.chars().take(max_chars).collect::<String>();
+            Ok(json!({
+                "path": workspace_relative(&root, &path),
+                "text": text,
+                "truncated": truncated
+            }))
+        }
+        "list_workspace_directory" => {
+            let arguments: WorkspacePathArguments = parse_arguments(params.arguments)?;
+            let source = read_thread(&handle, &params.thread_id).await?;
+            let root = canonical_workspace_root(source.cwd.as_path())?;
+            let path = resolve_workspace_path(&root, arguments.path.as_deref().unwrap_or("."))?;
+            if !path.is_dir() {
+                return Err("path is not a directory".to_string());
+            }
+            let mut entries = std::fs::read_dir(&path)
+                .map_err(|error| error.to_string())?
+                .filter_map(Result::ok)
+                .map(|entry| {
+                    let entry_path = entry.path();
+                    let kind = entry
+                        .file_type()
+                        .ok()
+                        .map(|kind| {
+                            if kind.is_dir() {
+                                "directory"
+                            } else if kind.is_file() {
+                                "file"
+                            } else if kind.is_symlink() {
+                                "symlink"
+                            } else {
+                                "other"
+                            }
+                        })
+                        .unwrap_or("unknown");
+                    json!({
+                        "path": workspace_relative(&root, &entry_path),
+                        "kind": kind
+                    })
+                })
+                .collect::<Vec<_>>();
+            entries.sort_by(|left, right| left["path"].as_str().cmp(&right["path"].as_str()));
+            let truncated = entries.len() > MAX_WORKSPACE_RESULTS;
+            entries.truncate(MAX_WORKSPACE_RESULTS);
+            Ok(json!({
+                "path": workspace_relative(&root, &path),
+                "entries": entries,
+                "truncated": truncated
+            }))
+        }
+        "search_workspace_text" => {
+            let arguments: WorkspaceSearchArguments = parse_arguments(params.arguments)?;
+            let query = arguments.query;
+            if query.is_empty() || query.len() > 256 {
+                return Err("query must contain between 1 and 256 UTF-8 bytes".to_string());
+            }
+            let max_results = arguments.max_results.unwrap_or(50);
+            if !(1..=MAX_WORKSPACE_RESULTS).contains(&max_results) {
+                return Err(format!(
+                    "maxResults must be between 1 and {MAX_WORKSPACE_RESULTS}"
+                ));
+            }
+            let source = read_thread(&handle, &params.thread_id).await?;
+            let root = canonical_workspace_root(source.cwd.as_path())?;
+            let path = resolve_workspace_path(&root, arguments.path.as_deref().unwrap_or("."))?;
+            let mut matches = Vec::new();
+            let mut visited_files = 0usize;
+            for entry in WalkDir::new(&path)
+                .follow_links(false)
+                .into_iter()
+                .filter_map(Result::ok)
+            {
+                if matches.len() >= max_results || visited_files >= MAX_WORKSPACE_VISITED_FILES {
+                    break;
+                }
+                if !entry.file_type().is_file() {
+                    continue;
+                }
+                visited_files += 1;
+                let Ok(metadata) = entry.metadata() else {
+                    continue;
+                };
+                if metadata.len() > MAX_WORKSPACE_FILE_BYTES {
+                    continue;
+                }
+                let Ok(bytes) = std::fs::read(entry.path()) else {
+                    continue;
+                };
+                let Ok(text) = std::str::from_utf8(&bytes) else {
+                    continue;
+                };
+                for (line_index, line) in text.lines().enumerate() {
+                    if line.contains(&query) {
+                        matches.push(json!({
+                            "path": workspace_relative(&root, entry.path()),
+                            "line": line_index + 1,
+                            "text": truncate(line, 500)
+                        }));
+                        if matches.len() >= max_results {
+                            break;
+                        }
+                    }
+                }
+            }
+            Ok(json!({
+                "query": query,
+                "matches": matches,
+                "visitedFiles": visited_files,
+                "truncated": matches.len() >= max_results
+                    || visited_files >= MAX_WORKSPACE_VISITED_FILES
+            }))
+        }
         "list_threads" | "list_archived_threads" => {
             let arguments: ListArguments = parse_arguments(params.arguments)?;
             let limit = arguments.limit.unwrap_or(DEFAULT_LIST_LIMIT);
@@ -686,57 +891,36 @@ async fn execute_inner(
                 "continuation": "The fork contains completed history only. If the source thread was running, the active turn and unfinished response are not in the child. Send a follow-up message to threadId only if the task requires work to continue there."
             }))
         }
+        "send_message_to_main" => {
+            let arguments: PairedMainSendArguments = parse_arguments(params.arguments)?;
+            let target_thread_id = paired_main_thread_id(&handle, &params.thread_id).await?;
+            send_delegated_message(
+                &handle,
+                &features,
+                app_event_tx,
+                &params.thread_id,
+                &target_thread_id,
+                arguments.prompt,
+                /*model*/ None,
+                mcp_config,
+                "send_message_to_main",
+            )
+            .await
+        }
         "send_message_to_thread" => {
             let arguments: SendArguments = parse_arguments(params.arguments)?;
-            if arguments.model.as_deref().is_some_and(str::is_empty) {
-                return Err("model must not be empty".to_string());
-            }
-            validate_prompt(&arguments.prompt, MAX_INPUT_BYTES)?;
-            let prompt = delegated_prompt(&params.thread_id, &arguments.prompt);
-            validate_prompt(&prompt, MAX_DELEGATED_INPUT_BYTES)?;
-            let thread = read_thread(&handle, &arguments.thread_id).await?;
-            let exclude_turns = thread.history_mode == ThreadHistoryMode::Paginated;
-            let resumed: ThreadResumeResponse = request_with_history_fallback(
+            send_delegated_message(
                 &handle,
-                exclude_turns,
-                |request_id, exclude_turns| ClientRequest::ThreadResume {
-                    request_id,
-                    params: ThreadResumeParams {
-                        thread_id: arguments.thread_id.clone(),
-                        exclude_turns,
-                        config: mcp_config.clone(),
-                        ..ThreadResumeParams::default()
-                    },
-                },
-            )
-            .await?;
-            let daybreak_enabled = thread.daybreak_enabled.unwrap_or(false);
-            register_background_thread(
-                app_event_tx,
-                resumed.thread,
-                /*task_tools_available*/ false,
-            )
-            .await?;
-            let cyber_access_program = background_turn_program(
                 &features,
-                &handle,
+                app_event_tx,
+                &params.thread_id,
                 &arguments.thread_id,
-                arguments.model.as_deref().unwrap_or(&resumed.model),
-                &resumed.model_provider,
-                daybreak_enabled,
-            )
-            .await?;
-            start_turn(
-                &handle,
-                &arguments.thread_id,
-                "send_message_to_thread",
-                prompt,
+                arguments.prompt,
                 arguments.model,
-                /*sandbox_policy*/ None,
-                cyber_access_program,
+                mcp_config,
+                "send_message_to_thread",
             )
-            .await?;
-            Ok(json!({"threadId": arguments.thread_id}))
+            .await
         }
         "set_thread_title" => {
             let arguments: TitleArguments = parse_arguments(params.arguments)?;
@@ -1118,6 +1302,33 @@ fn validate_prompt(prompt: &str, max_bytes: usize) -> Result<(), String> {
     Ok(())
 }
 
+fn canonical_workspace_root(root: &Path) -> Result<PathBuf, String> {
+    std::fs::canonicalize(root)
+        .map_err(|error| format!("failed to resolve workspace root: {error}"))
+}
+
+fn resolve_workspace_path(root: &Path, requested: &str) -> Result<PathBuf, String> {
+    let requested = Path::new(requested);
+    let candidate = if requested.is_absolute() {
+        requested.to_path_buf()
+    } else {
+        root.join(requested)
+    };
+    let resolved = std::fs::canonicalize(&candidate)
+        .map_err(|error| format!("failed to resolve workspace path: {error}"))?;
+    if !resolved.starts_with(root) {
+        return Err("path is outside the calling task's workspace".to_string());
+    }
+    Ok(resolved)
+}
+
+fn workspace_relative(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .into_owned()
+}
+
 fn delegated_prompt(source_thread_id: &str, prompt: &str) -> String {
     let escape = |text: &str| {
         text.replace('&', "&amp;")
@@ -1150,7 +1361,10 @@ pub(crate) fn parse_delegated_tool_output(
     output: &FunctionCallOutputBody,
 ) -> Option<(String, String)> {
     if !matches!(namespace, Some(NAMESPACE | "codex_app"))
-        || !matches!(name, "create_thread" | "send_message_to_thread")
+        || !matches!(
+            name,
+            "create_thread" | "send_message_to_thread" | "send_message_to_main"
+        )
     {
         return None;
     }
@@ -1230,6 +1444,90 @@ async fn read_thread(handle: &AppServerRequestHandle, thread_id: &str) -> Result
     })
     .await?;
     Ok(response.thread)
+}
+
+async fn paired_main_thread_id(
+    handle: &AppServerRequestHandle,
+    side_thread_id: &str,
+) -> Result<String, String> {
+    let side = read_thread(handle, side_thread_id).await?;
+    let Some(ThreadSource::Feature(source)) = side.thread_source.as_ref() else {
+        return Err("only a durable SIDE thread can message a paired MAIN thread".to_string());
+    };
+    let prefix = format!("{PERSISTENT_SIDE_THREAD_SOURCE_PREFIX}:");
+    let Some(parent) = source.strip_prefix(&prefix) else {
+        return Err("calling thread is not a durable SIDE thread".to_string());
+    };
+    let parent = ThreadId::from_string(parent)
+        .map_err(|_| "SIDE pairing metadata contains an invalid MAIN thread id".to_string())?
+        .to_string();
+    let main = read_thread(handle, &parent).await?;
+    if !same_thread_id(&main.id, &parent) {
+        return Err("paired MAIN thread could not be verified".to_string());
+    }
+    Ok(parent)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_delegated_message(
+    handle: &AppServerRequestHandle,
+    features: &Features,
+    app_event_tx: Option<&AppEventSender>,
+    source_thread_id: &str,
+    target_thread_id: &str,
+    prompt: String,
+    model: Option<String>,
+    mcp_config: Option<HashMap<String, Value>>,
+    tool_name: &str,
+) -> Result<Value, String> {
+    if model.as_deref().is_some_and(str::is_empty) {
+        return Err("model must not be empty".to_string());
+    }
+    validate_prompt(&prompt, MAX_INPUT_BYTES)?;
+    let prompt = delegated_prompt(source_thread_id, &prompt);
+    validate_prompt(&prompt, MAX_DELEGATED_INPUT_BYTES)?;
+    let thread = read_thread(handle, target_thread_id).await?;
+    let exclude_turns = thread.history_mode == ThreadHistoryMode::Paginated;
+    let resumed: ThreadResumeResponse =
+        request_with_history_fallback(handle, exclude_turns, |request_id, exclude_turns| {
+            ClientRequest::ThreadResume {
+                request_id,
+                params: ThreadResumeParams {
+                    thread_id: target_thread_id.to_string(),
+                    exclude_turns,
+                    config: mcp_config.clone(),
+                    ..ThreadResumeParams::default()
+                },
+            }
+        })
+        .await?;
+    let daybreak_enabled = thread.daybreak_enabled.unwrap_or(false);
+    register_background_thread(
+        app_event_tx,
+        resumed.thread,
+        /*task_tools_available*/ false,
+    )
+    .await?;
+    let cyber_access_program = background_turn_program(
+        features,
+        handle,
+        target_thread_id,
+        model.as_deref().unwrap_or(&resumed.model),
+        &resumed.model_provider,
+        daybreak_enabled,
+    )
+    .await?;
+    start_turn(
+        handle,
+        target_thread_id,
+        tool_name,
+        prompt,
+        model,
+        /*sandbox_policy*/ None,
+        cyber_access_program,
+    )
+    .await?;
+    Ok(json!({"threadId": target_thread_id}))
 }
 
 async fn start_turn(

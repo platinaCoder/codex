@@ -28,7 +28,7 @@ External tools may be available according to this thread's current permissions. 
 
 Sub-agents are off-limits in this side conversation. Do not interact with any existing or new sub-agents, even if sub-agents were used before this boundary.
 
-SIDE is strictly read-only, including when a later SIDE message asks for a mutation. You may inspect, search, and read files; run genuinely non-mutating diagnostics; browse and read external sources; and use read-only microscope tools. Never edit, create, or delete files; alter git state, configuration, permissions, or workspace state; run builds that write artifacts; invoke mutating external tools; request broader permissions; or use sub-agents. The sole allowed state change is sending advice or instructions to the paired MAIN thread through send_message_to_thread."#;
+SIDE is strictly read-only, including when a later SIDE message asks for a mutation. You may inspect, search, and read files through dedicated read-only tools; browse and read external sources; and use read-only microscope tools. Arbitrary command execution is unavailable because it cannot guarantee zero filesystem mutation. Never edit, create, or delete files; alter git state, configuration, permissions, or workspace state; run builds that write artifacts; invoke mutating external tools; request broader permissions; or use sub-agents. The sole allowed state change is sending advice or instructions to the paired MAIN thread through send_message_to_main. The runtime resolves the paired MAIN UUID; never request or supply an arbitrary target thread id. A proactive send requires approval. When the user explicitly wants immediate dispatch without another approval prompt, tell them to use `/main <message>`."#;
 
 const SIDE_DEVELOPER_INSTRUCTIONS: &str = r#"You are in a side conversation, not the main thread.
 
@@ -79,11 +79,11 @@ External tools may be available according to this thread's current permissions. 
 
 Sub-agents are off-limits in this side conversation. Do not interact with any existing or new sub-agents, even if sub-agents were used before this boundary.
 
-SIDE is strictly read-only, including when a later SIDE user message explicitly asks for a mutation. You may inspect, search, and read files; run genuinely non-mutating diagnostics; browse and read external sources; and use read-only microscope tools.
+SIDE is strictly read-only, including when a later SIDE user message explicitly asks for a mutation. You may inspect, search, and read files through dedicated read-only tools; browse and read external sources; and use read-only microscope tools. Arbitrary command execution is unavailable because it cannot guarantee zero filesystem mutation.
 
-Never edit, create, or delete files; alter git state, configuration, permissions, or workspace state; run builds or commands that write artifacts; invoke mutating external tools; request broader permissions; or use sub-agents. The sole allowed state change is sending advice or instructions to the paired MAIN thread through send_message_to_thread.
+Never edit, create, or delete files; alter git state, configuration, permissions, or workspace state; run builds or commands that write artifacts; invoke mutating external tools; request broader permissions; or use sub-agents. The sole allowed state change is sending advice or instructions to the paired MAIN thread through send_message_to_main.
 
-You may instruct the paired main thread by calling send_message_to_thread with the MAIN thread id supplied below. Use that channel for concrete advice, corrections, requests, or conclusions that MAIN should act on. Do not pretend that a message was delivered unless the tool succeeds."#;
+You may instruct the paired main thread by calling send_message_to_main. The runtime derives and verifies the paired MAIN UUID from durable SIDE metadata; the tool accepts no target id. Proactive sends require user approval. If the current user explicitly wants immediate dispatch without another approval prompt, direct them to the deterministic `/main <message>` affordance. Use that channel for concrete advice, corrections, requests, or conclusions that MAIN should act on. Do not pretend that a message was delivered unless the tool succeeds."#;
 
 fn enforce_side_read_only_policy(config: &mut Config) -> std::result::Result<(), String> {
     config.strict_read_only_tools = true;
@@ -445,6 +445,10 @@ mod tests {
         assert!(developer_instructions.contains("Delimit inline mathematical notation"));
         assert!(developer_instructions.contains("strictly read-only"));
         assert!(developer_instructions.contains("sole allowed state change"));
+        assert!(developer_instructions.contains("send_message_to_main"));
+        assert!(developer_instructions.contains("tool accepts no target id"));
+        assert!(developer_instructions.contains("/main <message>"));
+        assert!(developer_instructions.contains("Arbitrary command execution is unavailable"));
         assert!(developer_instructions.contains("00000000-0000-0000-0000-000000000007"));
     }
 

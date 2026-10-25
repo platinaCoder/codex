@@ -541,6 +541,15 @@ impl InferPaneState {
         match key {
             KeyEvent {
                 code: KeyCode::Enter,
+                modifiers: KeyModifiers::SHIFT,
+                kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                ..
+            } => {
+                self.insert_text("\n");
+                InferInputAction::None
+            }
+            KeyEvent {
+                code: KeyCode::Enter,
                 modifiers: KeyModifiers::NONE,
                 kind: KeyEventKind::Press,
                 ..
@@ -1003,6 +1012,35 @@ model = "checkpoint-small"
         assert!(matches!(
             pane.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             InferInputAction::Close
+        ));
+    }
+
+    #[tokio::test]
+    async fn shift_enter_inserts_newline_and_plain_enter_submits() {
+        let (request_tx, _request_rx) = mpsc::unbounded_channel();
+        let mut pane = InferPaneState {
+            session_id: Uuid::new_v4(),
+            target: "test".to_string(),
+            adapter: "test".to_string(),
+            focused: true,
+            status: InferStatus::Ready("ready".to_string()),
+            messages: Vec::new(),
+            input: "first".to_string(),
+            cursor: "first".len(),
+            scroll_rows: 0,
+            request_tx,
+            runtime_task: tokio::spawn(async {}),
+        };
+
+        assert!(matches!(
+            pane.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
+            InferInputAction::None
+        ));
+        pane.insert_text("second");
+        assert_eq!(pane.input, "first\nsecond");
+        assert!(matches!(
+            pane.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            InferInputAction::Submit(text) if text == "first\nsecond"
         ));
     }
 

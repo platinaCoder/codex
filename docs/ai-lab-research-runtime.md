@@ -32,13 +32,17 @@ user's preferred framing. This policy is applied both when a SIDE is created
 and when its persistent thread is resumed.
 
 SIDE is strictly read-only even when a later SIDE message requests a mutation.
-Its process sandbox has read-only filesystem access and no shell network access;
-its native tool surface is reduced to inspection operations, hosted web search,
-and read-only MCP tools. MCP tools must advertise `readOnlyHint`, and session
-settings reject later attempts to raise SIDE's filesystem or shell-network
-permissions. The sole state-changing exception is the exact
-`codex_tui.send_message_to_thread` bridge used to deliver advice to the paired
-MAIN UUID. Other task-management, patching, permission-escalation, build, and
+Arbitrary shell and process execution is absent—not merely sandboxed—because a
+general command transport cannot guarantee zero mutation across the workspace,
+`/tmp`, git configuration, subprocesses, and device APIs. SIDE instead receives
+bounded `read_workspace_file`, `list_workspace_directory`, and
+`search_workspace_text` tools, hosted web search, and read-only MCP tools. Paths
+for workspace reads are canonicalized and cannot escape the task workspace.
+MCP tools must advertise `readOnlyHint`, and session settings reject later
+attempts to raise SIDE's filesystem or network permissions. The sole
+state-changing exception is `codex_tui.send_message_to_main`. It takes no target
+UUID: the runtime derives and verifies the paired MAIN UUID from persisted SIDE
+metadata. Other task-management, patching, permission-escalation, build, and
 mutating external tools are unavailable.
 
 For mathematical explanations, SIDE defines unfamiliar notation and dimensions,
@@ -61,11 +65,17 @@ being guessed at.
 - `Ctrl+l` or `Ctrl+j`: focus SIDE when INFER is closed.
 - `/side`: focus the existing SIDE, or create it if the automatic setup was deferred until MAIN had its first persisted message.
 - Keyboard scrolling and composer input apply only to the focused pane. Each pane restores its own transcript position when focus changes.
+- `Shift+Enter`: insert a newline in the focused MAIN, SIDE, or INFER composer. Plain `Enter` submits.
 - `Ctrl+C` from an idle SIDE returns focus to MAIN without deleting or unsubscribing SIDE.
 
 The runtime injects the newest completed MAIN user or assistant message into SIDE as hidden developer context. It also refreshes that context when a persisted SIDE is restored.
 
-SIDE may advise or instruct MAIN through `send_message_to_thread` using the paired MAIN UUID. Delivery is explicit and does not merge the two histories.
+SIDE may advise or instruct MAIN through `send_message_to_main`; proactive
+model-initiated delivery remains approval-gated. Natural-language intent is not
+used to waive that approval because it is not a reliable authorization
+boundary. When the user explicitly wants immediate delivery, `/main <message>`
+is the deterministic, no-second-prompt affordance. Both paths are confined to
+the paired MAIN and do not merge the two histories.
 
 ## Ephemeral INFER pane
 

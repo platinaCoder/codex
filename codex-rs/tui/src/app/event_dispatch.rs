@@ -3146,6 +3146,47 @@ impl App {
                     tracing::warn!(%err, %side_thread_id, "failed to sync MAIN context into SIDE");
                 }
             }
+            AppEvent::SendToPairedMain {
+                side_thread_id,
+                message,
+            } => {
+                let response = crate::dynamic_tools::execute(
+                    app_server.request_handle(),
+                    codex_app_server_protocol::DynamicToolCallParams {
+                        thread_id: side_thread_id.to_string(),
+                        turn_id: format!("explicit-main-{}", uuid::Uuid::new_v4()),
+                        call_id: format!("explicit-main-{}", uuid::Uuid::new_v4()),
+                        namespace: Some(crate::dynamic_tools::NAMESPACE.to_string()),
+                        tool: "send_message_to_main".to_string(),
+                        arguments: serde_json::json!({"prompt": message}),
+                    },
+                    codex_app_server_protocol::ThreadStartParams::default(),
+                    self.config.features.get().clone(),
+                    self.dynamic_tool_status_updates.subscribe(),
+                    Some(&self.app_event_tx),
+                )
+                .await;
+                if response.success {
+                    self.chat_widget.add_info_message(
+                        "Sent to paired MAIN.".to_string(),
+                        /*hint*/ None,
+                    );
+                } else {
+                    let detail = response
+                        .content_items
+                        .into_iter()
+                        .find_map(|item| match item {
+                            codex_app_server_protocol::DynamicToolCallOutputContentItem::InputText {
+                                text,
+                            } => Some(text),
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| "dispatch failed".to_string());
+                    self.chat_widget
+                        .add_error_message(format!("Failed to send to paired MAIN: {detail}"));
+                }
+                tui.frame_requester().schedule_frame();
+            }
             AppEvent::RefreshPairedPane { thread_id } => {
                 self.pending_paired_pane_refreshes.remove(&thread_id);
                 self.refresh_paired_pane_projection(thread_id).await;

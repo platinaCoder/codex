@@ -156,6 +156,7 @@ impl DynamicToolMcpServer {
             "tools": {
                 "create_thread": {"approval_mode": "prompt"},
                 "send_message_to_thread": {"approval_mode": "prompt"},
+                "send_message_to_main": {"approval_mode": "prompt"},
                 "fork_thread": {"approval_mode": "prompt"},
                 "create_worktree": {"approval_mode": "approve"}
             }
@@ -289,10 +290,13 @@ impl ServerHandler for DynamicToolMcpHandler {
                         | "list_archived_threads"
                         | "read_thread"
                         | "wait_threads"
+                        | "read_workspace_file"
+                        | "list_workspace_directory"
+                        | "search_workspace_text"
                         // Strict SIDE policy treats this as its sole explicit
                         // state-changing exception; core narrows the codex_tui
-                        // namespace back down to this exact tool.
-                        | "send_message_to_thread"
+                        // namespace back down to the paired-target-only bridge.
+                        | "send_message_to_main"
                         | "list_worktrees"
                         | "get_worktree_creation_status"
                 )));

@@ -85,3 +85,26 @@ fn plain_enter_submits_expired_vim_insert_input() {
         },
     );
 }
+
+#[test]
+fn shift_enter_inserts_newline_while_plain_enter_submits() {
+    let (mut composer, _rx) = new_test_composer();
+    composer.draft.disable_paste_burst = true;
+    composer.handle_key_event(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+    assert_eq!(
+        composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
+        (InputResult::None, true)
+    );
+    composer.handle_key_event(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
+    assert_eq!(composer.current_text(), "a\nb");
+    assert_eq!(
+        composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        (
+            InputResult::Submitted {
+                text: "a\nb".to_string(),
+                text_elements: Vec::new(),
+            },
+            true,
+        )
+    );
+}

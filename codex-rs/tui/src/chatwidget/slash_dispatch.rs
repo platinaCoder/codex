@@ -409,6 +409,15 @@ impl ChatWidget {
             SlashCommand::Side | SlashCommand::Btw => {
                 self.request_empty_side_conversation(cmd);
             }
+            SlashCommand::Main => {
+                self.add_info_message(
+                    "Usage: /main <message>".to_string(),
+                    Some(
+                        "This command is available only from a paired SIDE conversation."
+                            .to_string(),
+                    ),
+                );
+            }
             SlashCommand::Infer => {
                 self.app_event_tx.send(AppEvent::StartInference {
                     model: String::new(),
@@ -1130,6 +1139,25 @@ impl ChatWidget {
                 );
                 self.request_side_conversation(parent_thread_id, Some(user_message));
             }
+            SlashCommand::Main if !trimmed.is_empty() => {
+                if !self.side_conversation_active() {
+                    self.add_error_message(
+                        "'/main' is available only from a paired SIDE conversation.".to_string(),
+                    );
+                    return;
+                }
+                let Some(side_thread_id) = self.thread_id else {
+                    self.add_error_message(
+                        "'/main' is unavailable before the SIDE session starts.".to_string(),
+                    );
+                    return;
+                };
+                self.app_event_tx.send(AppEvent::SendToPairedMain {
+                    side_thread_id,
+                    message: trimmed.to_string(),
+                });
+                self.append_message_history_entry(format!("/main {trimmed}"));
+            }
             SlashCommand::Review if !trimmed.is_empty() => {
                 self.submit_op(AppCommand::review(ReviewTarget::Custom {
                     instructions: args,
@@ -1360,6 +1388,7 @@ impl ChatWidget {
             | SlashCommand::Goal
             | SlashCommand::Side
             | SlashCommand::Btw
+            | SlashCommand::Main
             | SlashCommand::Infer
             | SlashCommand::Close
             | SlashCommand::Keymap

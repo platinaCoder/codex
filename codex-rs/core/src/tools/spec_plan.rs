@@ -555,9 +555,11 @@ pub(crate) fn finalize_tool_router(
 }
 
 /// SIDE uses a defense-in-depth tool surface in addition to its read-only
-/// process sandbox. MCP tools have already been filtered by `readOnlyHint` at
-/// discovery time. The one intentional state-changing exception is the
-/// dedicated TUI bridge that delivers advice to the paired MAIN thread.
+/// process sandbox. There is deliberately no arbitrary command transport: a
+/// read-only shell cannot provide a complete zero-write guarantee across the
+/// workspace, `/tmp`, git config, subprocesses, and device APIs. MCP tools have
+/// already been filtered by `readOnlyHint` at discovery time. The one
+/// intentional state-changing exception is the paired-MAIN message bridge.
 fn enforce_strict_read_only_tool_surface(
     turn_context: &TurnContext,
     registry: &mut ToolRegistry,
@@ -570,7 +572,13 @@ fn enforce_strict_read_only_tool_surface(
     registry.retain(|tool| {
         let name = tool.runtime.tool_name().with_default_namespace();
         if name.namespace.as_deref() == Some("codex_tui") {
-            return name.name == "send_message_to_thread";
+            return matches!(
+                name.name.as_str(),
+                "read_workspace_file"
+                    | "list_workspace_directory"
+                    | "search_workspace_text"
+                    | "send_message_to_main"
+            );
         }
         if tool.runtime.mcp_server_name().is_some() {
             return true;
@@ -578,9 +586,6 @@ fn enforce_strict_read_only_tool_surface(
         matches!(
             (name.namespace.as_deref(), name.name.as_str()),
             (
-                Some("functions"),
-                "exec_command" | "shell_command" | "write_stdin"
-            ) | (
                 Some("functions"),
                 "list_mcp_resources"
                     | "list_mcp_resource_templates"

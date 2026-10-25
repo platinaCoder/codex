@@ -13,11 +13,21 @@ use tempfile::TempDir;
 async fn test_server(
     tool_arguments: Value,
 ) -> color_eyre::Result<(TempDir, AppServerSession, String, String)> {
+    test_server_with_cwd(tool_arguments, /*cwd*/ None).await
+}
+
+async fn test_server_with_cwd(
+    tool_arguments: Value,
+    cwd: Option<&std::path::Path>,
+) -> color_eyre::Result<(TempDir, AppServerSession, String, String)> {
     let codex_home = tempfile::tempdir()?;
-    let config = ConfigBuilder::default()
+    let mut config = ConfigBuilder::default()
         .codex_home(codex_home.path().to_path_buf())
         .build()
         .await?;
+    if let Some(cwd) = cwd {
+        config.cwd = codex_utils_absolute_path::AbsolutePathBuf::try_from(cwd.to_path_buf())?;
+    }
     let target = create_fake_paginated_rollout(
         codex_home.path(),
         "2026-01-02T00-00-00",
@@ -785,6 +795,184 @@ async fn task_creation_and_followup_start_background_turns() -> color_eyre::Resu
     assert!(
         matches!(&oversized.content_items[..], [DynamicToolCallOutputContentItem::InputText { text }] if text.chars().count() <= MAX_ERROR_CHARS)
     );
+
+    server.shutdown().await?;
+    Ok(())
+}
+
+#[test]
+fn strict_side_command_write_attempts_have_no_dispatch_surface() -> color_eyre::Result<()> {
+    let workspace = tempfile::tempdir()?;
+    let outside = tempfile::tempdir()?;
+    let workspace_file = workspace.path().join("redirected.txt");
+    let workspace_dir = workspace.path().join("created");
+    let temp_file = outside.path().join("touched.txt");
+    let git_config = workspace.path().join("git-config");
+    let attempts = [
+        format!("printf unsafe > {}", workspace_file.display()),
+        format!("touch {}", temp_file.display()),
+        format!("mkdir {}", workspace_dir.display()),
+        format!(
+            "git config --file {} user.name unsafe",
+            git_config.display()
+        ),
+    ];
+
+    let tool_names = tool_specs()
+        .into_iter()
+        .flat_map(|spec| match spec {
+            DynamicToolSpec::Namespace(namespace) => namespace
+                .tools
+                .into_iter()
+                .map(|tool| match tool {
+                    DynamicToolNamespaceTool::Function(function) => function.name,
+                })
+                .collect::<Vec<_>>(),
+            DynamicToolSpec::Function(function) => vec![function.name],
+        })
+        .collect::<Vec<_>>();
+    for command in attempts {
+        let attempted_call = json!({"tool": "exec_command", "arguments": {"cmd": command}});
+        assert!(
+            !tool_names.iter().any(|name| name == "exec_command"),
+            "write attempt unexpectedly had a command transport: {attempted_call}"
+        );
+    }
+    assert!(!workspace_file.exists());
+    assert!(!workspace_dir.exists());
+    assert!(!temp_file.exists());
+    assert!(!git_config.exists());
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dedicated_workspace_tools_read_without_shell_execution() -> color_eyre::Result<()> {
+    let workspace = tempfile::tempdir()?;
+    std::fs::create_dir(workspace.path().join("src"))?;
+    std::fs::write(
+        workspace.path().join("Cargo.toml"),
+        "[package]\nname = \"side-read-test\"\n",
+    )?;
+    std::fs::write(
+        workspace.path().join("src/lib.rs"),
+        "pub const NEEDLE: &str = \"paired-main\";\n",
+    )?;
+    let (_codex_home, server, source, _target) =
+        test_server_with_cwd(json!({}), Some(workspace.path())).await?;
+
+    let read = response_json(
+        call_tool(
+            &server,
+            &source,
+            "read_workspace_file",
+            json!({"path": "Cargo.toml", "maxChars": 2000}),
+        )
+        .await,
+    );
+    assert!(
+        read["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("side-read-test"))
+    );
+
+    let search = response_json(
+        call_tool(
+            &server,
+            &source,
+            "search_workspace_text",
+            json!({"path": "src", "query": "paired-main", "maxResults": 5}),
+        )
+        .await,
+    );
+    assert!(
+        search["matches"]
+            .as_array()
+            .is_some_and(|matches| !matches.is_empty())
+    );
+
+    let list = response_json(
+        call_tool(
+            &server,
+            &source,
+            "list_workspace_directory",
+            json!({"path": "src"}),
+        )
+        .await,
+    );
+    assert!(
+        list["entries"]
+            .as_array()
+            .is_some_and(|entries| !entries.is_empty())
+    );
+
+    let escape = call_tool(
+        &server,
+        &source,
+        "read_workspace_file",
+        json!({"path": "/tmp"}),
+    )
+    .await;
+    assert!(!escape.success);
+
+    server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn paired_main_bridge_confines_target_to_side_metadata() -> color_eyre::Result<()> {
+    let (codex_home, mut server, source, target) = test_server(json!({})).await?;
+    let config = ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .build()
+        .await?;
+    let main = ThreadId::from_string(&target)?;
+    let side = server
+        .start_side_thread(
+            &crate::local_settings::LocalSettings::from(&config),
+            &config,
+            main,
+            /*selected_profile*/ None,
+        )
+        .await?
+        .session
+        .thread_id;
+
+    let rejected = call_tool(
+        &server,
+        &source,
+        "send_message_to_main",
+        json!({"prompt": "must not select an arbitrary target"}),
+    )
+    .await;
+    assert!(!rejected.success);
+
+    let sent = response_json(
+        call_tool(
+            &server,
+            &side.to_string(),
+            "send_message_to_main",
+            json!({"prompt": "paired-only advice"}),
+        )
+        .await,
+    );
+    assert_eq!(sent["threadId"], main.to_string());
+
+    let paired_spec = tool_specs()
+        .into_iter()
+        .find_map(|spec| match spec {
+            DynamicToolSpec::Namespace(namespace) => namespace.tools.into_iter().find_map(|tool| {
+                let DynamicToolNamespaceTool::Function(function) = tool;
+                (function.name == "send_message_to_main").then_some(function)
+            }),
+            DynamicToolSpec::Function(_) => None,
+        })
+        .expect("paired MAIN tool");
+    let properties = paired_spec.input_schema["properties"]
+        .as_object()
+        .expect("properties");
+    assert!(properties.contains_key("prompt"));
+    assert!(!properties.contains_key("threadId"));
 
     server.shutdown().await?;
     Ok(())

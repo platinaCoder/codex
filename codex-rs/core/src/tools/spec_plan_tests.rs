@@ -1105,7 +1105,12 @@ async fn strict_read_only_surface_keeps_reads_and_main_bridge_but_removes_mutati
             dynamic_tools: vec![
                 dynamic_tool(
                     Some("codex_tui"),
-                    "send_message_to_thread",
+                    "send_message_to_main",
+                    /*defer_loading*/ false,
+                ),
+                dynamic_tool(
+                    Some("codex_tui"),
+                    "read_workspace_file",
                     /*defer_loading*/ false,
                 ),
                 dynamic_tool(
@@ -1125,13 +1130,16 @@ async fn strict_read_only_surface_keeps_reads_and_main_bridge_but_removes_mutati
     .await;
 
     plan.assert_registered_contains(&[
-        "exec_command",
-        "write_stdin",
-        &ToolName::namespaced("codex_tui", "send_message_to_thread").to_string(),
+        &ToolName::namespaced("codex_tui", "send_message_to_main").to_string(),
+        &ToolName::namespaced("codex_tui", "read_workspace_file").to_string(),
     ]);
     plan.assert_registered_lacks(&[
+        "exec_command",
+        "shell_command",
+        "write_stdin",
         "apply_patch",
         "request_permissions",
+        &ToolName::namespaced("codex_tui", "send_message_to_thread").to_string(),
         &ToolName::namespaced("codex_tui", "create_thread").to_string(),
         &ToolName::namespaced("codex_tui", "set_thread_title").to_string(),
     ]);

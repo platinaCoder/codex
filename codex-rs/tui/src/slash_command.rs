@@ -47,6 +47,7 @@ pub enum SlashCommand {
     Agents,
     Side,
     Btw,
+    Main,
     Infer,
     Close,
     Copy,
@@ -148,6 +149,7 @@ impl SlashCommand {
             SlashCommand::Side | SlashCommand::Btw => {
                 "start a side conversation in an ephemeral fork"
             }
+            SlashCommand::Main => "send this message from SIDE to its paired MAIN thread",
             SlashCommand::Infer => "open an ephemeral local-model inference chat",
             SlashCommand::Close => "close the ephemeral inference pane",
             SlashCommand::Permissions => "choose what Codex is allowed to do",
@@ -199,6 +201,7 @@ impl SlashCommand {
                 | SlashCommand::Pets
                 | SlashCommand::Side
                 | SlashCommand::Btw
+                | SlashCommand::Main
                 | SlashCommand::Infer
                 | SlashCommand::Resume
         )
@@ -220,6 +223,7 @@ impl SlashCommand {
                 | SlashCommand::Pwd
                 | SlashCommand::Usage
                 | SlashCommand::Ide
+                | SlashCommand::Main
                 | SlashCommand::Infer
                 | SlashCommand::Close
         )
@@ -315,6 +319,7 @@ impl SlashCommand {
             | SlashCommand::Exit
             | SlashCommand::Side
             | SlashCommand::Btw
+            | SlashCommand::Main
             | SlashCommand::Infer
             | SlashCommand::Close => true,
             SlashCommand::Rollout => true,
