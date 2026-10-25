@@ -940,6 +940,15 @@ async fn paired_main_bridge_confines_target_scenario() -> color_eyre::Result<()>
         .codex_home(codex_home.path().to_path_buf())
         .build()
         .await?;
+    let (events_tx, _events_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (status_updates, _status_rx) = broadcast::channel(/*capacity*/ 8);
+    server
+        .start_dynamic_tool_mcp(
+            config.clone(),
+            AppEventSender::new(events_tx),
+            status_updates,
+        )
+        .await?;
     let mut side_config = config.clone();
     side_config.strict_read_only_tools = true;
     let main = ThreadId::from_string(&target)?;
@@ -1043,6 +1052,15 @@ async fn paired_main_bridge_confines_target_scenario() -> color_eyre::Result<()>
 
     server.shutdown().await?;
     let mut server = crate::start_embedded_app_server_for_picker(&config).await?;
+    let (events_tx, _events_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (status_updates, _status_rx) = broadcast::channel(/*capacity*/ 8);
+    server
+        .start_dynamic_tool_mcp(
+            config.clone(),
+            AppEventSender::new(events_tx),
+            status_updates,
+        )
+        .await?;
     for thread_id in [main, second_main] {
         server
             .resume_thread(
@@ -1128,10 +1146,7 @@ async fn paired_main_bridge_confines_target_scenario() -> color_eyre::Result<()>
     let mut in_process_side = ThreadStartParams::default();
     crate::dynamic_tools_mcp::ThreadToolTransport::Disabled
         .configure_paired_side(&mut in_process_side);
-    assert_eq!(
-        in_process_side.dynamic_tools,
-        Some(side_fallback_tool_specs())
-    );
+    assert_eq!(in_process_side.dynamic_tools, None);
 
     server.shutdown().await?;
     Ok(())

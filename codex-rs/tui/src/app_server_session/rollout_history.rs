@@ -190,6 +190,11 @@ impl AppServerSession {
                     .is_some_and(|main| ThreadId::from_string(main).is_ok()),
                 _ => false,
             });
+        if persisted_side && !thread_tool_transport.provides_paired_side_tools() {
+            return Err(color_eyre::eyre::eyre!(
+                "SIDE tools are unavailable because the authenticated local MCP server did not start; resolve the startup warning and retry"
+            ));
+        }
         if persisted_side {
             params
                 .config

@@ -1423,10 +1423,9 @@ impl App {
                 self.restore_side_user_message(user_message.take());
                 self.chat_widget
                     .set_side_conversation_context_label(/*label*/ None);
-                if activate {
-                    self.chat_widget
-                        .add_error_message(Self::side_start_error_message(&err));
-                } else {
+                self.chat_widget
+                    .add_error_message(Self::side_start_error_message(&err));
+                if !activate {
                     tracing::debug!(%err, %parent_thread_id, "automatic SIDE setup deferred");
                 }
             }

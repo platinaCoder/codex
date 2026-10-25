@@ -1812,9 +1812,19 @@ async fn side_main_mcp_bridge_survives_reattach_multiple_sides_and_cold_resume()
     boxed_future!(side_main_mcp_bridge_transport_scenario()).await
 }
 
-#[tokio::test]
-async fn embedded_side_keeps_read_and_main_bridge_tools_after_cold_resume() -> Result<()> {
-    boxed_future!(embedded_side_tools_cold_resume_scenario()).await
+#[test]
+fn embedded_side_keeps_read_and_main_bridge_tools_after_cold_resume() -> Result<()> {
+    std::thread::Builder::new()
+        .name("embedded-side-cold-resume-test".to_string())
+        .stack_size(32 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(embedded_side_tools_cold_resume_scenario())
+        })?
+        .join()
+        .map_err(|panic| color_eyre::eyre::eyre!("embedded SIDE test panicked: {panic:?}"))?
 }
 
 async fn embedded_side_tools_cold_resume_scenario() -> Result<()> {
@@ -2374,6 +2384,50 @@ async fn embedded_server_rejects_unowned_dynamic_tool_calls() -> Result<()> {
         panic!("expected a dynamic tool failure response")
     };
     assert!(!response.success);
+    app_server.shutdown().await?;
+    Ok(())
+}
+
+#[test]
+fn embedded_side_fails_closed_when_local_mcp_is_unavailable() -> Result<()> {
+    std::thread::Builder::new()
+        .name("embedded-side-fail-closed-test".to_string())
+        .stack_size(32 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(embedded_side_fails_closed_when_local_mcp_is_unavailable_scenario())
+        })?
+        .join()
+        .map_err(|panic| color_eyre::eyre::eyre!("embedded SIDE test panicked: {panic:?}"))?
+}
+
+async fn embedded_side_fails_closed_when_local_mcp_is_unavailable_scenario() -> Result<()> {
+    let codex_home = tempdir()?;
+    let config = crate::legacy_core::config::ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .build()
+        .await?;
+    let local_settings = crate::local_settings::LocalSettings::from(&config);
+    let mut app_server = crate::start_embedded_app_server_for_picker(&config).await?;
+
+    let error = app_server
+        .start_side_thread(
+            &local_settings,
+            &config,
+            ThreadId::new(),
+            /*selected_profile*/ None,
+        )
+        .await
+        .expect_err("embedded SIDE must require its authenticated MCP transport");
+
+    assert!(
+        error
+            .to_string()
+            .contains("authenticated local MCP server did not start"),
+        "{error}"
+    );
     app_server.shutdown().await?;
     Ok(())
 }

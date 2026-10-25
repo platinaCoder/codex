@@ -3163,7 +3163,11 @@ impl App {
                     codex_app_server_protocol::ThreadStartParams::default(),
                     self.config.features.get().clone(),
                     self.dynamic_tool_status_updates.subscribe(),
-                    Some(&self.app_event_tx),
+                    // The paired MAIN is already registered. This handler is
+                    // running on the app event loop, so asking the delegated
+                    // send to register it through that same loop would await
+                    // its own queued event and deadlock before TurnStart.
+                    None,
                 )
                 .await;
                 if response.success {

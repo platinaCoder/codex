@@ -90,19 +90,28 @@ impl ThreadToolTransport {
 
     pub(crate) fn configure_paired_side(&self, params: &mut ThreadStartParams) {
         match self {
-            // Direct dynamic tools have no per-call approval layer. If the
-            // authenticated loopback MCP is unavailable, retain only SIDE's
-            // bounded read surface and fail closed for model-originated MAIN
-            // dispatch. `/main` uses a private TUI event and remains available.
-            Self::Disabled | Self::Dynamic => {
+            // Embedded dynamic-tool requests are not owned by an external TUI
+            // task and are rejected by the event dispatcher. Never advertise
+            // a fallback surface that cannot execute.
+            Self::Disabled => params.dynamic_tools = None,
+            // External dynamic tools can retain SIDE's bounded read surface,
+            // but delegation remains MCP-only because direct calls have no
+            // per-call approval layer. `/main` is a private TUI action.
+            Self::Dynamic => {
                 params.dynamic_tools = Some(dynamic_tools::side_fallback_tool_specs());
             }
-            Self::Mcp(server) => {
-                params.dynamic_tools =
-                    (!server.task_tools).then(dynamic_tools::side_fallback_tool_specs);
+            Self::Mcp(_) => {
+                // Once an MCP transport is selected, direct dynamic requests
+                // are rejected. A worktree-only MCP therefore cannot provide
+                // SIDE's model tools and must not advertise dead fallbacks.
+                params.dynamic_tools = None;
                 self.configure_mcp(&mut params.config);
             }
         }
+    }
+
+    pub(crate) fn provides_paired_side_tools(&self) -> bool {
+        matches!(self, Self::Dynamic) || matches!(self, Self::Mcp(server) if server.task_tools)
     }
 
     pub(crate) fn provides_task_tools(&self) -> bool {

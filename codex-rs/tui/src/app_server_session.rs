@@ -927,6 +927,11 @@ impl AppServerSession {
         parent_thread_id: ThreadId,
         selected_profile: Option<&PermissionProfileSelection>,
     ) -> Result<AppServerStartedThread> {
+        if !self.thread_tool_transport().provides_paired_side_tools() {
+            return Err(color_eyre::eyre::eyre!(
+                "SIDE tools are unavailable because the authenticated local MCP server did not start; resolve the startup warning and retry /side"
+            ));
+        }
         self.start_thread_with_source(
             local_settings,
             config,

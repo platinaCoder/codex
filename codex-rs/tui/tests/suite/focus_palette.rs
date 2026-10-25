@@ -610,6 +610,274 @@ fn no_daemon_skips_startup_and_discovery() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn no_daemon_side_model_tools_and_main_dispatch_are_end_to_end() -> Result<()> {
+    use core_test_support::responses;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+    use wiremock::Mock;
+    use wiremock::Respond;
+    use wiremock::ResponseTemplate;
+    use wiremock::matchers::method;
+    use wiremock::matchers::path_regex;
+
+    struct SequenceResponder {
+        call_count: AtomicUsize,
+        bodies: Vec<String>,
+    }
+
+    fn is_thread_title_body(body: &serde_json::Value) -> bool {
+        body.pointer("/client_metadata/x-codex-turn-metadata")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|metadata| serde_json::from_str::<serde_json::Value>(metadata).ok())
+            .and_then(|metadata| metadata.get("thread_source").cloned())
+            .and_then(|source| source.as_str().map(str::to_owned))
+            .is_some_and(|source| source == "thread_title")
+    }
+
+    impl Respond for SequenceResponder {
+        fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+            let is_thread_title = serde_json::from_slice::<serde_json::Value>(&request.body)
+                .ok()
+                .is_some_and(|body| is_thread_title_body(&body));
+            if is_thread_title {
+                return ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(responses::sse(vec![
+                        responses::ev_assistant_message(
+                            "side-smoke-title",
+                            r#"{"title":"SIDE smoke"}"#,
+                        ),
+                        responses::ev_completed("side-smoke-title-response"),
+                    ]));
+            }
+            let index = self.call_count.fetch_add(1, Ordering::SeqCst);
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(
+                    self.bodies
+                        .get(index)
+                        .unwrap_or_else(|| panic!("unexpected model request {index}"))
+                        .clone(),
+                )
+        }
+    }
+
+    fn submit(terminal: &mut PtyCodex, input: &str) -> Result<()> {
+        terminal.write_input(format!("\x1b[200~{input}\x1b[201~").as_bytes())?;
+        terminal.wait_for_screen(input)?;
+        let deadline = Instant::now() + Duration::from_secs(/*secs*/ 30);
+        while terminal.screen_contains("tab to queue message") {
+            ensure!(
+                Instant::now() < deadline,
+                "composer remained busy before {input:?}"
+            );
+            terminal.read_output(Duration::from_millis(/*millis*/ 50))?;
+            terminal.ensure_running()?;
+        }
+        terminal.write_input(b"\r")?;
+        Ok(())
+    }
+
+    fn submit_typed(terminal: &mut PtyCodex, input: &str) -> Result<()> {
+        for byte in input.as_bytes() {
+            terminal.write_input(&[*byte])?;
+            // Stay beyond the composer's 8ms paste-burst threshold so this
+            // exercises literal user typing instead of paste normalization.
+            std::thread::sleep(Duration::from_millis(/*millis*/ 10));
+            terminal.read_output(Duration::from_millis(/*millis*/ 10))?;
+        }
+        terminal.wait_for_screen(input)?;
+        terminal.write_input(b"\r")?;
+        Ok(())
+    }
+
+    let workspace = tempfile::tempdir()?;
+    let workspace_path = workspace.path().canonicalize()?;
+    std::fs::write(
+        workspace_path.join("side-smoke.txt"),
+        "SIDE_MODEL_READ_NEEDLE\n",
+    )?;
+    let home = tempfile::tempdir()?;
+    write_test_config(home.path(), &workspace_path)?;
+    let model = responses::start_mock_server().await;
+    let config_path = home.path().join("config.toml");
+    let config = std::fs::read_to_string(&config_path)?.replace(
+        "model_provider = \"openai\"",
+        "model_provider = \"side-smoke\"",
+    );
+    std::fs::write(
+        &config_path,
+        format!(
+            "{config}\n[model_providers.side-smoke]\nname = \"SIDE smoke\"\nbase_url = \"{}/v1\"\nwire_api = \"responses\"\nrequires_openai_auth = false\nsupports_websockets = false\nrequest_max_retries = 0\nstream_max_retries = 0\n",
+            model.uri()
+        ),
+    )?;
+
+    let model_responses = vec![
+        responses::sse(vec![
+            responses::ev_assistant_message("main-seeded", "MAIN_SEEDED"),
+            responses::ev_completed("main-seeded-response"),
+        ]),
+        responses::sse(vec![
+            responses::ev_response_created("side-read-response"),
+            responses::ev_function_call_with_namespace(
+                "side-read",
+                "mcp__codex_tui",
+                "read_workspace_file",
+                r#"{"path":"side-smoke.txt"}"#,
+            ),
+            responses::ev_completed("side-read-response"),
+        ]),
+        responses::sse(vec![
+            responses::ev_response_created("side-list-response"),
+            responses::ev_function_call_with_namespace(
+                "side-list",
+                "mcp__codex_tui",
+                "list_workspace_directory",
+                r#"{"path":"."}"#,
+            ),
+            responses::ev_completed("side-list-response"),
+        ]),
+        responses::sse(vec![
+            responses::ev_response_created("side-search-response"),
+            responses::ev_function_call_with_namespace(
+                "side-search",
+                "mcp__codex_tui",
+                "search_workspace_text",
+                r#"{"query":"SIDE_MODEL_READ_NEEDLE","path":"."}"#,
+            ),
+            responses::ev_completed("side-search-response"),
+        ]),
+        responses::sse(vec![
+            responses::ev_assistant_message("side-done", "SIDE_MODEL_READS_OK"),
+            responses::ev_completed("side-done-response"),
+        ]),
+        responses::sse(vec![
+            responses::ev_assistant_message("main-done", "MAIN_SLASH_DISPATCH_OK"),
+            responses::ev_completed("main-done-response"),
+        ]),
+        responses::sse(vec![
+            responses::ev_response_created("side-proactive-response"),
+            responses::ev_function_call_with_namespace(
+                "side-proactive",
+                "mcp__codex_tui",
+                "send_message_to_main",
+                r#"{"prompt":"PROACTIVE_SIDE_MESSAGE"}"#,
+            ),
+            responses::ev_completed("side-proactive-response"),
+        ]),
+    ];
+    Mock::given(method("POST"))
+        .and(path_regex(r"/v1/responses$"))
+        .respond_with(SequenceResponder {
+            call_count: AtomicUsize::new(0),
+            bodies: model_responses,
+        })
+        .mount(&model)
+        .await;
+
+    let mut terminal = if let Some(candidate) = std::env::var_os("AI_LAB_CODEX_STAGED") {
+        PtyCodex::start_binary(
+            Path::new(&candidate),
+            &workspace_path,
+            home,
+            &[
+                "--no-daemon",
+                "--no-alt-screen",
+                "Seed MAIN before SIDE smoke.",
+            ],
+            /*editor*/ None,
+        )?
+    } else {
+        PtyCodex::start(
+            &workspace_path,
+            home,
+            &[
+                "--no-daemon",
+                "--no-alt-screen",
+                "Seed MAIN before SIDE smoke.",
+            ],
+        )?
+    };
+    terminal.wait_for_startup()?;
+    terminal.wait_for_screen("MAIN_SEEDED")?;
+    submit(&mut terminal, "/side")?;
+    terminal.wait_for_screen("Side from main thread")?;
+    submit(&mut terminal, "READ_SIDE_MARKER")?;
+    terminal.wait_for_screen("SIDE_MODEL_READS_OK")?;
+
+    let requests = responses::received_responses_requests(&model)
+        .await
+        .into_iter()
+        .filter(|request| !is_thread_title_body(&request.body_json()))
+        .collect::<Vec<_>>();
+    ensure!(
+        requests.len() == 5,
+        "expected MAIN seed plus four SIDE model requests, got {}",
+        requests.len()
+    );
+    ensure!(
+        requests[2]
+            .function_call_output("side-read")
+            .to_string()
+            .contains("SIDE_MODEL_READ_NEEDLE"),
+        "read output missing from request: {}",
+        requests[2].body_json()
+    );
+    ensure!(
+        requests[3]
+            .function_call_output("side-list")
+            .to_string()
+            .contains("side-smoke.txt"),
+        "list output missing from request: {}",
+        requests[3].body_json()
+    );
+    ensure!(
+        requests[4]
+            .function_call_output("side-search")
+            .to_string()
+            .contains("SIDE_MODEL_READ_NEEDLE"),
+        "search output missing from request: {}",
+        requests[4].body_json()
+    );
+
+    submit_typed(&mut terminal, "/main verify deterministic dispatch")?;
+    let dispatch_deadline = Instant::now() + Duration::from_secs(/*secs*/ 5);
+    let dispatched_requests = loop {
+        terminal.read_output(Duration::from_millis(/*millis*/ 50))?;
+        let requests = responses::received_responses_requests(&model)
+            .await
+            .into_iter()
+            .filter(|request| !is_thread_title_body(&request.body_json()))
+            .collect::<Vec<_>>();
+        if requests.len() >= 6 || Instant::now() >= dispatch_deadline {
+            break requests;
+        }
+    };
+    ensure!(
+        dispatched_requests.len() == 6,
+        "/main did not start the paired MAIN turn; got {} model requests; screen:\n{}",
+        dispatched_requests.len(),
+        terminal.screen_contents()
+    );
+    terminal.wait_for_screen("MAIN_SLASH_DISPATCH_OK")?;
+    submit(&mut terminal, "PROACTIVE_SIDE_SEND")?;
+    terminal.wait_for_screen("Allow the codex_tui MCP server")?;
+    ensure!(
+        responses::received_responses_requests(&model)
+            .await
+            .into_iter()
+            .filter(|request| !is_thread_title_body(&request.body_json()))
+            .count()
+            == 7,
+        "proactive SIDE dispatch must pause before a follow-up model request"
+    );
+    ensure!(terminal.screen_contains("Allow"));
+
+    Ok(())
+}
+
 #[test]
 fn auto_daemon_start_failure_exits_with_manual_fallback_hint() -> Result<()> {
     let workspace = tempfile::tempdir()?;

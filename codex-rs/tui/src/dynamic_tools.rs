@@ -336,10 +336,10 @@ pub(crate) fn non_delegation_tool_specs() -> Vec<DynamicToolSpec> {
     tool_specs_without_delegation_except(/*retained_delegation*/ None)
 }
 
-/// Direct dynamic tools have no MCP approval layer. When SIDE cannot use the
-/// authenticated loopback MCP, fail closed by exposing only observational
-/// tools. The explicit `/main` UI path calls the paired bridge internally and
-/// does not depend on advertising it to the model.
+/// External direct-dynamic transports have no MCP approval layer. Keep their
+/// SIDE fallback observational; embedded sessions require the authenticated
+/// loopback MCP instead of advertising direct tools that they cannot execute.
+/// The explicit `/main` UI path calls the paired bridge internally.
 pub(crate) fn side_fallback_tool_specs() -> Vec<DynamicToolSpec> {
     non_delegation_tool_specs()
 }
