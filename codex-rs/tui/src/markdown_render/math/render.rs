@@ -1,6 +1,6 @@
 //! Bounded Unicode layout for a deliberately small TeX math subset.
 //! Accents apply only to single graphemes so their scope survives terminal rendering.
-//! Unsupported Unicode scripts use explicit grouping; structured layouts remain bounded.
+//! Unsupported Unicode scripts use raised/lowered grouping; structured layouts remain bounded.
 
 use crate::width::display_width;
 use unicode_segmentation::UnicodeSegmentation;
@@ -89,6 +89,12 @@ enum SequenceEnd {
     Cell,
 }
 
+#[derive(Clone, Copy)]
+enum ScriptPosition {
+    Above,
+    Below,
+}
+
 impl MathParser<'_> {
     fn take(&mut self) -> Option<char> {
         let ch = self.remaining.chars().next()?;
@@ -170,36 +176,13 @@ impl MathParser<'_> {
             '\\' => self.command(),
             '^' | '_' => {
                 let arg = self.compact_argument()?;
-                let (plain, alphabet) = if ch == '^' {
-                    (
-                        "0123456789+-=()abcdefghijklmnoprstuvwxyz",
-                        "⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁼⁽⁾ᵃᵇᶜᵈᵉᶠᵍʰⁱʲᵏˡᵐⁿᵒᵖʳˢᵗᵘᵛʷˣʸᶻ",
-                    )
-                } else {
-                    (
-                        "0123456789+-=()aehijklmnoprstuvx",
-                        "₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎ₐₑₕᵢⱼₖₗₘₙₒₚᵣₛₜᵤᵥₓ",
-                    )
-                };
                 let text = arg.single()?;
-                let output: Option<String> = text
-                    .chars()
-                    .map(|value| {
-                        if let Some(index) = plain.chars().position(|ch| ch == value) {
-                            alphabet.chars().nth(index)
-                        } else if matches!(value, ',' | ';' | ':') {
-                            // Unicode has no general script-height punctuation. Retaining a narrow
-                            // separator is still unambiguous between lowered/raised index atoms and
-                            // avoids rejecting common grouped indices such as `a_{j,t}`.
-                            Some(value)
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                Some(Layout::text(
-                    output.unwrap_or_else(|| format!("{ch}{{{text}}}")),
-                ))
+                let position = if ch == '^' {
+                    ScriptPosition::Above
+                } else {
+                    ScriptPosition::Below
+                };
+                Some(Layout::text(render_script(text, position)))
             }
             '}' | '$' | '%' | '#' | '&' | '`' => None,
             ch if ch.is_whitespace() => {
@@ -290,7 +273,8 @@ impl MathParser<'_> {
                 };
                 Some(Layout::text(text))
             }
-            "hat" | "widehat" | "bar" | "tilde" | "vec" | "dot" | "ddot" => {
+            "hat" | "widehat" | "bar" | "overline" | "tilde" | "widetilde" | "vec"
+            | "overrightarrow" | "dot" | "ddot" | "check" | "breve" | "acute" | "grave" => {
                 let arg = self.argument()?;
                 let text = arg.single()?;
                 if text.graphemes(/*is_extended*/ true).count() != 1
@@ -301,11 +285,15 @@ impl MathParser<'_> {
                 }
                 let accent = match name {
                     "hat" | "widehat" => '\u{0302}',
-                    "bar" => '\u{0304}',
-                    "tilde" => '\u{0303}',
-                    "vec" => '\u{20d7}',
+                    "bar" | "overline" => '\u{0304}',
+                    "tilde" | "widetilde" => '\u{0303}',
+                    "vec" | "overrightarrow" => '\u{20d7}',
                     "dot" => '\u{0307}',
                     "ddot" => '\u{0308}',
+                    "check" => '\u{030c}',
+                    "breve" => '\u{0306}',
+                    "acute" => '\u{0301}',
+                    "grave" => '\u{0300}',
                     _ => unreachable!(),
                 };
                 Some(Layout::text(format!("{text}{accent}")))
@@ -350,6 +338,149 @@ impl MathParser<'_> {
             }
             _ => symbol(name).map(Layout::text),
         }
+    }
+}
+
+fn render_script(text: &str, position: ScriptPosition) -> String {
+    let converted = text
+        .chars()
+        .map(|ch| script_char(ch, position))
+        .collect::<Option<String>>();
+    converted.unwrap_or_else(|| {
+        let (open, close) = match position {
+            ScriptPosition::Above => ('⁽', '⁾'),
+            ScriptPosition::Below => ('₍', '₎'),
+        };
+        format!("{open}{text}{close}")
+    })
+}
+
+fn script_char(ch: char, position: ScriptPosition) -> Option<char> {
+    // Unicode does not define a complete superscript/subscript alphabet. Only use exact
+    // codepoints here: visually substituting a lowercase modifier for an unsupported capital
+    // would change mathematical notation. The caller keeps those labels explicit and grouped.
+    match position {
+        ScriptPosition::Above => Some(match ch {
+            '0' => '⁰',
+            '1' => '¹',
+            '2' => '²',
+            '3' => '³',
+            '4' => '⁴',
+            '5' => '⁵',
+            '6' => '⁶',
+            '7' => '⁷',
+            '8' => '⁸',
+            '9' => '⁹',
+            '+' => '⁺',
+            '-' => '⁻',
+            '=' => '⁼',
+            '(' => '⁽',
+            ')' => '⁾',
+            '*' => '⁎',
+            'a' => 'ᵃ',
+            'b' => 'ᵇ',
+            'c' => 'ᶜ',
+            'd' => 'ᵈ',
+            'e' => 'ᵉ',
+            'f' => 'ᶠ',
+            'g' => 'ᵍ',
+            'h' => 'ʰ',
+            'i' => 'ⁱ',
+            'j' => 'ʲ',
+            'k' => 'ᵏ',
+            'l' => 'ˡ',
+            'm' => 'ᵐ',
+            'n' => 'ⁿ',
+            'o' => 'ᵒ',
+            'p' => 'ᵖ',
+            'r' => 'ʳ',
+            's' => 'ˢ',
+            't' => 'ᵗ',
+            'u' => 'ᵘ',
+            'v' => 'ᵛ',
+            'w' => 'ʷ',
+            'x' => 'ˣ',
+            'y' => 'ʸ',
+            'z' => 'ᶻ',
+            'A' => 'ᴬ',
+            'B' => 'ᴮ',
+            'C' => 'ꟲ',
+            'D' => 'ᴰ',
+            'E' => 'ᴱ',
+            'F' => 'ꟳ',
+            'G' => 'ᴳ',
+            'H' => 'ᴴ',
+            'I' => 'ᴵ',
+            'J' => 'ᴶ',
+            'K' => 'ᴷ',
+            'L' => 'ᴸ',
+            'M' => 'ᴹ',
+            'N' => 'ᴺ',
+            'O' => 'ᴼ',
+            'P' => 'ᴾ',
+            'Q' => 'ꟴ',
+            'R' => 'ᴿ',
+            'T' => 'ᵀ',
+            'U' => 'ᵁ',
+            'V' => 'ⱽ',
+            'W' => 'ᵂ',
+            'α' => 'ᵅ',
+            'β' => 'ᵝ',
+            'γ' => 'ᵞ',
+            'δ' => 'ᵟ',
+            'θ' => 'ᶿ',
+            'ι' => 'ᶥ',
+            'φ' => 'ᶲ',
+            'ϕ' => 'ᵠ',
+            'χ' => 'ᵡ',
+            // Prime glyphs already carry their own vertical placement.
+            '′' | '″' | '‴' | '⁗' => ch,
+            // Unicode has no general script-height punctuation. A narrow separator remains
+            // unambiguous between raised/lowered atoms, as in `a_{j,t}`.
+            ',' | ';' | ':' => ch,
+            _ => return None,
+        }),
+        ScriptPosition::Below => Some(match ch {
+            '0' => '₀',
+            '1' => '₁',
+            '2' => '₂',
+            '3' => '₃',
+            '4' => '₄',
+            '5' => '₅',
+            '6' => '₆',
+            '7' => '₇',
+            '8' => '₈',
+            '9' => '₉',
+            '+' => '₊',
+            '-' => '₋',
+            '=' => '₌',
+            '(' => '₍',
+            ')' => '₎',
+            'a' => 'ₐ',
+            'e' => 'ₑ',
+            'h' => 'ₕ',
+            'i' => 'ᵢ',
+            'j' => 'ⱼ',
+            'k' => 'ₖ',
+            'l' => 'ₗ',
+            'm' => 'ₘ',
+            'n' => 'ₙ',
+            'o' => 'ₒ',
+            'p' => 'ₚ',
+            'r' => 'ᵣ',
+            's' => 'ₛ',
+            't' => 'ₜ',
+            'u' => 'ᵤ',
+            'v' => 'ᵥ',
+            'x' => 'ₓ',
+            'β' => 'ᵦ',
+            'γ' => 'ᵧ',
+            'ρ' => 'ᵨ',
+            'φ' | 'ϕ' => 'ᵩ',
+            'χ' => 'ᵪ',
+            ',' | ';' | ':' => ch,
+            _ => return None,
+        }),
     }
 }
 

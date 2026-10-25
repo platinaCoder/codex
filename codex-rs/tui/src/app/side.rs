@@ -364,13 +364,13 @@ mod tests {
     }
 
     #[test]
-    fn projected_side_transcript_renders_grouped_math_subscripts() {
+    fn projected_side_transcript_renders_math_annotations() {
         let cells = crate::thread_transcript::thread_items_to_transcript_cells(
             /*thread_id*/ None,
             &codex_utils_absolute_path::AbsolutePathBuf::current_dir().expect("current directory"),
             vec![ThreadItem::AgentMessage {
                 id: "math-message".into(),
-                text: r"Address \(a_{j,t}\) selects a memory row.".into(),
+                text: r"Address \(a_{j,t}\) reads \(r_t^M\) from \(W_{read}\).".into(),
                 phase: None,
                 memory_citation: None,
                 delivery: None,
@@ -387,7 +387,10 @@ mod tests {
             .join("\n");
 
         assert!(rendered.contains("aⱼ,ₜ"), "{rendered}");
+        assert!(rendered.contains("rₜᴹ"), "{rendered}");
+        assert!(rendered.contains("W₍read₎"), "{rendered}");
         assert!(!rendered.contains("a_{j,t}"), "{rendered}");
+        assert!(!rendered.contains("r_t^M"), "{rendered}");
     }
 
     #[test]

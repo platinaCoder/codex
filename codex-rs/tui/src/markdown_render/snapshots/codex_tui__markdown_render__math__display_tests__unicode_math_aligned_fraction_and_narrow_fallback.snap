@@ -3,10 +3,10 @@ source: tui/src/markdown_render/math_display_tests.rs
 expression: "format!(\"Wide:\\n{}\\n\\nNarrow:\\n{}\", plain(formula, 80), plain(formula, 12))"
 ---
 Wide:
-      x  1
-      ─ =─   first
-      z  2
-y_{gpt} =3   second
+     x  1
+     ─ =─   first
+     z  2
+y₍gpt₎ =3   second
 
 Narrow:
 \[

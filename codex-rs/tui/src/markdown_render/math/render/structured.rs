@@ -7,7 +7,9 @@ use super::Layout;
 use super::MAX_COLUMNS;
 use super::MAX_ROWS;
 use super::MathParser;
+use super::ScriptPosition;
 use super::SequenceEnd;
+use super::render_script;
 use crate::width::display_width;
 
 enum AnnotationPosition {
@@ -125,9 +127,16 @@ impl MathParser<'_> {
                 }
                 let annotation = annotation.single()?;
                 let base = base.single()?;
-                let marker = if name == "underset" { '_' } else { '^' };
+                let position = if name == "underset" {
+                    ScriptPosition::Below
+                } else {
+                    ScriptPosition::Above
+                };
                 // Parenthesize the base so an annotation cannot attach to only its last atom.
-                Some(Layout::text(format!("({base}){marker}{{{annotation}}}")))
+                Some(Layout::text(format!(
+                    "({base}){}",
+                    render_script(annotation, position)
+                )))
             }
             "substack" => {
                 self.remaining = self.remaining.trim_start().strip_prefix('{')?;

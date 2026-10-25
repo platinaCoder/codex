@@ -198,8 +198,45 @@ fn unicode_math_grouped_script_separators_preserve_readable_indices() {
     );
     assert_eq!(
         render("x_{g,t}", /*display*/ false).as_deref(),
-        Some("x_{g,t}"),
-        "unsupported substantive characters must keep the explicit LaTeX script"
+        Some("x₍g,t₎"),
+        "unsupported substantive characters must remain explicitly grouped"
+    );
+}
+
+#[test]
+fn unicode_math_renders_common_script_annotations() {
+    assert_eq!(
+        render(
+            r"r_t^M + x^{-1} + x^T + y^{out} + z^{\alpha}_{\beta} + q^{*}",
+            /*display*/ false
+        )
+        .as_deref(),
+        Some("rₜᴹ + x⁻¹ + xᵀ + yᵒᵘᵗ + zᵅᵦ + q⁎")
+    );
+    assert_eq!(
+        render(r"x^S + W_{read}", /*display*/ false).as_deref(),
+        Some("x⁽S⁾ + W₍read₎"),
+        "letters without exact Unicode script forms must retain their case and grouping"
+    );
+    assert_eq!(
+        render(
+            r"\overset{\text{def}}{=} + \underset{i}{\min}",
+            /*display*/ false
+        )
+        .as_deref(),
+        Some("(=)ᵈᵉᶠ + (min)ᵢ")
+    );
+}
+
+#[test]
+fn unicode_math_renders_common_accent_aliases() {
+    assert_eq!(
+        render(
+            r"\overline M + \widetilde x + \overrightarrow v + \check y + \breve z + \acute a + \grave e",
+            /*display*/ false
+        )
+        .as_deref(),
+        Some("M̄ + x̃ + v⃗ + y̌ + z̆ + á + è")
     );
 }
 

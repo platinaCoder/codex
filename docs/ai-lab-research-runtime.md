@@ -38,8 +38,12 @@ architecture. It explicitly separates what an equation specifies from how the
 software realizes it, favoring concise conceptual understanding unless deeper
 mathematical detail is requested. SIDE is also instructed to delimit math so
 the TUI can recognize it. Common grouped indices with punctuation render in
-compact Unicode—for example, `a_{j,t}` is displayed as `aⱼ,ₜ`—while unsupported
-expressions retain their source LaTeX rather than being guessed at.
+compact Unicode—for example, `a_{j,t}` is displayed as `aⱼ,ₜ` and `r_t^M` as
+`rₜᴹ`. Uppercase and Greek superscripts, inline over/under annotations, and common
+accent aliases are supported. Script labels without an exact Unicode glyph remain
+readable in raised/lowered parentheses (for example, `W_{read}` becomes
+`W₍read₎`), while unsupported expressions retain their source LaTeX rather than
+being guessed at.
 
 ## Interaction
 
