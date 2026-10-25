@@ -8,7 +8,6 @@ use axum::extract::State;
 use axum::http::Request;
 use axum::http::StatusCode;
 use axum::http::header::AUTHORIZATION;
-use axum::http::request::Parts;
 use axum::middleware;
 use axum::middleware::Next;
 use axum::response::Response;
@@ -88,22 +87,17 @@ impl ThreadToolTransport {
         }
     }
 
-    pub(crate) fn configure_paired_side(
-        &self,
-        params: &mut ThreadStartParams,
-        main_thread_id: codex_protocol::ThreadId,
-    ) {
+    pub(crate) fn configure_paired_side(&self, params: &mut ThreadStartParams) {
         match self {
-            Self::Disabled => params.dynamic_tools = None,
-            Self::Dynamic => {
-                params.dynamic_tools = Some(dynamic_tools::non_delegation_tool_specs());
+            // In-process/no-daemon sessions do not run the loopback MCP
+            // task-tool server. Give SIDE the bounded read surface plus its
+            // persisted-target bridge through app-server dynamic tools.
+            Self::Disabled | Self::Dynamic => {
+                params.dynamic_tools = Some(dynamic_tools::side_tool_specs());
             }
-            Self::Mcp(server) => {
+            Self::Mcp(_) => {
                 params.dynamic_tools = None;
-                params.config.get_or_insert_default().insert(
-                    format!("mcp_servers.{}", server.namespace),
-                    server.paired_config(main_thread_id),
-                );
+                self.configure_mcp(&mut params.config);
             }
         }
     }
@@ -113,19 +107,6 @@ impl ThreadToolTransport {
             config.get_or_insert_default().insert(
                 format!("mcp_servers.{}", server.namespace),
                 server.config.clone(),
-            );
-        }
-    }
-
-    pub(crate) fn configure_paired_side_mcp(
-        &self,
-        config: &mut Option<HashMap<String, Value>>,
-        main_thread_id: codex_protocol::ThreadId,
-    ) {
-        if let Self::Mcp(server) = self {
-            config.get_or_insert_default().insert(
-                format!("mcp_servers.{}", server.namespace),
-                server.paired_config(main_thread_id),
             );
         }
     }
@@ -148,23 +129,14 @@ impl ToolServices {
 }
 
 type ToolConnection = Arc<RwLock<Option<(AppServerRequestHandle, AppEventSender)>>>;
-type PairCapabilities = Arc<RwLock<HashMap<String, String>>>;
-
-const PAIRED_MAIN_CAPABILITY_HEADER: &str = "x-codex-ai-lab-pair";
-
 pub(crate) struct DynamicToolMcpServer {
     connection: ToolConnection,
-    pair_capabilities: PairCapabilities,
     config: Value,
     namespace: &'static str,
     task: JoinHandle<()>,
 }
 
 impl DynamicToolMcpServer {
-    fn paired_config(&self, main_thread_id: codex_protocol::ThreadId) -> Value {
-        issue_pair_capability(&self.config, &self.pair_capabilities, main_thread_id)
-    }
-
     pub(crate) fn suspend(&self) {
         *self
             .connection
@@ -221,11 +193,9 @@ impl DynamicToolMcpServer {
             overrides.remove("web_search");
         }
         let connection = Arc::new(RwLock::new(Some((request_handle, app_event_tx))));
-        let pair_capabilities = Arc::new(RwLock::new(HashMap::new()));
         let namespace = services.namespace();
         let handler = DynamicToolMcpHandler {
             connection: Arc::clone(&connection),
-            pair_capabilities: Arc::clone(&pair_capabilities),
             thread_start_params,
             features,
             status_updates,
@@ -251,48 +221,11 @@ impl DynamicToolMcpServer {
         });
         Ok(Self {
             connection,
-            pair_capabilities,
             config: server_config,
             namespace,
             task,
         })
     }
-}
-
-fn issue_pair_capability(
-    base_config: &Value,
-    pair_capabilities: &PairCapabilities,
-    main_thread_id: codex_protocol::ThreadId,
-) -> Value {
-    let capability = Uuid::new_v4().to_string();
-    let main_thread_id = main_thread_id.to_string();
-    let mut capabilities = pair_capabilities
-        .write()
-        .unwrap_or_else(PoisonError::into_inner);
-    // Resuming a pair rotates its bearer capability. A stale SIDE config
-    // must not remain authorized after the durable pairing is reattached.
-    capabilities.retain(|_, paired_main| paired_main != &main_thread_id);
-    capabilities.insert(capability.clone(), main_thread_id);
-    drop(capabilities);
-    let mut config = base_config.clone();
-    config["http_headers"][PAIRED_MAIN_CAPABILITY_HEADER] = Value::String(capability);
-    config
-}
-
-fn trusted_paired_main_from_headers(
-    headers: &axum::http::HeaderMap,
-    pair_capabilities: &PairCapabilities,
-) -> Option<String> {
-    headers
-        .get(PAIRED_MAIN_CAPABILITY_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|capability| {
-            pair_capabilities
-                .read()
-                .unwrap_or_else(PoisonError::into_inner)
-                .get(capability)
-                .cloned()
-        })
 }
 
 impl Drop for DynamicToolMcpServer {
@@ -320,7 +253,6 @@ async fn require_authorization(
 #[derive(Clone)]
 struct DynamicToolMcpHandler {
     connection: ToolConnection,
-    pair_capabilities: PairCapabilities,
     thread_start_params: ThreadStartParams,
     features: Features,
     status_updates: broadcast::Sender<ThreadStatusChangedNotification>,
@@ -416,15 +348,6 @@ impl ServerHandler for DynamicToolMcpHandler {
             .get("callId")
             .and_then(Value::as_str)
             .map_or_else(|| format!("mcp-call-{}", Uuid::new_v4()), str::to_string);
-        let trusted_paired_main = context.extensions.get::<Parts>().and_then(|parts| {
-            trusted_paired_main_from_headers(&parts.headers, &self.pair_capabilities)
-        });
-        if request.name.as_ref() == "send_message_to_main" && trusted_paired_main.is_none() {
-            return Err(McpError::invalid_params(
-                "send_message_to_main requires an authenticated SIDE pairing",
-                None,
-            ));
-        }
         let params = DynamicToolCallParams {
             thread_id: thread_id.to_string(),
             turn_id,
@@ -469,14 +392,13 @@ impl ServerHandler for DynamicToolMcpHandler {
                     None,
                 ));
             }
-            dynamic_tools::execute_with_paired_main(
+            dynamic_tools::execute(
                 request_handle,
                 params,
                 thread_start_params,
                 self.features.clone(),
                 self.status_updates.subscribe(),
                 Some(&app_event_tx),
-                trusted_paired_main,
             )
             .await
         };
@@ -499,65 +421,5 @@ impl ServerHandler for DynamicToolMcpHandler {
             CallToolResult::error(content)
         }
         .into())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn pair_token(config: &Value) -> &str {
-        config["http_headers"][PAIRED_MAIN_CAPABILITY_HEADER]
-            .as_str()
-            .expect("paired capability header")
-    }
-
-    #[test]
-    fn pair_capabilities_are_isolated_and_rotate_on_resume() {
-        let capabilities: PairCapabilities = Arc::new(RwLock::new(HashMap::new()));
-        let base = json!({
-            "url": "http://127.0.0.1:1234/mcp",
-            "http_headers": {"Authorization": "Bearer shared"}
-        });
-        let main_a = codex_protocol::ThreadId::new();
-        let main_b = codex_protocol::ThreadId::new();
-
-        let fresh_a = issue_pair_capability(&base, &capabilities, main_a);
-        let fresh_b = issue_pair_capability(&base, &capabilities, main_b);
-        let token_a = pair_token(&fresh_a).to_string();
-        let token_b = pair_token(&fresh_b).to_string();
-        assert_ne!(token_a, token_b);
-        assert_eq!(fresh_a["http_headers"]["Authorization"], "Bearer shared");
-        assert_eq!(fresh_b["http_headers"]["Authorization"], "Bearer shared");
-
-        let resumed_a = issue_pair_capability(&base, &capabilities, main_a);
-        let resumed_token_a = pair_token(&resumed_a).to_string();
-        assert_ne!(resumed_token_a, token_a);
-        let capability_map = capabilities.read().unwrap_or_else(PoisonError::into_inner);
-        assert_eq!(capability_map.get(&token_a), None);
-        assert_eq!(capability_map.get(&token_b), Some(&main_b.to_string()));
-        assert_eq!(
-            capability_map.get(&resumed_token_a),
-            Some(&main_a.to_string())
-        );
-        drop(capability_map);
-
-        let mut headers = axum::http::HeaderMap::new();
-        headers.insert(
-            PAIRED_MAIN_CAPABILITY_HEADER,
-            resumed_token_a.parse().expect("valid capability header"),
-        );
-        assert_eq!(
-            trusted_paired_main_from_headers(&headers, &capabilities),
-            Some(main_a.to_string())
-        );
-        headers.insert(
-            PAIRED_MAIN_CAPABILITY_HEADER,
-            "unknown-capability".parse().expect("valid header"),
-        );
-        assert_eq!(
-            trusted_paired_main_from_headers(&headers, &capabilities),
-            None
-        );
     }
 }

@@ -982,9 +982,9 @@ impl AppServerSession {
             params.history_mode = None;
         }
         self.thread_tool_transport().validate_config(config)?;
-        if let Some(parent_thread_id) = persistent_side_main {
+        if is_persistent_side {
             self.thread_tool_transport()
-                .configure_paired_side(&mut params, parent_thread_id);
+                .configure_paired_side(&mut params);
         } else {
             self.thread_tool_transport().configure(&mut params);
         }

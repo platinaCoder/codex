@@ -46,10 +46,17 @@ Session settings also reject later attempts to raise SIDE's filesystem or
 network permissions. The sole
 state-changing exception is `codex_tui.send_message_to_main`. It takes no target
 UUID: the runtime derives and verifies the paired MAIN UUID from persisted SIDE
-metadata. Model-initiated MCP calls additionally carry a rotating per-pair
-capability; stale, absent, or cross-pair capabilities are rejected. Other
-task-management, patching, permission-escalation, build, and mutating external
-tools are unavailable.
+metadata on every dispatch. The MCP transport authenticates the local runtime,
+and the caller thread identifier is supplied by that runtime rather than by the
+model; no client-selected target or separately rotating pair token is trusted.
+Other task-management, patching, permission-escalation, build, and mutating
+external tools are unavailable.
+
+On resume, the TUI reads persisted thread metadata even when the client did not
+set its SIDE flag. A valid `ai_lab_side:<MAIN_UUID>` marker forces strict mode
+back into the resume request. In `--no-daemon` mode, SIDE receives the same
+bounded read tools and paired-MAIN bridge through app-server dynamic tools;
+MAIN does not receive the SIDE-only bridge.
 
 For mathematical explanations, SIDE defines unfamiliar notation and dimensions,
 translates equations into pseudocode when practical, traces information flow,

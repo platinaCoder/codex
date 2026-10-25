@@ -333,16 +333,26 @@ pub(crate) fn tool_specs() -> Vec<DynamicToolSpec> {
 }
 
 pub(crate) fn non_delegation_tool_specs() -> Vec<DynamicToolSpec> {
+    tool_specs_without_delegation_except(/*retained_delegation*/ None)
+}
+
+pub(crate) fn side_tool_specs() -> Vec<DynamicToolSpec> {
+    tool_specs_without_delegation_except(Some("send_message_to_main"))
+}
+
+fn tool_specs_without_delegation_except(retained_delegation: Option<&str>) -> Vec<DynamicToolSpec> {
     tool_specs()
         .into_iter()
         .filter_map(|spec| match spec {
             DynamicToolSpec::Function(function) => (!DELEGATION_TOOLS
-                .contains(&function.name.as_str()))
+                .contains(&function.name.as_str())
+                || retained_delegation == Some(function.name.as_str()))
             .then_some(DynamicToolSpec::Function(function)),
             DynamicToolSpec::Namespace(mut namespace) => {
                 namespace.tools.retain(|tool| match tool {
                     DynamicToolNamespaceTool::Function(function) => {
                         !DELEGATION_TOOLS.contains(&function.name.as_str())
+                            || retained_delegation == Some(function.name.as_str())
                     }
                 });
                 Some(DynamicToolSpec::Namespace(namespace))
@@ -375,33 +385,6 @@ pub(crate) async fn execute(
         features,
         status_updates,
         app_event_tx,
-        /*trusted_paired_main*/ None,
-    )
-    .await
-    .and_then(success_response)
-    {
-        Ok(response) => response,
-        Err(error) => failure_response(error),
-    }
-}
-
-pub(crate) async fn execute_with_paired_main(
-    request_handle: AppServerRequestHandle,
-    params: DynamicToolCallParams,
-    thread_start_params: ThreadStartParams,
-    features: Features,
-    status_updates: broadcast::Receiver<ThreadStatusChangedNotification>,
-    app_event_tx: Option<&AppEventSender>,
-    trusted_paired_main: Option<String>,
-) -> DynamicToolCallResponse {
-    match execute_inner(
-        request_handle,
-        params,
-        thread_start_params,
-        features,
-        status_updates,
-        app_event_tx,
-        trusted_paired_main,
     )
     .await
     .and_then(success_response)
@@ -426,7 +409,6 @@ async fn execute_inner(
     features: Features,
     mut status_updates: broadcast::Receiver<ThreadStatusChangedNotification>,
     app_event_tx: Option<&AppEventSender>,
-    trusted_paired_main: Option<String>,
 ) -> Result<Value, String> {
     let mcp_config = thread_start_params.config.as_ref().and_then(|overrides| {
         let key = format!("mcp_servers.{NAMESPACE}");
@@ -921,17 +903,7 @@ async fn execute_inner(
         }
         "send_message_to_main" => {
             let arguments: PairedMainSendArguments = parse_arguments(params.arguments)?;
-            let persisted_target = paired_main_thread_id(&handle, &params.thread_id).await?;
-            let target_thread_id = match trusted_paired_main {
-                Some(trusted_target) if trusted_target == persisted_target => trusted_target,
-                Some(_) => {
-                    return Err(
-                        "SIDE caller metadata does not match its authenticated MAIN pairing"
-                            .to_string(),
-                    );
-                }
-                None => persisted_target,
-            };
+            let target_thread_id = paired_main_thread_id(&handle, &params.thread_id).await?;
             send_delegated_message(
                 &handle,
                 &features,

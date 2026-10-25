@@ -1845,7 +1845,7 @@ async fn codex_apps_auth_elicitation_enabled_by_default_requests_elicitation(
 }
 
 #[test]
-fn mcp_tool_call_ids_are_added_to_request_meta() {
+fn mcp_tool_call_ids_overwrite_forged_request_meta() {
     let origin = crate::tools::context::ToolCallOrigin {
         item_id: Some(ResponseItemId::from_server("fc-live".to_string())),
         window_id: "thread-live:2".to_string(),

@@ -142,37 +142,6 @@ async fn call_tool(
     .await
 }
 
-async fn call_tool_with_paired_main(
-    server: &AppServerSession,
-    source: &str,
-    name: &str,
-    arguments: Value,
-    trusted_paired_main: Option<String>,
-) -> DynamicToolCallResponse {
-    let (_status_sender, status_receiver) = broadcast::channel(/*capacity*/ 8);
-    execute_with_paired_main(
-        server.request_handle(),
-        DynamicToolCallParams {
-            thread_id: source.to_string(),
-            turn_id: "persisted-turn".to_string(),
-            call_id: "call-1".to_string(),
-            namespace: Some(NAMESPACE.to_string()),
-            tool: name.to_string(),
-            arguments,
-        },
-        ThreadStartParams {
-            dynamic_tools: Some(tool_specs()),
-            ephemeral: Some(true),
-            ..ThreadStartParams::default()
-        },
-        Features::with_defaults(),
-        status_receiver,
-        /*app_event_tx*/ None,
-        trusted_paired_main,
-    )
-    .await
-}
-
 fn response_json(response: DynamicToolCallResponse) -> Value {
     assert!(response.success, "tool call failed: {response:?}");
     let [DynamicToolCallOutputContentItem::InputText { text }] = response.content_items.as_slice()
@@ -995,12 +964,11 @@ async fn paired_main_bridge_confines_target_scenario() -> color_eyre::Result<()>
     assert!(!rejected.success);
 
     let sent = response_json(
-        call_tool_with_paired_main(
+        call_tool(
             &server,
             &side.to_string(),
             "send_message_to_main",
             json!({"prompt": "paired-only advice"}),
-            Some(main.to_string()),
         )
         .await,
     );
@@ -1037,22 +1005,12 @@ async fn paired_main_bridge_confines_target_scenario() -> color_eyre::Result<()>
             }))?],
         )
         .await?;
-    let cross_pair = call_tool_with_paired_main(
-        &server,
-        &second_side.to_string(),
-        "send_message_to_main",
-        json!({"prompt": "must not cross pair boundaries"}),
-        Some(main.to_string()),
-    )
-    .await;
-    assert!(!cross_pair.success);
     let second_sent = response_json(
-        call_tool_with_paired_main(
+        call_tool(
             &server,
             &second_side.to_string(),
             "send_message_to_main",
             json!({"prompt": "second paired advice"}),
-            Some(second_main.to_string()),
         )
         .await,
     );
@@ -1087,40 +1045,29 @@ async fn paired_main_bridge_confines_target_scenario() -> color_eyre::Result<()>
     for thread_id in [side, second_side] {
         server
             .resume_thread(
-                &crate::local_settings::LocalSettings::from(&side_config),
-                side_config.clone(),
+                &crate::local_settings::LocalSettings::from(&config),
+                config.clone(),
                 thread_id,
                 ResumeModelSettings::RestoreFromThread,
             )
             .await?;
     }
     let resumed_sent = response_json(
-        call_tool_with_paired_main(
+        call_tool(
             &server,
             &side.to_string(),
             "send_message_to_main",
             json!({"prompt": "resumed paired advice"}),
-            Some(main.to_string()),
         )
         .await,
     );
     assert_eq!(resumed_sent["threadId"], main.to_string());
-    let resumed_cross_pair = call_tool_with_paired_main(
-        &server,
-        &second_side.to_string(),
-        "send_message_to_main",
-        json!({"prompt": "resumed pair must still reject crossed authority"}),
-        Some(main.to_string()),
-    )
-    .await;
-    assert!(!resumed_cross_pair.success);
     let resumed_second_sent = response_json(
-        call_tool_with_paired_main(
+        call_tool(
             &server,
             &second_side.to_string(),
             "send_message_to_main",
             json!({"prompt": "resumed second paired advice"}),
-            Some(second_main.to_string()),
         )
         .await,
     );
@@ -1141,6 +1088,36 @@ async fn paired_main_bridge_confines_target_scenario() -> color_eyre::Result<()>
         .expect("properties");
     assert!(properties.contains_key("prompt"));
     assert!(!properties.contains_key("threadId"));
+    let side_tool_names = side_tool_specs()
+        .into_iter()
+        .flat_map(|spec| match spec {
+            DynamicToolSpec::Function(function) => vec![function.name],
+            DynamicToolSpec::Namespace(namespace) => namespace
+                .tools
+                .into_iter()
+                .map(|tool| match tool {
+                    DynamicToolNamespaceTool::Function(function) => function.name,
+                })
+                .collect(),
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        side_tool_names
+            .iter()
+            .any(|name| name == "read_workspace_file")
+    );
+    assert!(
+        side_tool_names
+            .iter()
+            .any(|name| name == "send_message_to_main")
+    );
+    for forbidden in ["create_thread", "send_message_to_thread", "fork_thread"] {
+        assert!(!side_tool_names.iter().any(|name| name == forbidden));
+    }
+    let mut in_process_side = ThreadStartParams::default();
+    crate::dynamic_tools_mcp::ThreadToolTransport::Disabled
+        .configure_paired_side(&mut in_process_side);
+    assert_eq!(in_process_side.dynamic_tools, Some(side_tool_specs()));
 
     server.shutdown().await?;
     Ok(())

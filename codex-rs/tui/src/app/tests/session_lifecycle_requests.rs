@@ -1230,7 +1230,7 @@ async fn external_transport_registers_dynamic_tools_and_finds_task_mentions() ->
 
     let starts = recorded_params(&requests, "thread/start");
     assert_eq!(starts.len(), 2);
-    for params in starts {
+    for params in &starts {
         assert_eq!(params["dynamicTools"][0]["type"], "namespace");
         assert_eq!(params["dynamicTools"][0]["name"], "codex_tui");
         assert_eq!(
@@ -1248,6 +1248,31 @@ async fn external_transport_registers_dynamic_tools_and_finds_task_mentions() ->
         );
     }
     let target_id = started.session.thread_id;
+    let mut side_config = app.config.clone();
+    side_config.strict_read_only_tools = true;
+    app_server
+        .start_side_thread(
+            &crate::local_settings::LocalSettings::from(&side_config),
+            &side_config,
+            target_id,
+            /*selected_profile*/ None,
+        )
+        .await?;
+    let side_start = recorded_params(&requests, "thread/start")
+        .pop()
+        .expect("SIDE thread start");
+    let side_tools = side_start["dynamicTools"][0]["tools"]
+        .as_array()
+        .expect("SIDE dynamic tool namespace");
+    assert_eq!(side_tools.len(), 10);
+    assert!(
+        side_tools
+            .iter()
+            .any(|tool| tool["name"] == "send_message_to_main")
+    );
+    for forbidden in ["create_thread", "send_message_to_thread", "fork_thread"] {
+        assert!(!side_tools.iter().any(|tool| tool["name"] == forbidden));
+    }
     app_server
         .thread_inject_items(target_id, vec![App::side_boundary_prompt_item()])
         .await?;
@@ -1784,6 +1809,217 @@ async fn local_daemon_registers_approval_gated_mcp_tools_for_both_start_paths_sc
 
     app_server.shutdown().await?;
     proxy.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn side_main_mcp_bridge_survives_reattach_multiple_sides_and_cold_resume() -> Result<()> {
+    boxed_future!(side_main_mcp_bridge_transport_scenario()).await
+}
+
+async fn side_main_mcp_bridge_transport_scenario() -> Result<()> {
+    let (mut app, _events, _ops) = Box::pin(make_test_app_with_channels()).await;
+    app.config.ephemeral = false;
+    let (bridge_tx, mut bridge_rx) = tokio::sync::mpsc::unbounded_channel();
+    let bridge_sender = AppEventSender::new(bridge_tx);
+    let registration_task = tokio::spawn(async move {
+        while let Some(event) = bridge_rx.recv().await {
+            if let AppEvent::DynamicToolThreadStarted { registered, .. } = event {
+                let _ = registered.send(());
+            }
+        }
+    });
+    let (mut app_server, mut requests, mut proxy) = Box::pin(start_recording_app_server(
+        &app.config,
+        /*blocked_thread_list*/ None,
+        /*failed_thread_name*/ None,
+    ))
+    .await?;
+    Box::pin(app_server.start_dynamic_tool_mcp(
+        app.config.clone(),
+        bridge_sender.clone(),
+        app.dynamic_tool_status_updates.clone(),
+    ))
+    .await?;
+
+    let main = Box::pin(app_server.start_thread(&app.config))
+        .await?
+        .session
+        .thread_id;
+    let mut side_config = app.config.clone();
+    side_config.strict_read_only_tools = true;
+    let side_one = Box::pin(app_server.start_side_thread(
+        &crate::local_settings::LocalSettings::from(&side_config),
+        &side_config,
+        main,
+        /*selected_profile*/ None,
+    ))
+    .await?
+    .session
+    .thread_id;
+    let side_two = Box::pin(app_server.start_side_thread(
+        &crate::local_settings::LocalSettings::from(&side_config),
+        &side_config,
+        main,
+        /*selected_profile*/ None,
+    ))
+    .await?
+    .session
+    .thread_id;
+    // Empty threads do not materialize a rollout until their first item.
+    for side in [side_one, side_two] {
+        app_server
+            .thread_inject_items(
+                side,
+                vec![serde_json::from_value(serde_json::json!({
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "persist SIDE identity"}]
+                }))?],
+            )
+            .await?;
+    }
+
+    let starts = recorded_params(&requests, "thread/start");
+    let mcp = starts
+        .iter()
+        .find_map(|params| params["config"].get("mcp_servers.codex_tui"))
+        .expect("thread start should carry the local MCP transport");
+    let mcp_url = mcp["url"].as_str().expect("MCP server URL").to_string();
+    let authorization = mcp["http_headers"]["Authorization"]
+        .as_str()
+        .expect("MCP bearer token")
+        .to_string();
+    assert_eq!(
+        mcp["http_headers"].as_object().map(serde_json::Map::len),
+        Some(1)
+    );
+    let client = codex_http_client::HttpClientBuilder::new().build_direct()?;
+    let call_main_bridge = |id: u32, caller: ThreadId, prompt: &'static str| {
+        client
+            .post(&mcp_url)
+            .header("Authorization", &authorization)
+            .header("Accept", "application/json, text/event-stream")
+            .header("MCP-Protocol-Version", "2026-07-28")
+            .header("MCP-Method", "tools/call")
+            .header("MCP-Name", "send_message_to_main")
+            .json(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": {
+                    "name": "send_message_to_main",
+                    "arguments": {"prompt": prompt},
+                    "_meta": {
+                        "threadId": caller,
+                        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                        "io.modelcontextprotocol/clientCapabilities": {}
+                    }
+                }
+            }))
+    };
+    let call_text = |response: codex_http_client::HttpResponse| async move {
+        response.error_for_status_ref()?;
+        let text = response.text().await?;
+        Ok::<_, color_eyre::Report>(text)
+    };
+
+    let first = call_text(
+        call_main_bridge(1, side_one, "live SIDE bridge")
+            .send()
+            .await?,
+    )
+    .await?;
+    assert!(first.contains(&main.to_string()), "{first}");
+    let second = call_text(
+        call_main_bridge(2, side_two, "second SIDE bridge")
+            .send()
+            .await?,
+    )
+    .await?;
+    assert!(second.contains(&main.to_string()), "{second}");
+    let rejected = call_text(
+        call_main_bridge(3, main, "MAIN cannot impersonate SIDE")
+            .send()
+            .await?,
+    )
+    .await?;
+    assert!(
+        rejected.contains("only a durable SIDE thread"),
+        "{rejected}"
+    );
+
+    // Reattach while SIDE is loaded. The caller deliberately omits the strict
+    // client flag; persisted identity must restore strictness and the bridge.
+    let plain_config = app.config.clone();
+    assert!(!plain_config.strict_read_only_tools);
+    Box::pin(app_server.resume_thread(
+        &crate::local_settings::LocalSettings::from(&plain_config),
+        plain_config.clone(),
+        side_one,
+        crate::app_server_session::ResumeModelSettings::PreserveExistingThread,
+    ))
+    .await
+    .map_err(|error| color_eyre::eyre::eyre!("loaded reattach for {side_one} failed: {error}"))?;
+    let loaded_resume = recorded_params(&requests, "thread/resume")
+        .pop()
+        .expect("loaded SIDE reattach request");
+    assert_eq!(loaded_resume["config"]["strict_read_only_tools"], true);
+    let reattached = call_text(
+        call_main_bridge(4, side_one, "loaded reattach bridge")
+            .send()
+            .await?,
+    )
+    .await?;
+    assert!(reattached.contains(&main.to_string()), "{reattached}");
+
+    // Reconnect the same authenticated MCP endpoint to a fresh app-server and
+    // cold-resume with the strict client flag still absent.
+    let transport = app_server.thread_tool_transport();
+    let crate::dynamic_tools_mcp::ThreadToolTransport::Mcp(tool_server) = &transport else {
+        panic!("expected local MCP task-tool transport");
+    };
+    tool_server.suspend();
+    let (replacement, replacement_requests, replacement_proxy) =
+        Box::pin(start_recording_app_server(
+            &app.config,
+            /*blocked_thread_list*/ None,
+            /*failed_thread_name*/ None,
+        ))
+        .await?;
+    tool_server.reconnect(replacement.request_handle(), bridge_sender);
+    let previous = std::mem::replace(
+        &mut app_server,
+        replacement.with_thread_tool_transport(transport),
+    );
+    previous.shutdown().await?;
+    proxy.await??;
+    requests = replacement_requests;
+    proxy = replacement_proxy;
+
+    Box::pin(app_server.resume_thread(
+        &crate::local_settings::LocalSettings::from(&plain_config),
+        plain_config,
+        side_one,
+        crate::app_server_session::ResumeModelSettings::RestoreFromThread,
+    ))
+    .await
+    .map_err(|error| color_eyre::eyre::eyre!("cold resume for {side_one} failed: {error}"))?;
+    let cold_resume = recorded_params(&requests, "thread/resume")
+        .pop()
+        .expect("cold SIDE resume request");
+    assert_eq!(cold_resume["config"]["strict_read_only_tools"], true);
+    let cold = call_text(
+        call_main_bridge(5, side_one, "cold resume bridge")
+            .send()
+            .await?,
+    )
+    .await?;
+    assert!(cold.contains(&main.to_string()), "{cold}");
+
+    app_server.shutdown().await?;
+    proxy.await??;
+    registration_task.abort();
     Ok(())
 }
 
@@ -3318,7 +3554,9 @@ async fn paginated_workflows_never_request_full_thread_history() -> Result<()> {
     ))
     .await?;
     assert_eq!(resumed.session.thread_id, paginated_thread_id);
-    assert!(recorded_params(&requests, "thread/read").is_empty());
+    let identity_reads = recorded_params(&requests, "thread/read");
+    assert_eq!(identity_reads.len(), 1);
+    assert_ne!(identity_reads[0]["includeTurns"], true);
     let resume_requests = recorded_params(&requests, "thread/resume");
     assert_eq!(resume_requests.len(), 1);
     assert_eq!(resume_requests[0]["excludeTurns"], true);

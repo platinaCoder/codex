@@ -175,29 +175,27 @@ impl AppServerSession {
         if model_settings == ResumeModelSettings::OverrideFromCurrentConfig {
             params.model_provider = self.explicit_model_provider(&config);
         }
-        // The strict flag only selects the SIDE resume path. Pair authority
-        // itself comes from server-owned persisted thread metadata, never from
-        // client resume overrides (which a loaded thread may ignore).
-        let persisted_side_main = if config.strict_read_only_tools {
-            self.thread_read(thread_id, /*include_turns*/ false)
-                .await
-                .ok()
-                .and_then(|thread| match thread.thread_source {
-                    Some(codex_app_server_protocol::ThreadSource::Feature(source)) => source
-                        .strip_prefix(&format!("{}:", super::PERSISTENT_SIDE_THREAD_SOURCE_PREFIX))
-                        .and_then(|main| ThreadId::from_string(main).ok()),
-                    _ => None,
-                })
-        } else {
-            None
-        };
-        if let Some(main_thread_id) = persisted_side_main {
-            self.thread_tool_transport()
-                .configure_paired_side_mcp(&mut params.config, main_thread_id);
-        } else {
-            self.thread_tool_transport()
-                .configure_mcp(&mut params.config);
+        // Resume authority comes from server-owned persisted thread metadata,
+        // never from a fallible client flag. A loaded thread may ignore client
+        // overrides, so explicitly preserve strictness in both places.
+        let persisted_side = self
+            .thread_read(thread_id, /*include_turns*/ false)
+            .await
+            .ok()
+            .is_some_and(|thread| match thread.thread_source {
+                Some(codex_app_server_protocol::ThreadSource::Feature(source)) => source
+                    .strip_prefix(&format!("{}:", super::PERSISTENT_SIDE_THREAD_SOURCE_PREFIX))
+                    .is_some_and(|main| ThreadId::from_string(main).is_ok()),
+                _ => false,
+            });
+        if persisted_side {
+            params
+                .config
+                .get_or_insert_default()
+                .insert("strict_read_only_tools".to_string(), true.into());
         }
+        self.thread_tool_transport()
+            .configure_mcp(&mut params.config);
         let mut rollout_maintenance_guard = None;
         params.exclude_turns = if self.history_support == ThreadHistorySupport::Paginated {
             let known_legacy_history = self
