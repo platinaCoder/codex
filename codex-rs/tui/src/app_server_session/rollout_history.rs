@@ -175,8 +175,29 @@ impl AppServerSession {
         if model_settings == ResumeModelSettings::OverrideFromCurrentConfig {
             params.model_provider = self.explicit_model_provider(&config);
         }
-        self.thread_tool_transport()
-            .configure_mcp(&mut params.config);
+        // The strict flag only selects the SIDE resume path. Pair authority
+        // itself comes from server-owned persisted thread metadata, never from
+        // client resume overrides (which a loaded thread may ignore).
+        let persisted_side_main = if config.strict_read_only_tools {
+            self.thread_read(thread_id, /*include_turns*/ false)
+                .await
+                .ok()
+                .and_then(|thread| match thread.thread_source {
+                    Some(codex_app_server_protocol::ThreadSource::Feature(source)) => source
+                        .strip_prefix(&format!("{}:", super::PERSISTENT_SIDE_THREAD_SOURCE_PREFIX))
+                        .and_then(|main| ThreadId::from_string(main).ok()),
+                    _ => None,
+                })
+        } else {
+            None
+        };
+        if let Some(main_thread_id) = persisted_side_main {
+            self.thread_tool_transport()
+                .configure_paired_side_mcp(&mut params.config, main_thread_id);
+        } else {
+            self.thread_tool_transport()
+                .configure_mcp(&mut params.config);
+        }
         let mut rollout_maintenance_guard = None;
         params.exclude_turns = if self.history_support == ThreadHistorySupport::Paginated {
             let known_legacy_history = self

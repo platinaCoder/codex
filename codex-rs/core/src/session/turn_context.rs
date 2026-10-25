@@ -346,6 +346,9 @@ pub struct TurnContext {
     pub(crate) session_telemetry: SessionTelemetry,
     pub(crate) provider: SharedModelProvider,
     pub(crate) session_source: SessionSource,
+    /// Persisted thread identity. Security-sensitive behavior must use this
+    /// server-owned value instead of client resume overrides.
+    pub(crate) thread_source: Option<ThreadSource>,
     pub(crate) history_mode: ThreadHistoryMode,
     pub(crate) parent_thread_id: Option<ThreadId>,
     pub(crate) originator: String,
@@ -437,6 +440,7 @@ impl TurnContext {
             session_telemetry,
             provider: self.provider.clone(),
             session_source: self.session_source.clone(),
+            thread_source: self.thread_source.clone(),
             history_mode: self.history_mode,
             parent_thread_id: self.parent_thread_id,
             originator: self.originator.clone(),
@@ -849,6 +853,7 @@ impl TurnContext {
             session_telemetry,
             provider: self.provider.clone(),
             session_source: self.session_source.clone(),
+            thread_source: self.thread_source.clone(),
             history_mode: self.history_mode,
             parent_thread_id: self.parent_thread_id,
             originator: self.originator.clone(),
@@ -1134,6 +1139,7 @@ impl Session {
             session_telemetry: session_telemetry_for_context,
             provider,
             session_source,
+            thread_source: session_configuration.thread_source.clone(),
             history_mode: session_configuration.history_mode,
             parent_thread_id: session_configuration.parent_thread_id,
             originator: session_configuration.originator.clone(),

@@ -944,13 +944,13 @@ impl AppServerSession {
         thread_source: ThreadSource,
     ) -> Result<AppServerStartedThread> {
         let request_id = self.next_request_id();
-        let is_persistent_side = matches!(
-            &thread_source,
-            ThreadSource::Feature(source)
-                if source
-                    .strip_prefix(PERSISTENT_SIDE_THREAD_SOURCE_PREFIX)
-                    .is_some_and(|suffix| suffix.starts_with(':'))
-        );
+        let persistent_side_main = match &thread_source {
+            ThreadSource::Feature(source) => source
+                .strip_prefix(&format!("{PERSISTENT_SIDE_THREAD_SOURCE_PREFIX}:"))
+                .and_then(|main_id| ThreadId::from_string(main_id).ok()),
+            _ => None,
+        };
+        let is_persistent_side = persistent_side_main.is_some();
         let session_config = self.session_config_with_effective_service_tier(config);
         let mut params = thread_start_params_from_config(
             &session_config,
@@ -982,7 +982,12 @@ impl AppServerSession {
             params.history_mode = None;
         }
         self.thread_tool_transport().validate_config(config)?;
-        self.thread_tool_transport().configure(&mut params);
+        if let Some(parent_thread_id) = persistent_side_main {
+            self.thread_tool_transport()
+                .configure_paired_side(&mut params, parent_thread_id);
+        } else {
+            self.thread_tool_transport().configure(&mut params);
+        }
         let request_handle = self.request_handle();
         let (response, history_support, task_tools_available) =
             request_thread_start_with_history_fallback(&request_handle, request_id, params)

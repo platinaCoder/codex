@@ -26,6 +26,7 @@ use codex_protocol::openai_models::WebSearchToolType;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
+use codex_protocol::protocol::ThreadSource;
 use codex_tools::DiscoverablePluginInfo;
 use codex_tools::DiscoverableTool;
 use codex_tools::ResponsesApiNamespaceTool;
@@ -427,6 +428,23 @@ fn mcp_runtime(
     let handler: Arc<dyn CoreToolRuntime> = Arc::new(
         McpHandler::new(mcp_tool(server, namespace, name)).expect("MCP tool spec should build"),
     );
+    RegisteredTool {
+        runtime: handler,
+        exposure,
+        model_spec: None,
+    }
+}
+
+fn read_only_mcp_runtime(
+    server: &str,
+    namespace: &str,
+    name: &str,
+    exposure: ToolExposure,
+) -> RegisteredTool {
+    let mut tool = mcp_tool(server, namespace, name);
+    tool.tool.annotations = Some(rmcp::model::ToolAnnotations::new().read_only(true));
+    let handler: Arc<dyn CoreToolRuntime> =
+        Arc::new(McpHandler::new(tool).expect("MCP tool spec should build"));
     RegisteredTool {
         runtime: handler,
         exposure,
@@ -1144,6 +1162,116 @@ async fn strict_read_only_surface_keeps_reads_and_main_bridge_but_removes_mutati
         &ToolName::namespaced("codex_tui", "set_thread_title").to_string(),
     ]);
     assert!(!plan.can_manage_children);
+}
+
+#[tokio::test]
+async fn persisted_side_identity_enforces_strict_surface_without_client_override() {
+    let plan = probe_with(
+        |turn| {
+            let mut config = (*turn.config).clone();
+            assert!(!config.strict_read_only_tools);
+            config
+                .features
+                .enable(Feature::ShellTool)
+                .expect("shell feature should be configurable");
+            config
+                .features
+                .enable(Feature::CodeMode)
+                .expect("code-mode feature should be configurable");
+            turn.config = Arc::new(config);
+            turn.thread_source = Some(ThreadSource::Feature(format!(
+                "ai_lab_side:{}",
+                ThreadId::new()
+            )));
+            update_turn_settings_for_test(turn, |settings| {
+                Arc::make_mut(&mut settings.model_info).shell_type =
+                    ConfigShellToolType::UnifiedExec;
+                Arc::make_mut(&mut settings.model_info).apply_patch_tool_type =
+                    Some(ApplyPatchToolType::Freeform);
+            });
+        },
+        ToolPlanInputs {
+            tool_runtimes: vec![
+                read_only_mcp_runtime(
+                    "ai_lab_microscope",
+                    "microscope",
+                    "inspect",
+                    ToolExposure::Direct,
+                ),
+                read_only_mcp_runtime(
+                    "untrusted_read_only_claim",
+                    "untrusted",
+                    "inspect",
+                    ToolExposure::Direct,
+                ),
+            ],
+            dynamic_tools: vec![
+                dynamic_tool(
+                    Some("codex_tui"),
+                    "send_message_to_main",
+                    /*defer_loading*/ false,
+                ),
+                dynamic_tool(
+                    Some("codex_tui"),
+                    "read_workspace_file",
+                    /*defer_loading*/ false,
+                ),
+                dynamic_tool(
+                    Some("codex_tui"),
+                    "send_message_to_thread",
+                    /*defer_loading*/ false,
+                ),
+            ],
+            ..ToolPlanInputs::default()
+        },
+    )
+    .await;
+
+    plan.assert_registered_contains(&[
+        "exec",
+        &ToolName::namespaced("microscope", "inspect").to_string(),
+        &ToolName::namespaced("codex_tui", "send_message_to_main").to_string(),
+        &ToolName::namespaced("codex_tui", "read_workspace_file").to_string(),
+    ]);
+    plan.assert_registered_lacks(&[
+        "exec_command",
+        "shell_command",
+        "write_stdin",
+        "apply_patch",
+        "request_permissions",
+        &ToolName::namespaced("untrusted", "inspect").to_string(),
+        &ToolName::namespaced("codex_tui", "send_message_to_thread").to_string(),
+    ]);
+    for nested in plan.code_mode_tool_names.values() {
+        assert!(
+            !matches!(
+                nested.name.as_str(),
+                "exec_command"
+                    | "shell_command"
+                    | "write_stdin"
+                    | "apply_patch"
+                    | "request_permissions"
+            ),
+            "mutating tool leaked into SIDE code-mode catalog: {nested}"
+        );
+    }
+    let model_catalog = serde_json::to_string(&plan.visible_specs).expect("tool specs serialize");
+    assert!(model_catalog.contains("read_workspace_file"));
+    assert!(model_catalog.contains("microscope"));
+    for forbidden in [
+        "exec_command",
+        "shell_command",
+        "write_stdin",
+        "apply_patch",
+        "request_permissions",
+        "send_message_to_thread",
+        "untrusted",
+    ] {
+        assert!(
+            !model_catalog.contains(forbidden),
+            "mutating or untrusted tool leaked into model-visible SIDE catalog: {forbidden}"
+        );
+    }
 }
 
 #[tokio::test]

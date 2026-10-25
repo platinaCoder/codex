@@ -142,6 +142,37 @@ async fn call_tool(
     .await
 }
 
+async fn call_tool_with_paired_main(
+    server: &AppServerSession,
+    source: &str,
+    name: &str,
+    arguments: Value,
+    trusted_paired_main: Option<String>,
+) -> DynamicToolCallResponse {
+    let (_status_sender, status_receiver) = broadcast::channel(/*capacity*/ 8);
+    execute_with_paired_main(
+        server.request_handle(),
+        DynamicToolCallParams {
+            thread_id: source.to_string(),
+            turn_id: "persisted-turn".to_string(),
+            call_id: "call-1".to_string(),
+            namespace: Some(NAMESPACE.to_string()),
+            tool: name.to_string(),
+            arguments,
+        },
+        ThreadStartParams {
+            dynamic_tools: Some(tool_specs()),
+            ephemeral: Some(true),
+            ..ThreadStartParams::default()
+        },
+        Features::with_defaults(),
+        status_receiver,
+        /*app_event_tx*/ None,
+        trusted_paired_main,
+    )
+    .await
+}
+
 fn response_json(response: DynamicToolCallResponse) -> Value {
     assert!(response.success, "tool call failed: {response:?}");
     let [DynamicToolCallOutputContentItem::InputText { text }] = response.content_items.as_slice()
@@ -919,18 +950,34 @@ async fn dedicated_workspace_tools_read_without_shell_execution() -> color_eyre:
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn paired_main_bridge_confines_target_to_side_metadata() -> color_eyre::Result<()> {
+#[test]
+fn paired_main_bridge_confines_target_to_side_metadata() -> color_eyre::Result<()> {
+    std::thread::Builder::new()
+        .name("paired-main-bridge-test".to_string())
+        .stack_size(32 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(paired_main_bridge_confines_target_scenario())
+        })?
+        .join()
+        .map_err(|panic| color_eyre::eyre::eyre!("paired bridge test panicked: {panic:?}"))?
+}
+
+async fn paired_main_bridge_confines_target_scenario() -> color_eyre::Result<()> {
     let (codex_home, mut server, source, target) = test_server(json!({})).await?;
     let config = ConfigBuilder::default()
         .codex_home(codex_home.path().to_path_buf())
         .build()
         .await?;
+    let mut side_config = config.clone();
+    side_config.strict_read_only_tools = true;
     let main = ThreadId::from_string(&target)?;
     let side = server
         .start_side_thread(
-            &crate::local_settings::LocalSettings::from(&config),
-            &config,
+            &crate::local_settings::LocalSettings::from(&side_config),
+            &side_config,
             main,
             /*selected_profile*/ None,
         )
@@ -948,15 +995,136 @@ async fn paired_main_bridge_confines_target_to_side_metadata() -> color_eyre::Re
     assert!(!rejected.success);
 
     let sent = response_json(
-        call_tool(
+        call_tool_with_paired_main(
             &server,
             &side.to_string(),
             "send_message_to_main",
             json!({"prompt": "paired-only advice"}),
+            Some(main.to_string()),
         )
         .await,
     );
     assert_eq!(sent["threadId"], main.to_string());
+    let explicit_main_send = response_json(
+        call_tool(
+            &server,
+            &side.to_string(),
+            "send_message_to_main",
+            json!({"prompt": "explicit slash-main advice"}),
+        )
+        .await,
+    );
+    assert_eq!(explicit_main_send["threadId"], main.to_string());
+
+    let second_main = ThreadId::from_string(&source)?;
+    let second_side = server
+        .start_side_thread(
+            &crate::local_settings::LocalSettings::from(&side_config),
+            &side_config,
+            second_main,
+            /*selected_profile*/ None,
+        )
+        .await?
+        .session
+        .thread_id;
+    server
+        .thread_inject_items(
+            second_main,
+            vec![serde_json::from_value(json!({
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "saved second MAIN history"}]
+            }))?],
+        )
+        .await?;
+    let cross_pair = call_tool_with_paired_main(
+        &server,
+        &second_side.to_string(),
+        "send_message_to_main",
+        json!({"prompt": "must not cross pair boundaries"}),
+        Some(main.to_string()),
+    )
+    .await;
+    assert!(!cross_pair.success);
+    let second_sent = response_json(
+        call_tool_with_paired_main(
+            &server,
+            &second_side.to_string(),
+            "send_message_to_main",
+            json!({"prompt": "second paired advice"}),
+            Some(second_main.to_string()),
+        )
+        .await,
+    );
+    assert_eq!(second_sent["threadId"], second_main.to_string());
+    // Materialize rollouts for the freshly started MAIN/SIDE threads so the
+    // restart below exercises cold resume from persisted identity.
+    for thread_id in [side, second_side] {
+        server
+            .thread_inject_items(
+                thread_id,
+                vec![serde_json::from_value(json!({
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "saved pair history"}]
+                }))?],
+            )
+            .await?;
+    }
+
+    server.shutdown().await?;
+    let mut server = crate::start_embedded_app_server_for_picker(&config).await?;
+    for thread_id in [main, second_main] {
+        server
+            .resume_thread(
+                &crate::local_settings::LocalSettings::from(&config),
+                config.clone(),
+                thread_id,
+                ResumeModelSettings::RestoreFromThread,
+            )
+            .await?;
+    }
+    for thread_id in [side, second_side] {
+        server
+            .resume_thread(
+                &crate::local_settings::LocalSettings::from(&side_config),
+                side_config.clone(),
+                thread_id,
+                ResumeModelSettings::RestoreFromThread,
+            )
+            .await?;
+    }
+    let resumed_sent = response_json(
+        call_tool_with_paired_main(
+            &server,
+            &side.to_string(),
+            "send_message_to_main",
+            json!({"prompt": "resumed paired advice"}),
+            Some(main.to_string()),
+        )
+        .await,
+    );
+    assert_eq!(resumed_sent["threadId"], main.to_string());
+    let resumed_cross_pair = call_tool_with_paired_main(
+        &server,
+        &second_side.to_string(),
+        "send_message_to_main",
+        json!({"prompt": "resumed pair must still reject crossed authority"}),
+        Some(main.to_string()),
+    )
+    .await;
+    assert!(!resumed_cross_pair.success);
+    let resumed_second_sent = response_json(
+        call_tool_with_paired_main(
+            &server,
+            &second_side.to_string(),
+            "send_message_to_main",
+            json!({"prompt": "resumed second paired advice"}),
+            Some(second_main.to_string()),
+        )
+        .await,
+    );
+    assert_eq!(resumed_second_sent["threadId"], second_main.to_string());
 
     let paired_spec = tool_specs()
         .into_iter()

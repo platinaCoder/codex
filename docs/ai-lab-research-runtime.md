@@ -36,14 +36,20 @@ Arbitrary shell and process execution is absent—not merely sandboxed—because
 general command transport cannot guarantee zero mutation across the workspace,
 `/tmp`, git configuration, subprocesses, and device APIs. SIDE instead receives
 bounded `read_workspace_file`, `list_workspace_directory`, and
-`search_workspace_text` tools, hosted web search, and read-only MCP tools. Paths
-for workspace reads are canonicalized and cannot escape the task workspace.
-MCP tools must advertise `readOnlyHint`, and session settings reject later
-attempts to raise SIDE's filesystem or network permissions. The sole
+`search_workspace_text` tools, hosted web search, and the locally controlled
+`ai_lab_microscope` MCP tools. Paths for workspace reads are canonicalized and
+cannot escape the task workspace. Third-party `readOnlyHint` claims are not
+trusted as a zero-mutation boundary. Strictness is re-derived on every turn
+from the server-owned persisted `ai_lab_side:<MAIN_UUID>` source marker, so a
+loaded thread cannot weaken SIDE merely by ignoring client resume overrides.
+Session settings also reject later attempts to raise SIDE's filesystem or
+network permissions. The sole
 state-changing exception is `codex_tui.send_message_to_main`. It takes no target
 UUID: the runtime derives and verifies the paired MAIN UUID from persisted SIDE
-metadata. Other task-management, patching, permission-escalation, build, and
-mutating external tools are unavailable.
+metadata. Model-initiated MCP calls additionally carry a rotating per-pair
+capability; stale, absent, or cross-pair capabilities are rejected. Other
+task-management, patching, permission-escalation, build, and mutating external
+tools are unavailable.
 
 For mathematical explanations, SIDE defines unfamiliar notation and dimensions,
 translates equations into pseudocode when practical, traces information flow,

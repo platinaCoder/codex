@@ -557,15 +557,27 @@ pub(crate) fn finalize_tool_router(
 /// SIDE uses a defense-in-depth tool surface in addition to its read-only
 /// process sandbox. There is deliberately no arbitrary command transport: a
 /// read-only shell cannot provide a complete zero-write guarantee across the
-/// workspace, `/tmp`, git config, subprocesses, and device APIs. MCP tools have
-/// already been filtered by `readOnlyHint` at discovery time. The one
-/// intentional state-changing exception is the paired-MAIN message bridge.
+/// workspace, `/tmp`, git config, subprocesses, and device APIs. Only the
+/// locally controlled lab microscope is retained from MCP discovery; arbitrary
+/// third-party `readOnlyHint` annotations are not a zero-mutation boundary. The
+/// one intentional state-changing exception is the paired-MAIN message bridge.
+fn is_strict_read_only_turn(turn_context: &TurnContext) -> bool {
+    turn_context.config.strict_read_only_tools
+        || matches!(
+            turn_context.thread_source.as_ref(),
+            Some(codex_protocol::protocol::ThreadSource::Feature(source))
+                if source
+                    .strip_prefix("ai_lab_side:")
+                    .is_some_and(|main_id| !main_id.is_empty())
+        )
+}
+
 fn enforce_strict_read_only_tool_surface(
     turn_context: &TurnContext,
     registry: &mut ToolRegistry,
     hosted_specs: &mut Vec<ToolSpec>,
 ) {
-    if !turn_context.config.strict_read_only_tools {
+    if !is_strict_read_only_turn(turn_context) {
         return;
     }
 
@@ -580,8 +592,12 @@ fn enforce_strict_read_only_tool_surface(
                     | "send_message_to_main"
             );
         }
-        if tool.runtime.mcp_server_name().is_some() {
-            return true;
+        if let Some(server) = tool.runtime.mcp_server_name() {
+            // The lab microscope is locally controlled and exposes only its
+            // registered observational/counterfactual read interface. Do not
+            // trust arbitrary third-party readOnlyHint annotations as a
+            // zero-mutation security boundary.
+            return server == "ai_lab_microscope";
         }
         matches!(
             (name.namespace.as_deref(), name.name.as_str()),
@@ -1122,7 +1138,7 @@ fn register_code_mode_executors(
     }
     enabled_tools
         .sort_by(|left, right| compare_code_mode_tools(left, right, &namespace_descriptions));
-    let exec_description = codex_code_mode::build_exec_tool_description(
+    let mut exec_description = codex_code_mode::build_exec_tool_description(
         &enabled_tools,
         &deferred_tools,
         &namespace_descriptions,
@@ -1136,6 +1152,12 @@ fn register_code_mode_executors(
         deferred_tool_discovery,
         model_messages.code_mode(),
     );
+    if is_strict_read_only_turn(turn_context) {
+        exec_description = exec_description.replace(
+            "`await tools.exec_command(...)`",
+            "`await tools.codex_tui__read_workspace_file(...)`",
+        );
+    }
     let execute_handler = CodeModeExecuteHandler::new(
         create_code_mode_tool(exec_description),
         code_mode_nested_tool_specs,
