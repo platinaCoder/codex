@@ -67,6 +67,7 @@ use codex_protocol::protocol::SessionConfiguredEvent;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadSettingsOverrides;
+use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_protocol::protocol::TurnEnvironmentSelections;
 use codex_protocol::user_input::UserInput;
@@ -421,6 +422,7 @@ pub struct TestCodexBuilder {
     external_time_provider: Option<Arc<dyn TimeProvider>>,
     code_mode_host_program: Option<PathBuf>,
     history_mode: Option<ThreadHistoryMode>,
+    thread_source: Option<ThreadSource>,
     models_manager: Option<SharedModelsManager>,
     thread_store: Option<Arc<dyn ThreadStore>>,
     image_store: Arc<dyn AttachmentStore>,
@@ -485,6 +487,11 @@ impl TestCodexBuilder {
 
     pub fn with_history_mode(mut self, history_mode: impl Into<Option<ThreadHistoryMode>>) -> Self {
         self.history_mode = history_mode.into();
+        self
+    }
+
+    pub fn with_thread_source(mut self, thread_source: ThreadSource) -> Self {
+        self.thread_source = Some(thread_source);
         self
     }
 
@@ -953,6 +960,7 @@ impl TestCodexBuilder {
                 };
                 Box::pin(thread_manager.start_thread(StartThreadOptions {
                     history_mode: self.history_mode,
+                    thread_source: self.thread_source.clone(),
                     client_mcp_extensions: client_mcp_extensions(),
                     environments: environment_requests,
                     ..StartThreadOptions::new(config.clone())
@@ -1549,6 +1557,7 @@ pub fn test_codex() -> TestCodexBuilder {
         code_mode_host_program: None,
         // These fixtures exercise legacy-only resume/fork helpers; store-default tests opt out.
         history_mode: Some(ThreadHistoryMode::Legacy),
+        thread_source: None,
         models_manager: None,
         thread_store: None,
         image_store: codex_core::passthrough_image_store(),

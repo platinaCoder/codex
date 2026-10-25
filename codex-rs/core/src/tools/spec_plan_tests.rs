@@ -1275,6 +1275,92 @@ async fn persisted_side_identity_enforces_strict_surface_without_client_override
 }
 
 #[tokio::test]
+async fn strict_side_keeps_only_paired_codex_tui_mcp_tools_model_visible() {
+    let plan = probe_with(
+        |turn| {
+            let mut config = (*turn.config).clone();
+            config
+                .features
+                .enable(Feature::CodeMode)
+                .expect("code-mode feature should be configurable");
+            turn.config = Arc::new(config);
+            turn.thread_source = Some(ThreadSource::Feature(format!(
+                "ai_lab_side:{}",
+                ThreadId::new()
+            )));
+        },
+        ToolPlanInputs {
+            tool_runtimes: [
+                "read_workspace_file",
+                "list_workspace_directory",
+                "search_workspace_text",
+                "send_message_to_main",
+                "create_thread",
+                "send_message_to_thread",
+                "set_thread_title",
+            ]
+            .into_iter()
+            .map(|name| {
+                read_only_mcp_runtime("codex_tui", "mcp__codex_tui", name, ToolExposure::Direct)
+            })
+            .collect(),
+            ..ToolPlanInputs::default()
+        },
+    )
+    .await;
+
+    let allowed = [
+        "read_workspace_file",
+        "list_workspace_directory",
+        "search_workspace_text",
+        "send_message_to_main",
+    ];
+    for name in allowed {
+        let qualified = ToolName::namespaced("mcp__codex_tui", name).to_string();
+        plan.assert_registered_contains(&[&qualified]);
+        assert!(
+            plan.code_mode_tool_names
+                .values()
+                .any(|tool| tool.to_string() == qualified),
+            "{qualified} missing from the model-visible code-mode catalog: {:?}",
+            plan.code_mode_tool_names
+        );
+    }
+    for name in [
+        "create_thread",
+        "send_message_to_thread",
+        "set_thread_title",
+    ] {
+        let qualified = ToolName::namespaced("mcp__codex_tui", name).to_string();
+        plan.assert_registered_lacks(&[&qualified]);
+        assert!(
+            plan.code_mode_tool_names
+                .values()
+                .all(|tool| tool.to_string() != qualified),
+            "forbidden {qualified} leaked into the model-visible code-mode catalog"
+        );
+    }
+
+    let model_catalog = serde_json::to_string(&plan.visible_specs).expect("tool specs serialize");
+    for name in allowed {
+        assert!(
+            model_catalog.contains(name),
+            "allowed {name} missing from model-visible specs: {model_catalog}"
+        );
+    }
+    for forbidden in [
+        "create_thread",
+        "send_message_to_thread",
+        "set_thread_title",
+    ] {
+        assert!(
+            !model_catalog.contains(forbidden),
+            "forbidden {forbidden} leaked into model-visible specs: {model_catalog}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn strict_read_only_surface_requires_mcp_read_only_annotations() {
     let (_session, mut turn) = make_session_and_context().await;
     let mut config = (*turn.config).clone();

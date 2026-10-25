@@ -55,6 +55,7 @@ const APP_ONLY_CWD_MARKER_FILE_ENV: &str = "MCP_TEST_APP_ONLY_CWD_MARKER_FILE";
 const DYNAMIC_SERVER_METADATA_ENV: &str = "MCP_TEST_DYNAMIC_SERVER_METADATA";
 const INITIALIZE_BARRIER_FILE_ENV: &str = "MCP_TEST_INITIALIZE_BARRIER_FILE";
 const SERVER_INSTRUCTIONS_ENV: &str = "MCP_TEST_SERVER_INSTRUCTIONS";
+const SIDE_TOOL_CATALOG_ENV: &str = "MCP_TEST_SIDE_TOOL_CATALOG";
 
 fn dynamic_server_process_label() -> Option<String> {
     std::env::var_os(DYNAMIC_SERVER_METADATA_ENV)
@@ -135,6 +136,27 @@ impl TestToolServer {
         );
         encrypted_output_tool.annotations = Some(ToolAnnotations::new().read_only(true));
 
+        let side_catalog_tools = std::env::var_os(SIDE_TOOL_CATALOG_ENV)
+            .into_iter()
+            .flat_map(|_| {
+                [
+                    "read_workspace_file",
+                    "list_workspace_directory",
+                    "search_workspace_text",
+                    "send_message_to_main",
+                    "create_thread",
+                    "send_message_to_thread",
+                    "set_thread_title",
+                ]
+                .map(|name| {
+                    let mut tool = sandbox_meta_tool.clone();
+                    tool.name = Cow::Borrowed(name);
+                    tool.description = Some(Cow::Owned(format!("SIDE catalog test tool {name}.")));
+                    tool
+                })
+            })
+            .collect::<Vec<_>>();
+
         let mut tools = vec![
             Self::echo_tool(),
             Self::echo_dash_tool(),
@@ -149,6 +171,7 @@ impl TestToolServer {
             sandbox_meta_tool,
         ];
         tools.extend(entitlement_tools);
+        tools.extend(side_catalog_tools);
         if std::env::var_os("MCP_TEST_ENABLE_NODE_REPL_JS").is_some() {
             #[expect(clippy::expect_used)]
             let schema: JsonObject = serde_json::from_value(json!({

@@ -59,6 +59,7 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadSettingsOverrides;
+use codex_protocol::protocol::ThreadSource;
 use codex_protocol::user_input::UserInput;
 use codex_tools::FreeformTool;
 use codex_tools::FreeformToolFormat;
@@ -8074,6 +8075,140 @@ text(JSON.stringify(tool));
             ),
         })
     );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn strict_side_exports_only_paired_codex_tui_tools_in_all_tools() -> Result<()> {
+    skip_if_wine_exec!(
+        Ok(()),
+        "requires a Windows test_stdio_server in the Wine-exec environment"
+    );
+    skip_if_no_network!(Ok(()));
+
+    let server = responses::start_mock_server().await;
+    let rmcp_test_server_bin = stdio_server_bin()?;
+    let mut builder = test_codex()
+        .with_thread_source(ThreadSource::Feature(
+            "ai_lab_side:00000000-0000-0000-0000-000000000001".to_string(),
+        ))
+        .with_model_info_override("gpt-5.5", |model_info| {
+            model_info.tool_mode = Some(ToolMode::CodeMode);
+        })
+        .with_config(move |config| {
+            let _ = config.features.enable(Feature::CodeMode);
+            let mut servers = config.mcp_servers.get().clone();
+            servers.insert(
+                "codex_tui".to_string(),
+                McpServerConfig {
+                    auth: Default::default(),
+                    transport: McpServerTransportConfig::Stdio {
+                        command: rmcp_test_server_bin,
+                        args: Vec::new(),
+                        env: Some(HashMap::from([(
+                            "MCP_TEST_SIDE_TOOL_CATALOG".to_string(),
+                            "1".to_string(),
+                        )])),
+                        env_vars: Vec::new(),
+                        cwd: None,
+                    },
+                    environment_id: "local".to_string(),
+                    enabled: true,
+                    required: false,
+                    startup_readiness: Default::default(),
+                    supports_parallel_tool_calls: false,
+                    tool_input_schema_max_bytes: None,
+                    omit_tools_from: None,
+                    disabled_reason: None,
+                    startup_timeout_sec: Some(Duration::from_secs(10)),
+                    tool_timeout_sec: None,
+                    default_tools_approval_mode: None,
+                    enabled_tools: None,
+                    disabled_tools: None,
+                    scopes: None,
+                    oauth: None,
+                    oauth_resource: None,
+                    tools: HashMap::new(),
+                },
+            );
+            config
+                .mcp_servers
+                .set(servers)
+                .expect("test mcp servers should accept any configuration");
+        });
+    let test = builder.build(&server).await?;
+    wait_for_mcp_server(&test.codex, "codex_tui").await?;
+
+    let first_mock = responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-1"),
+            ev_custom_tool_call(
+                "call-1",
+                "exec",
+                r#"
+const names = [
+  "mcp__codex_tui__read_workspace_file",
+  "mcp__codex_tui__list_workspace_directory",
+  "mcp__codex_tui__search_workspace_text",
+  "mcp__codex_tui__send_message_to_main",
+  "mcp__codex_tui__create_thread",
+  "mcp__codex_tui__send_message_to_thread",
+  "mcp__codex_tui__set_thread_title",
+];
+text(JSON.stringify(Object.fromEntries(names.map(name => [name, {
+  type: typeof tools[name],
+  listed: ALL_TOOLS.some(tool => tool.name === name),
+}]))));
+"#,
+            ),
+            ev_completed("resp-1"),
+        ]),
+    )
+    .await;
+    let second_mock = responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_assistant_message("msg-1", "done"),
+            ev_completed("resp-2"),
+        ]),
+    )
+    .await;
+
+    test.submit_turn("inspect the strict SIDE tool catalog")
+        .await?;
+
+    let _first_request = first_mock.single_request();
+    let request = second_mock.single_request();
+    let (output, success) = custom_tool_output_body_and_success(&request, "call-1");
+    assert_ne!(
+        success,
+        Some(false),
+        "strict SIDE ALL_TOOLS inspection failed unexpectedly: {output}"
+    );
+    let output_text = custom_tool_output_last_non_empty_text(&request, "call-1")
+        .expect("strict SIDE ALL_TOOLS inspection should emit JSON");
+    let parsed: Value = serde_json::from_str(&output_text).with_context(|| {
+        format!("parse strict SIDE ALL_TOOLS output {output_text:?}; response body {output:?}")
+    })?;
+    for name in [
+        "mcp__codex_tui__read_workspace_file",
+        "mcp__codex_tui__list_workspace_directory",
+        "mcp__codex_tui__search_workspace_text",
+        "mcp__codex_tui__send_message_to_main",
+    ] {
+        assert_eq!(parsed[name]["type"], "function", "{name}: {parsed}");
+        assert_eq!(parsed[name]["listed"], true, "{name}: {parsed}");
+    }
+    for name in [
+        "mcp__codex_tui__create_thread",
+        "mcp__codex_tui__send_message_to_thread",
+        "mcp__codex_tui__set_thread_title",
+    ] {
+        assert_eq!(parsed[name]["type"], "undefined", "{name}: {parsed}");
+        assert_eq!(parsed[name]["listed"], false, "{name}: {parsed}");
+    }
 
     Ok(())
 }

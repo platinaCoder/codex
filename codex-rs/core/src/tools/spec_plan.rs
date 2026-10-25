@@ -572,6 +572,16 @@ fn is_strict_read_only_turn(turn_context: &TurnContext) -> bool {
         )
 }
 
+fn is_side_codex_tui_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "read_workspace_file"
+            | "list_workspace_directory"
+            | "search_workspace_text"
+            | "send_message_to_main"
+    )
+}
+
 fn enforce_strict_read_only_tool_surface(
     turn_context: &TurnContext,
     registry: &mut ToolRegistry,
@@ -584,15 +594,16 @@ fn enforce_strict_read_only_tool_surface(
     registry.retain(|tool| {
         let name = tool.runtime.tool_name().with_default_namespace();
         if name.namespace.as_deref() == Some("codex_tui") {
-            return matches!(
-                name.name.as_str(),
-                "read_workspace_file"
-                    | "list_workspace_directory"
-                    | "search_workspace_text"
-                    | "send_message_to_main"
-            );
+            return is_side_codex_tui_tool(&name.name);
         }
         if let Some(server) = tool.runtime.mcp_server_name() {
+            // MCP discovery normalizes this namespace (for example to
+            // `mcp__codex_tui`), so match the authenticated server identity
+            // and then apply the same exact-name allowlist used for embedded
+            // dynamic tools. Never allow the rest of the task-management MCP.
+            if server == "codex_tui" {
+                return is_side_codex_tui_tool(&name.name);
+            }
             // The lab microscope is locally controlled and exposes only its
             // registered observational/counterfactual read interface. Do not
             // trust arbitrary third-party readOnlyHint annotations as a
