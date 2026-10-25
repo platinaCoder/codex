@@ -931,6 +931,7 @@ text(JSON.stringify({ catalogSafe: true, read }));
     terminal.wait_for_screen("MAIN_SLASH_DISPATCH_OK")?;
     terminal.wait_for_screen("SIDE_PROACTIVE_SEND_OK")?;
     submit(&mut terminal, "/side")?;
+    terminal.wait_for_screen("SIDE • focused")?;
     submit(&mut terminal, "COLD_RESUME_READ")?;
     terminal.wait_for_screen("SIDE_COLD_RESUME_OK")?;
 
