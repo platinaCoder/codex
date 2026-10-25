@@ -5357,6 +5357,13 @@ async fn side_thread_config_is_durable_and_appends_developer_guardrails() {
     assert!(developer_instructions.contains("Treat coherence and truth as separate things."));
     assert!(developer_instructions.contains("Preserve uncertainty where it exists."));
     assert!(developer_instructions.contains("Answer in continuous prose."));
+    assert!(developer_instructions.contains("Explain unfamiliar symbols, indices, operators"));
+    assert!(developer_instructions.contains("Translate the equation into equivalent pseudocode"));
+    assert!(
+        developer_instructions.contains("Distinguish what the mathematical expression specifies")
+    );
+    assert!(developer_instructions.contains("Never assume a particular neural architecture"));
+    assert!(developer_instructions.contains("Prioritize building conceptual understanding"));
     assert!(
         developer_instructions
             .contains("External tools may be available according to this thread's current")

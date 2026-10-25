@@ -31,6 +31,13 @@ explicit, and preserves uncertainty instead of automatically adopting the
 user's preferred framing. This policy is applied both when a SIDE is created
 and when its persistent thread is resumed.
 
+For mathematical explanations, SIDE defines unfamiliar notation and dimensions,
+translates equations into pseudocode when practical, traces information flow,
+and relates the expression to the implementation without assuming a particular
+architecture. It explicitly separates what an equation specifies from how the
+software realizes it, favoring concise conceptual understanding unless deeper
+mathematical detail is requested.
+
 ## Interaction
 
 - `Ctrl+h` or `Ctrl+k`: focus MAIN.
