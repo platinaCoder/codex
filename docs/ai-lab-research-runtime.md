@@ -59,8 +59,10 @@ the task surface on an authenticated loopback `codex_tui` MCP service. This
 keeps bounded workspace reads and the paired-MAIN bridge available to fresh,
 reattached, and cold-resumed SIDE threads, including SIDE histories created by
 an older runtime without persisted dynamic tools. If that local MCP cannot be
-started, a fresh embedded SIDE falls back to the equivalent app-server dynamic
-tool surface. After MCP namespace normalization, core still matches the
+started, a fresh embedded SIDE falls back to a read-only app-server dynamic
+tool surface and does not advertise the paired-MAIN bridge to the model because
+that transport has no per-call approval layer. The explicit `/main` UI path
+remains available. After MCP namespace normalization, core still matches the
 authenticated `codex_tui` server identity and applies the same exact four-tool
 allowlist before constructing the model-visible catalog. MAIN does not receive
 the SIDE-only bridge.

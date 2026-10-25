@@ -1264,13 +1264,8 @@ async fn external_transport_registers_dynamic_tools_and_finds_task_mentions() ->
     let side_tools = side_start["dynamicTools"][0]["tools"]
         .as_array()
         .expect("SIDE dynamic tool namespace");
-    assert_eq!(side_tools.len(), 10);
-    assert!(
-        side_tools
-            .iter()
-            .any(|tool| tool["name"] == "send_message_to_main")
-    );
-    for forbidden in ["create_thread", "send_message_to_thread", "fork_thread"] {
+    assert_eq!(side_tools.len(), 9);
+    for forbidden in crate::dynamic_tools::DELEGATION_TOOLS {
         assert!(!side_tools.iter().any(|tool| tool["name"] == forbidden));
     }
     app_server

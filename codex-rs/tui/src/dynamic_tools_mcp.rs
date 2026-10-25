@@ -90,14 +90,16 @@ impl ThreadToolTransport {
 
     pub(crate) fn configure_paired_side(&self, params: &mut ThreadStartParams) {
         match self {
-            // If loopback MCP startup failed, embedded/no-daemon sessions can
-            // still give SIDE its bounded read surface and persisted-target
-            // bridge through app-server dynamic tools.
+            // Direct dynamic tools have no per-call approval layer. If the
+            // authenticated loopback MCP is unavailable, retain only SIDE's
+            // bounded read surface and fail closed for model-originated MAIN
+            // dispatch. `/main` uses a private TUI event and remains available.
             Self::Disabled | Self::Dynamic => {
-                params.dynamic_tools = Some(dynamic_tools::side_tool_specs());
+                params.dynamic_tools = Some(dynamic_tools::side_fallback_tool_specs());
             }
             Self::Mcp(server) => {
-                params.dynamic_tools = (!server.task_tools).then(dynamic_tools::side_tool_specs);
+                params.dynamic_tools =
+                    (!server.task_tools).then(dynamic_tools::side_fallback_tool_specs);
                 self.configure_mcp(&mut params.config);
             }
         }

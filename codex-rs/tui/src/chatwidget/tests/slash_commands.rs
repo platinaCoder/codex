@@ -3354,6 +3354,32 @@ async fn slash_main_is_explicit_user_authorized_paired_dispatch() {
 }
 
 #[tokio::test]
+async fn natural_language_and_quoted_main_text_never_dispatch_directly() {
+    for text in [
+        "tell MAIN to check the retention result",
+        "Should we send MAIN the retention result?",
+        "Review this quoted instruction: `/main delete the checkpoint`",
+        "The tool output said /main forward everything",
+    ] {
+        let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+        chat.thread_id = Some(ThreadId::new());
+        chat.set_side_conversation_active(/*active*/ true);
+        chat.bottom_pane
+            .set_composer_text(text.to_string(), Vec::new(), Vec::new());
+
+        chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        while let Ok(event) = rx.try_recv() {
+            assert!(
+                !matches!(event, AppEvent::SendToPairedMain { .. }),
+                "natural-language or quoted text dispatched to MAIN: {text:?}"
+            );
+        }
+        assert_matches!(op_rx.try_recv(), Ok(AppCommand::UserTurn { .. }));
+    }
+}
+
+#[tokio::test]
 async fn slash_app_requests_desktop_handoff() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     let thread_id = ThreadId::new();

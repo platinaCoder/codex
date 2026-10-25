@@ -336,8 +336,12 @@ pub(crate) fn non_delegation_tool_specs() -> Vec<DynamicToolSpec> {
     tool_specs_without_delegation_except(/*retained_delegation*/ None)
 }
 
-pub(crate) fn side_tool_specs() -> Vec<DynamicToolSpec> {
-    tool_specs_without_delegation_except(Some("send_message_to_main"))
+/// Direct dynamic tools have no MCP approval layer. When SIDE cannot use the
+/// authenticated loopback MCP, fail closed by exposing only observational
+/// tools. The explicit `/main` UI path calls the paired bridge internally and
+/// does not depend on advertising it to the model.
+pub(crate) fn side_fallback_tool_specs() -> Vec<DynamicToolSpec> {
+    non_delegation_tool_specs()
 }
 
 fn tool_specs_without_delegation_except(retained_delegation: Option<&str>) -> Vec<DynamicToolSpec> {
