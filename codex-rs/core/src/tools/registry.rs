@@ -587,6 +587,10 @@ impl ToolRegistry {
             .map(|tool| tool.runtime)
     }
 
+    pub(crate) fn retain(&mut self, mut keep: impl FnMut(&RegisteredTool) -> bool) {
+        self.tools.retain(|_, tool| keep(tool));
+    }
+
     pub(crate) fn entries(&self) -> impl Iterator<Item = &RegisteredTool> {
         self.tools.values()
     }

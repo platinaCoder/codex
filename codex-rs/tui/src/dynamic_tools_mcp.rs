@@ -289,6 +289,10 @@ impl ServerHandler for DynamicToolMcpHandler {
                         | "list_archived_threads"
                         | "read_thread"
                         | "wait_threads"
+                        // Strict SIDE policy treats this as its sole explicit
+                        // state-changing exception; core narrows the codex_tui
+                        // namespace back down to this exact tool.
+                        | "send_message_to_thread"
                         | "list_worktrees"
                         | "get_worktree_creation_status"
                 )));

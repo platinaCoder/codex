@@ -55,6 +55,41 @@ fn set_requirements(configuration: &mut SessionConfiguration, requirements: Conf
 }
 
 #[tokio::test]
+async fn strict_read_only_session_rejects_later_permission_escalation() {
+    let mut configuration = make_session_configuration_for_tests().await;
+    Arc::make_mut(&mut configuration.original_config_do_not_use).strict_read_only_tools = true;
+    configuration.permission_profile_state = PermissionProfileState::from_constrained_legacy(
+        Constrained::allow_any(PermissionProfile::read_only()),
+    )
+    .expect("test permission state");
+
+    configuration
+        .validate(&[])
+        .expect("read-only SIDE permissions should remain valid");
+    assert!(
+        configuration
+            .apply(
+                &SessionSettingsUpdate {
+                    permission_profile: Some(PermissionProfile::Disabled),
+                    ..Default::default()
+                },
+                &[],
+            )
+            .is_err(),
+        "strict SIDE must reject later write/network permission escalation"
+    );
+    configuration
+        .apply(
+            &SessionSettingsUpdate {
+                permission_profile: Some(PermissionProfile::read_only()),
+                ..Default::default()
+            },
+            &[],
+        )
+        .expect("read-only settings updates should remain available");
+}
+
+#[tokio::test]
 async fn proposed_permission_profile_is_checked_before_step_settings() {
     let mut configuration = make_session_configuration_for_tests().await;
     let permission = Constrained::allow_only(PermissionProfile::read_only());

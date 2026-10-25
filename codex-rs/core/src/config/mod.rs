@@ -679,6 +679,10 @@ pub struct Config {
     /// Effective permission configuration for shell tool execution.
     pub permissions: Permissions,
 
+    /// Whether this thread exposes only observational tools plus explicitly
+    /// allowlisted cross-thread messaging.
+    pub strict_read_only_tools: bool,
+
     /// Whether config explicitly selected named permissions profiles instead
     /// of the legacy `sandbox_mode` syntax.
     pub explicit_permission_profile_mode: bool,
@@ -1897,7 +1901,7 @@ impl Config {
         McpConfig {
             chatgpt_base_url: self.chatgpt_base_url.clone(),
             apps_mcp_product_sku: self.apps_mcp_product_sku.clone(),
-            requires_read_only_mcp_tools: false,
+            requires_read_only_mcp_tools: self.strict_read_only_tools,
             codex_home: self.codex_home.to_path_buf(),
             mcp_enterprise_managed_auth: self.mcp_enterprise_managed_auth.clone(),
             ema_state: Default::default(),
@@ -4507,6 +4511,7 @@ impl Config {
                 windows_sandbox_mode,
                 windows_sandbox_type,
             },
+            strict_read_only_tools: cfg.strict_read_only_tools.unwrap_or(false),
             explicit_permission_profile_mode,
             custom_permission_profiles,
             approvals_reviewer: constrained_approvals_reviewer.value(),

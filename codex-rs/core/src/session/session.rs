@@ -379,12 +379,39 @@ impl SessionConfiguration {
         &self,
         environments: &[TurnEnvironmentSelection],
     ) -> ConstraintResult<()> {
+        self.validate_strict_read_only_permissions(environments)?;
         self.step_settings
             .validate(&self.step_settings_constraints(environments))?;
         super::environment::validate_environment_configs(
             environments,
             &self.original_config_do_not_use.features,
         )
+    }
+
+    fn validate_strict_read_only_permissions(
+        &self,
+        environments: &[TurnEnvironmentSelection],
+    ) -> ConstraintResult<()> {
+        if !self.original_config_do_not_use.strict_read_only_tools {
+            return Ok(());
+        }
+        let permission_profile = self.effective_permission_profile(environments);
+        let has_write_access = permission_profile
+            .file_system_sandbox_policy()
+            .entries
+            .iter()
+            .any(|entry| entry.access.can_write());
+        let has_network_access = permission_profile.network_sandbox_policy().is_enabled();
+        if !has_write_access && !has_network_access {
+            return Ok(());
+        }
+        Err(ConstraintError::InvalidValue {
+            field_name: "permission_profile",
+            candidate: "write or shell-network access".to_string(),
+            allowed: "strict read-only filesystem permissions without shell network access"
+                .to_string(),
+            requirement_source: codex_config::RequirementSource::Unknown,
+        })
     }
 
     pub(super) fn step_settings_constraints(
@@ -568,6 +595,7 @@ impl SessionConfiguration {
             &updates.step_settings,
             &next_configuration.step_settings_constraints(next_environments),
         )?);
+        next_configuration.validate_strict_read_only_permissions(next_environments)?;
         Ok(next_configuration)
     }
 

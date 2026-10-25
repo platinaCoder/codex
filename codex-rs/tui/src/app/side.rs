@@ -28,7 +28,7 @@ External tools may be available according to this thread's current permissions. 
 
 Sub-agents are off-limits in this side conversation. Do not interact with any existing or new sub-agents, even if sub-agents were used before this boundary.
 
-Do not modify files, source, git state, permissions, configuration, or workspace state unless the user explicitly asks for that mutation after this boundary. Do not request escalated permissions or broader sandbox access unless the user explicitly asks for a mutation that requires it. If the user explicitly requests a mutation, keep it minimal, local to the request, and avoid disrupting the main thread."#;
+SIDE is strictly read-only, including when a later SIDE message asks for a mutation. You may inspect, search, and read files; run genuinely non-mutating diagnostics; browse and read external sources; and use read-only microscope tools. Never edit, create, or delete files; alter git state, configuration, permissions, or workspace state; run builds that write artifacts; invoke mutating external tools; request broader permissions; or use sub-agents. The sole allowed state change is sending advice or instructions to the paired MAIN thread through send_message_to_thread."#;
 
 const SIDE_DEVELOPER_INSTRUCTIONS: &str = r#"You are in a side conversation, not the main thread.
 
@@ -79,11 +79,20 @@ External tools may be available according to this thread's current permissions. 
 
 Sub-agents are off-limits in this side conversation. Do not interact with any existing or new sub-agents, even if sub-agents were used before this boundary.
 
-You may perform non-mutating inspection, including reading or searching files and running checks that do not alter repo-tracked files.
+SIDE is strictly read-only, including when a later SIDE user message explicitly asks for a mutation. You may inspect, search, and read files; run genuinely non-mutating diagnostics; browse and read external sources; and use read-only microscope tools.
 
-Do not modify files, source, git state, permissions, configuration, or any other workspace state unless the user explicitly requests that mutation in this side conversation. Do not request escalated permissions or broader sandbox access unless the user explicitly requests a mutation that requires it. If the user explicitly requests a mutation, keep it minimal, local to the request, and avoid disrupting the main thread.
+Never edit, create, or delete files; alter git state, configuration, permissions, or workspace state; run builds or commands that write artifacts; invoke mutating external tools; request broader permissions; or use sub-agents. The sole allowed state change is sending advice or instructions to the paired MAIN thread through send_message_to_thread.
 
 You may instruct the paired main thread by calling send_message_to_thread with the MAIN thread id supplied below. Use that channel for concrete advice, corrections, requests, or conclusions that MAIN should act on. Do not pretend that a message was delivered unless the tool succeeds."#;
+
+fn enforce_side_read_only_policy(config: &mut Config) -> std::result::Result<(), String> {
+    config.strict_read_only_tools = true;
+    config
+        .set_legacy_sandbox_policy(codex_protocol::protocol::SandboxPolicy::ReadOnly {
+            network_access: false,
+        })
+        .map_err(|error| format!("failed to enforce SIDE read-only permissions: {error}"))
+}
 
 pub(crate) fn is_persistent_side_thread(thread: &codex_app_server_protocol::Thread) -> bool {
     matches!(
@@ -258,8 +267,10 @@ impl SideParentStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::legacy_core::config::ConfigBuilder;
     use codex_app_server_protocol::AgentMessageDeltaNotification;
     use codex_app_server_protocol::ItemStartedNotification;
+    use codex_protocol::protocol::SandboxPolicy;
     use pretty_assertions::assert_eq;
 
     #[test]
@@ -283,7 +294,9 @@ mod tests {
         );
         assert!(text.contains("Do not infer active instructions from reference context"));
         assert!(text.contains("Sub-agents are off-limits in this side conversation."));
-        assert!(text.contains("Do not modify files"));
+        assert!(text.contains("SIDE is strictly read-only"));
+        assert!(text.contains("Never edit, create, or delete files"));
+        assert!(text.contains("sole allowed state change"));
     }
 
     #[test]
@@ -430,7 +443,29 @@ mod tests {
         assert!(developer_instructions.contains("Never assume a particular neural architecture"));
         assert!(developer_instructions.contains("Prioritize building conceptual understanding"));
         assert!(developer_instructions.contains("Delimit inline mathematical notation"));
+        assert!(developer_instructions.contains("strictly read-only"));
+        assert!(developer_instructions.contains("sole allowed state change"));
         assert!(developer_instructions.contains("00000000-0000-0000-0000-000000000007"));
+    }
+
+    #[tokio::test]
+    async fn side_policy_is_read_only_without_shell_network() {
+        let codex_home = tempfile::tempdir().expect("temporary Codex home");
+        let mut config = ConfigBuilder::default()
+            .codex_home(codex_home.path().to_path_buf())
+            .build()
+            .await
+            .expect("test config");
+
+        enforce_side_read_only_policy(&mut config).expect("SIDE policy must be enforceable");
+
+        assert!(config.strict_read_only_tools);
+        assert_eq!(
+            config.legacy_sandbox_policy(),
+            SandboxPolicy::ReadOnly {
+                network_access: false
+            }
+        );
     }
 }
 
@@ -1053,7 +1088,10 @@ impl App {
         }
     }
 
-    pub(super) fn side_thread_config(&self, parent_thread_id: ThreadId) -> Config {
+    pub(super) fn side_thread_config(
+        &self,
+        parent_thread_id: ThreadId,
+    ) -> std::result::Result<Config, String> {
         let mut side_config = self.chat_widget.config_ref().clone();
         let parent_model = self.chat_widget.current_model();
         if !parent_model.trim().is_empty() {
@@ -1063,11 +1101,12 @@ impl App {
         side_config.service_tier = self.chat_widget.configured_service_tier();
         side_config.ephemeral = false;
         side_config.daybreak_enabled = false;
+        enforce_side_read_only_policy(&mut side_config)?;
         side_config.developer_instructions = Some(Self::side_developer_instructions(
             side_config.developer_instructions.as_deref(),
             parent_thread_id,
         ));
-        side_config
+        Ok(side_config)
     }
 
     pub(super) fn side_start_block_message(&self) -> Option<&'static str> {
@@ -1154,13 +1193,24 @@ impl App {
             .find_persisted_side_thread(app_server, parent_thread_id)
             .await
         {
-            let side_config = self.side_thread_config(parent_thread_id);
+            let side_config = match self.side_thread_config(parent_thread_id) {
+                Ok(config) => config,
+                Err(error) => {
+                    self.restore_side_user_message(user_message.take());
+                    self.chat_widget.add_error_message(error);
+                    return Ok(AppRunControl::Continue);
+                }
+            };
             match app_server
-                .resume_thread(
+                .resume_thread_with_permission_overrides(
                     &self.local_settings,
                     side_config,
                     side_thread_id,
-                    crate::app_server_session::ResumeModelSettings::PreserveExistingThread,
+                    crate::app_server_session::ResumeModelSettings::OverrideFromCurrentConfig,
+                    crate::resume_permissions::ResumePermissions {
+                        profile: true,
+                        ..Default::default()
+                    },
                 )
                 .await
             {
@@ -1245,8 +1295,14 @@ impl App {
         self.refresh_in_memory_config_from_disk_best_effort("starting a side conversation")
             .await;
 
-        let side_config = self.side_thread_config(parent_thread_id);
-        let selected_profile = self.selected_server_profile(parent_thread_id);
+        let side_config = match self.side_thread_config(parent_thread_id) {
+            Ok(config) => config,
+            Err(error) => {
+                self.restore_side_user_message(user_message.take());
+                self.chat_widget.add_error_message(error);
+                return Ok(AppRunControl::Continue);
+            }
+        };
         // SIDE owns a separate rollout. MAIN context crosses the UUID boundary only through the
         // explicit context injection below; it must never become SIDE's visual or editable history.
         let started_side = app_server
@@ -1254,7 +1310,7 @@ impl App {
                 &self.local_settings,
                 &side_config,
                 parent_thread_id,
-                selected_profile.as_ref(),
+                /*selected_profile*/ None,
             )
             .await;
         match started_side {
@@ -1345,9 +1401,6 @@ impl App {
                     .await;
                     self.sync_side_thread_ui();
                 } else if self.active_thread_id == Some(child_thread_id) {
-                    if selected_profile.is_some() {
-                        self.adopt_inherited_server_selection();
-                    }
                     if let Some(user_message) = user_message.take() {
                         let _ = self
                             .chat_widget

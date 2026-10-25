@@ -375,6 +375,7 @@ pub(crate) fn finalize_tool_router(
 ) -> CodexResult<ToolRouter> {
     let model_messages = ResolvedModelMessages::from_model(model_info);
     hosted_specs.retain(|spec| registry.tool_policy.allows(&ToolName::plain(spec.name())));
+    enforce_strict_read_only_tool_surface(turn_context, &mut registry, &mut hosted_specs);
     apply_direct_model_only_namespace_overrides(turn_context, &mut registry);
     enforce_strict_3p_tools(turn_context, model_info, &mut registry);
     let tool_mode = effective_tool_mode(turn_context, model_info);
@@ -551,6 +552,46 @@ pub(crate) fn finalize_tool_router(
         tool_namespaces_info,
         &child_management_tools,
     ))
+}
+
+/// SIDE uses a defense-in-depth tool surface in addition to its read-only
+/// process sandbox. MCP tools have already been filtered by `readOnlyHint` at
+/// discovery time. The one intentional state-changing exception is the
+/// dedicated TUI bridge that delivers advice to the paired MAIN thread.
+fn enforce_strict_read_only_tool_surface(
+    turn_context: &TurnContext,
+    registry: &mut ToolRegistry,
+    hosted_specs: &mut Vec<ToolSpec>,
+) {
+    if !turn_context.config.strict_read_only_tools {
+        return;
+    }
+
+    registry.retain(|tool| {
+        let name = tool.runtime.tool_name().with_default_namespace();
+        if name.namespace.as_deref() == Some("codex_tui") {
+            return name.name == "send_message_to_thread";
+        }
+        if tool.runtime.mcp_server_name().is_some() {
+            return true;
+        }
+        matches!(
+            (name.namespace.as_deref(), name.name.as_str()),
+            (
+                Some("functions"),
+                "exec_command" | "shell_command" | "write_stdin"
+            ) | (
+                Some("functions"),
+                "list_mcp_resources"
+                    | "list_mcp_resource_templates"
+                    | "read_mcp_resource"
+                    | "view_image"
+                    | "current_time"
+                    | "get_context_remaining"
+            ) | (Some("web"), "run")
+        )
+    });
+    hosted_specs.retain(|spec| matches!(spec, ToolSpec::WebSearch { .. }));
 }
 
 fn apply_direct_model_only_namespace_overrides(

@@ -1080,6 +1080,75 @@ async fn dynamic_tools_cannot_reclaim_the_reserved_exec_command_name() {
 }
 
 #[tokio::test]
+async fn strict_read_only_surface_keeps_reads_and_main_bridge_but_removes_mutations() {
+    let plan = probe_with(
+        |turn| {
+            let mut config = (*turn.config).clone();
+            config.strict_read_only_tools = true;
+            config
+                .features
+                .enable(Feature::ShellTool)
+                .expect("shell feature should be configurable");
+            config
+                .features
+                .enable(Feature::RequestPermissionsTool)
+                .expect("permissions feature should be configurable");
+            turn.config = Arc::new(config);
+            update_turn_settings_for_test(turn, |settings| {
+                Arc::make_mut(&mut settings.model_info).shell_type =
+                    ConfigShellToolType::UnifiedExec;
+                Arc::make_mut(&mut settings.model_info).apply_patch_tool_type =
+                    Some(ApplyPatchToolType::Freeform);
+            });
+        },
+        ToolPlanInputs {
+            dynamic_tools: vec![
+                dynamic_tool(
+                    Some("codex_tui"),
+                    "send_message_to_thread",
+                    /*defer_loading*/ false,
+                ),
+                dynamic_tool(
+                    Some("codex_tui"),
+                    "create_thread",
+                    /*defer_loading*/ false,
+                ),
+                dynamic_tool(
+                    Some("codex_tui"),
+                    "set_thread_title",
+                    /*defer_loading*/ false,
+                ),
+            ],
+            ..ToolPlanInputs::default()
+        },
+    )
+    .await;
+
+    plan.assert_registered_contains(&[
+        "exec_command",
+        "write_stdin",
+        &ToolName::namespaced("codex_tui", "send_message_to_thread").to_string(),
+    ]);
+    plan.assert_registered_lacks(&[
+        "apply_patch",
+        "request_permissions",
+        &ToolName::namespaced("codex_tui", "create_thread").to_string(),
+        &ToolName::namespaced("codex_tui", "set_thread_title").to_string(),
+    ]);
+    assert!(!plan.can_manage_children);
+}
+
+#[tokio::test]
+async fn strict_read_only_surface_requires_mcp_read_only_annotations() {
+    let (_session, mut turn) = make_session_and_context().await;
+    let mut config = (*turn.config).clone();
+    config.strict_read_only_tools = true;
+    turn.config = Arc::new(config);
+
+    assert!(mcp_config_for_test(&turn.config).requires_read_only_mcp_tools);
+}
+
+#[tokio::test]
 async fn multiple_environments_expose_environment_selectors() {
     let multiple_environments = probe(|turn| {
         duplicate_primary_environment(turn);

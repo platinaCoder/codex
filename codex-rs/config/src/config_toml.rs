@@ -255,6 +255,12 @@ pub struct ConfigToml {
     #[serde(default)]
     pub developer_instructions: Option<String>,
 
+    /// Restrict the callable tool surface to observational tools. This is an
+    /// internal thread-scoped safety control used by read-only research panes.
+    #[serde(default)]
+    #[schemars(skip)]
+    pub strict_read_only_tools: Option<bool>,
+
     /// Whether to inject the `<permissions instructions>` developer block.
     pub include_permissions_instructions: Option<bool>,
 

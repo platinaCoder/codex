@@ -2064,6 +2064,7 @@ fn config_request_overrides_from_config(
                     | "personality"
                     | "sandbox_workspace_write"
                     | "shell_environment_policy"
+                    | "strict_read_only_tools"
                     | "suppress_unstable_features_warning"
             )
         })
@@ -2120,6 +2121,9 @@ fn config_request_overrides_from_config(
     }
     if config.bypass_hook_trust {
         overrides.insert("bypass_hook_trust".to_string(), true.into());
+    }
+    if config.strict_read_only_tools {
+        overrides.insert("strict_read_only_tools".to_string(), true.into());
     }
     Some(overrides)
 }
