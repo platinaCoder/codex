@@ -187,6 +187,23 @@ Annotations: \(\underset{i\in I}{\min} x_i\), \(\overset{\text{def}}{=}\).",
 }
 
 #[test]
+fn unicode_math_grouped_script_separators_preserve_readable_indices() {
+    assert_eq!(
+        render("a_{j,t}", /*display*/ false).as_deref(),
+        Some("aⱼ,ₜ")
+    );
+    assert_eq!(
+        render("x_{i,j;k:t}", /*display*/ false).as_deref(),
+        Some("xᵢ,ⱼ;ₖ:ₜ")
+    );
+    assert_eq!(
+        render("x_{g,t}", /*display*/ false).as_deref(),
+        Some("x_{g,t}"),
+        "unsupported substantive characters must keep the explicit LaTeX script"
+    );
+}
+
+#[test]
 fn unicode_math_aligned_fraction_and_narrow_fallback() {
     let formula = r"\[
 \begin{aligned}

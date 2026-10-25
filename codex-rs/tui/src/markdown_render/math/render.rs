@@ -185,8 +185,16 @@ impl MathParser<'_> {
                 let output: Option<String> = text
                     .chars()
                     .map(|value| {
-                        let index = plain.chars().position(|ch| ch == value)?;
-                        alphabet.chars().nth(index)
+                        if let Some(index) = plain.chars().position(|ch| ch == value) {
+                            alphabet.chars().nth(index)
+                        } else if matches!(value, ',' | ';' | ':') {
+                            // Unicode has no general script-height punctuation. Retaining a narrow
+                            // separator is still unambiguous between lowered/raised index atoms and
+                            // avoids rejecting common grouped indices such as `a_{j,t}`.
+                            Some(value)
+                        } else {
+                            None
+                        }
                     })
                     .collect();
                 Some(Layout::text(

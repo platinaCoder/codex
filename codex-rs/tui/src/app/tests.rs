@@ -5364,6 +5364,7 @@ async fn side_thread_config_is_durable_and_appends_developer_guardrails() {
     );
     assert!(developer_instructions.contains("Never assume a particular neural architecture"));
     assert!(developer_instructions.contains("Prioritize building conceptual understanding"));
+    assert!(developer_instructions.contains("Delimit inline mathematical notation"));
     assert!(
         developer_instructions
             .contains("External tools may be available according to this thread's current")

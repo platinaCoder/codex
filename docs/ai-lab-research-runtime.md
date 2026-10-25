@@ -36,7 +36,10 @@ translates equations into pseudocode when practical, traces information flow,
 and relates the expression to the implementation without assuming a particular
 architecture. It explicitly separates what an equation specifies from how the
 software realizes it, favoring concise conceptual understanding unless deeper
-mathematical detail is requested.
+mathematical detail is requested. SIDE is also instructed to delimit math so
+the TUI can recognize it. Common grouped indices with punctuation render in
+compact Unicode—for example, `a_{j,t}` is displayed as `aⱼ,ₜ`—while unsupported
+expressions retain their source LaTeX rather than being guessed at.
 
 ## Interaction
 
