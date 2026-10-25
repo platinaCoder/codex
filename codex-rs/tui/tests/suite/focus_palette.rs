@@ -320,6 +320,57 @@ impl PtyCodex {
         extra_args: &[&str],
         editor: Option<&Path>,
     ) -> Result<Self> {
+        let (master, child) =
+            Self::spawn_binary(codex, repo_root, codex_home.path(), extra_args, editor)?;
+
+        Ok(Self {
+            master,
+            child,
+            parser: vt100::Parser::new(
+                /*rows*/ 32, /*cols*/ 120, /*scrollback_len*/ 0,
+            ),
+            output: Vec::new(),
+            cursor_answered: false,
+            palette_answered: false,
+            keyboard_answered: false,
+            _codex_home: codex_home,
+        })
+    }
+
+    fn restart_binary(
+        &mut self,
+        codex: &Path,
+        repo_root: &Path,
+        extra_args: &[&str],
+    ) -> Result<()> {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let (master, child) = Self::spawn_binary(
+            codex,
+            repo_root,
+            self._codex_home.path(),
+            extra_args,
+            /*editor*/ None,
+        )?;
+        self.master = master;
+        self.child = child;
+        self.parser = vt100::Parser::new(
+            /*rows*/ 32, /*cols*/ 120, /*scrollback_len*/ 0,
+        );
+        self.output.clear();
+        self.cursor_answered = false;
+        self.palette_answered = false;
+        self.keyboard_answered = false;
+        Ok(())
+    }
+
+    fn spawn_binary(
+        codex: &Path,
+        repo_root: &Path,
+        codex_home: &Path,
+        extra_args: &[&str],
+        editor: Option<&Path>,
+    ) -> Result<(File, Child)> {
         let mut master_fd = -1;
         let mut slave_fd = -1;
         let mut window_size = libc::winsize {
@@ -367,25 +418,13 @@ impl PtyCodex {
             .env("TERM_PROGRAM", "kitty")
             .env_remove("TERM_PROGRAM_VERSION")
             .env("OPENAI_API_KEY", "focus-palette-test")
-            .env("CODEX_HOME", codex_home.path())
+            .env("CODEX_HOME", codex_home)
             .stdin(stdin)
             .stdout(stdout)
             .stderr(slave)
             .spawn()
             .context("start Codex in focus-test pseudo-terminal")?;
-
-        Ok(Self {
-            master,
-            child,
-            parser: vt100::Parser::new(
-                /*rows*/ 32, /*cols*/ 120, /*scrollback_len*/ 0,
-            ),
-            output: Vec::new(),
-            cursor_answered: false,
-            palette_answered: false,
-            keyboard_answered: false,
-            _codex_home: codex_home,
-        })
+        Ok((master, child))
     }
 
     pub(super) fn wait_for_startup(&mut self) -> Result<()> {
@@ -613,18 +652,13 @@ fn no_daemon_skips_startup_and_discovery() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn no_daemon_side_model_tools_and_main_dispatch_are_end_to_end() -> Result<()> {
     use core_test_support::responses;
-    use std::sync::atomic::AtomicUsize;
-    use std::sync::atomic::Ordering;
     use wiremock::Mock;
     use wiremock::Respond;
     use wiremock::ResponseTemplate;
     use wiremock::matchers::method;
     use wiremock::matchers::path_regex;
 
-    struct SequenceResponder {
-        call_count: AtomicUsize,
-        bodies: Vec<String>,
-    }
+    struct SideSmokeResponder;
 
     fn is_thread_title_body(body: &serde_json::Value) -> bool {
         body.pointer("/client_metadata/x-codex-turn-metadata")
@@ -635,31 +669,130 @@ async fn no_daemon_side_model_tools_and_main_dispatch_are_end_to_end() -> Result
             .is_some_and(|source| source == "thread_title")
     }
 
-    impl Respond for SequenceResponder {
+    fn request_tail(body: &serde_json::Value) -> String {
+        body.get("input")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|input| input.last())
+            .map(serde_json::Value::to_string)
+            .unwrap_or_default()
+    }
+
+    fn model_response(events: Vec<serde_json::Value>) -> ResponseTemplate {
+        ResponseTemplate::new(200)
+            .insert_header("content-type", "text/event-stream")
+            .set_body_string(responses::sse(events))
+    }
+
+    impl Respond for SideSmokeResponder {
         fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
-            let is_thread_title = serde_json::from_slice::<serde_json::Value>(&request.body)
-                .ok()
-                .is_some_and(|body| is_thread_title_body(&body));
-            if is_thread_title {
-                return ResponseTemplate::new(200)
-                    .insert_header("content-type", "text/event-stream")
-                    .set_body_string(responses::sse(vec![
-                        responses::ev_assistant_message(
-                            "side-smoke-title",
-                            r#"{"title":"SIDE smoke"}"#,
-                        ),
-                        responses::ev_completed("side-smoke-title-response"),
-                    ]));
+            let body = serde_json::from_slice::<serde_json::Value>(&request.body)
+                .expect("model request body must be JSON");
+            if is_thread_title_body(&body) {
+                return model_response(vec![
+                    responses::ev_assistant_message(
+                        "side-smoke-title",
+                        r#"{"title":"SIDE smoke"}"#,
+                    ),
+                    responses::ev_completed("side-smoke-title-response"),
+                ]);
             }
-            let index = self.call_count.fetch_add(1, Ordering::SeqCst);
-            ResponseTemplate::new(200)
-                .insert_header("content-type", "text/event-stream")
-                .set_body_string(
-                    self.bodies
-                        .get(index)
-                        .unwrap_or_else(|| panic!("unexpected model request {index}"))
-                        .clone(),
-                )
+
+            let tail = request_tail(&body);
+            let events = if tail.contains("side-read-suite")
+                && tail.contains("custom_tool_call_output")
+            {
+                vec![
+                    responses::ev_assistant_message("side-read-done", "SIDE_MODEL_READS_OK"),
+                    responses::ev_completed("side-read-done-response"),
+                ]
+            } else if tail.contains("side-proactive") && tail.contains("custom_tool_call_output") {
+                vec![
+                    responses::ev_assistant_message(
+                        "side-proactive-done",
+                        "SIDE_PROACTIVE_SEND_OK",
+                    ),
+                    responses::ev_completed("side-proactive-done-response"),
+                ]
+            } else if tail.contains("side-cold-read") && tail.contains("custom_tool_call_output") {
+                vec![
+                    responses::ev_assistant_message("side-cold-read-done", "SIDE_COLD_RESUME_OK"),
+                    responses::ev_completed("side-cold-read-done-response"),
+                ]
+            } else if tail.contains("Seed MAIN before SIDE smoke") {
+                vec![
+                    responses::ev_assistant_message("main-seeded", "MAIN_SEEDED"),
+                    responses::ev_completed("main-seeded-response"),
+                ]
+            } else if tail.contains("READ_SIDE_MARKER") {
+                let code = r#"
+const pick = suffix => ALL_TOOLS.find(({ name }) => name.endsWith(`__${suffix}`));
+const readTool = pick("read_workspace_file");
+const listTool = pick("list_workspace_directory");
+const searchTool = pick("search_workspace_text");
+const exposedWrites = ALL_TOOLS.filter(({ name }) =>
+  /(?:write|edit|patch|delete|remove|exec_command)/i.test(name)
+).map(({ name }) => name);
+if (!readTool || !listTool || !searchTool || exposedWrites.length !== 0) {
+  throw new Error(JSON.stringify({ readTool, listTool, searchTool, exposedWrites }));
+}
+const [read, list, search] = await Promise.all([
+  tools[readTool.name]({ path: "side-smoke.txt" }),
+  tools[listTool.name]({ path: "." }),
+  tools[searchTool.name]({ query: "SIDE_MODEL_READ_NEEDLE", path: "." }),
+]);
+text(JSON.stringify({ catalogSafe: true, read, list, search }));
+"#;
+                vec![
+                    responses::ev_response_created("side-read-response"),
+                    responses::ev_custom_tool_call("side-read-suite", "exec", code),
+                    responses::ev_completed("side-read-response"),
+                ]
+            } else if tail.contains("Hi! Say Hi to MAIN") {
+                let code = r#"
+const mainTool = ALL_TOOLS.find(({ name }) => name.endsWith("__send_message_to_main"));
+if (!mainTool) throw new Error("send_message_to_main missing from SIDE catalog");
+const result = await tools[mainTool.name]({ prompt: "PROACTIVE_SIDE_MESSAGE" });
+text(JSON.stringify(result));
+"#;
+                vec![
+                    responses::ev_response_created("side-proactive-response"),
+                    responses::ev_custom_tool_call("side-proactive", "exec", code),
+                    responses::ev_completed("side-proactive-response"),
+                ]
+            } else if tail.contains("PROACTIVE_SIDE_MESSAGE") {
+                vec![
+                    responses::ev_assistant_message(
+                        "main-proactive-done",
+                        "MAIN_PROACTIVE_DISPATCH_OK",
+                    ),
+                    responses::ev_completed("main-proactive-done-response"),
+                ]
+            } else if tail.contains("verify deterministic dispatch") {
+                vec![
+                    responses::ev_assistant_message("main-slash-done", "MAIN_SLASH_DISPATCH_OK"),
+                    responses::ev_completed("main-slash-done-response"),
+                ]
+            } else if tail.contains("COLD_RESUME_READ") {
+                let code = r#"
+const readTool = ALL_TOOLS.find(({ name }) => name.endsWith("__read_workspace_file"));
+const exposedWrites = ALL_TOOLS.filter(({ name }) =>
+  /(?:write|edit|patch|delete|remove|exec_command)/i.test(name)
+).map(({ name }) => name);
+if (!readTool || exposedWrites.length !== 0) {
+  throw new Error(JSON.stringify({ readTool, exposedWrites }));
+}
+const read = await tools[readTool.name]({ path: "side-smoke.txt" });
+text(JSON.stringify({ catalogSafe: true, read }));
+"#;
+                vec![
+                    responses::ev_response_created("side-cold-read-response"),
+                    responses::ev_custom_tool_call("side-cold-read", "exec", code),
+                    responses::ev_completed("side-cold-read-response"),
+                ]
+            } else {
+                panic!("unexpected model request tail: {tail}\nbody: {body}")
+            };
+            model_response(events)
         }
     }
 
@@ -714,92 +847,28 @@ async fn no_daemon_side_model_tools_and_main_dispatch_are_end_to_end() -> Result
         ),
     )?;
 
-    let model_responses = vec![
-        responses::sse(vec![
-            responses::ev_assistant_message("main-seeded", "MAIN_SEEDED"),
-            responses::ev_completed("main-seeded-response"),
-        ]),
-        responses::sse(vec![
-            responses::ev_response_created("side-read-response"),
-            responses::ev_function_call_with_namespace(
-                "side-read",
-                "mcp__codex_tui",
-                "read_workspace_file",
-                r#"{"path":"side-smoke.txt"}"#,
-            ),
-            responses::ev_completed("side-read-response"),
-        ]),
-        responses::sse(vec![
-            responses::ev_response_created("side-list-response"),
-            responses::ev_function_call_with_namespace(
-                "side-list",
-                "mcp__codex_tui",
-                "list_workspace_directory",
-                r#"{"path":"."}"#,
-            ),
-            responses::ev_completed("side-list-response"),
-        ]),
-        responses::sse(vec![
-            responses::ev_response_created("side-search-response"),
-            responses::ev_function_call_with_namespace(
-                "side-search",
-                "mcp__codex_tui",
-                "search_workspace_text",
-                r#"{"query":"SIDE_MODEL_READ_NEEDLE","path":"."}"#,
-            ),
-            responses::ev_completed("side-search-response"),
-        ]),
-        responses::sse(vec![
-            responses::ev_assistant_message("side-done", "SIDE_MODEL_READS_OK"),
-            responses::ev_completed("side-done-response"),
-        ]),
-        responses::sse(vec![
-            responses::ev_assistant_message("main-done", "MAIN_SLASH_DISPATCH_OK"),
-            responses::ev_completed("main-done-response"),
-        ]),
-        responses::sse(vec![
-            responses::ev_response_created("side-proactive-response"),
-            responses::ev_function_call_with_namespace(
-                "side-proactive",
-                "mcp__codex_tui",
-                "send_message_to_main",
-                r#"{"prompt":"PROACTIVE_SIDE_MESSAGE"}"#,
-            ),
-            responses::ev_completed("side-proactive-response"),
-        ]),
-    ];
     Mock::given(method("POST"))
         .and(path_regex(r"/v1/responses$"))
-        .respond_with(SequenceResponder {
-            call_count: AtomicUsize::new(0),
-            bodies: model_responses,
-        })
+        .respond_with(SideSmokeResponder)
         .mount(&model)
         .await;
 
-    let mut terminal = if let Some(candidate) = std::env::var_os("AI_LAB_CODEX_STAGED") {
-        PtyCodex::start_binary(
-            Path::new(&candidate),
-            &workspace_path,
-            home,
-            &[
-                "--no-daemon",
-                "--no-alt-screen",
-                "Seed MAIN before SIDE smoke.",
-            ],
-            /*editor*/ None,
-        )?
+    let codex = if let Some(candidate) = std::env::var_os("AI_LAB_CODEX_STAGED") {
+        std::path::PathBuf::from(candidate)
     } else {
-        PtyCodex::start(
-            &workspace_path,
-            home,
-            &[
-                "--no-daemon",
-                "--no-alt-screen",
-                "Seed MAIN before SIDE smoke.",
-            ],
-        )?
+        codex_utils_cargo_bin::cargo_bin("codex")?
     };
+    let mut terminal = PtyCodex::start_binary(
+        &codex,
+        &workspace_path,
+        home,
+        &[
+            "--no-daemon",
+            "--no-alt-screen",
+            "Seed MAIN before SIDE smoke.",
+        ],
+        /*editor*/ None,
+    )?;
     terminal.wait_for_startup()?;
     terminal.wait_for_screen("MAIN_SEEDED")?;
     submit(&mut terminal, "/side")?;
@@ -812,68 +881,77 @@ async fn no_daemon_side_model_tools_and_main_dispatch_are_end_to_end() -> Result
         .into_iter()
         .filter(|request| !is_thread_title_body(&request.body_json()))
         .collect::<Vec<_>>();
+    let read_output = requests
+        .iter()
+        .map(|request| request.body_json())
+        .find(|body| {
+            let tail = request_tail(body);
+            tail.contains("side-read-suite") && tail.contains("custom_tool_call_output")
+        })
+        .context("missing functions.exec output for SIDE read/list/search suite")?;
+    let read_output = request_tail(&read_output);
     ensure!(
-        requests.len() == 5,
-        "expected MAIN seed plus four SIDE model requests, got {}",
-        requests.len()
+        read_output.contains(r#"\"catalogSafe\":true"#),
+        "{read_output}"
     );
     ensure!(
-        requests[2]
-            .function_call_output("side-read")
-            .to_string()
-            .contains("SIDE_MODEL_READ_NEEDLE"),
-        "read output missing from request: {}",
-        requests[2].body_json()
+        read_output.contains("SIDE_MODEL_READ_NEEDLE"),
+        "{read_output}"
     );
-    ensure!(
-        requests[3]
-            .function_call_output("side-list")
-            .to_string()
-            .contains("side-smoke.txt"),
-        "list output missing from request: {}",
-        requests[3].body_json()
-    );
-    ensure!(
-        requests[4]
-            .function_call_output("side-search")
-            .to_string()
-            .contains("SIDE_MODEL_READ_NEEDLE"),
-        "search output missing from request: {}",
-        requests[4].body_json()
-    );
+    ensure!(read_output.contains("side-smoke.txt"), "{read_output}");
 
-    submit_typed(&mut terminal, "/main verify deterministic dispatch")?;
-    let dispatch_deadline = Instant::now() + Duration::from_secs(/*secs*/ 5);
-    let dispatched_requests = loop {
-        terminal.read_output(Duration::from_millis(/*millis*/ 50))?;
-        let requests = responses::received_responses_requests(&model)
-            .await
-            .into_iter()
-            .filter(|request| !is_thread_title_body(&request.body_json()))
-            .collect::<Vec<_>>();
-        if requests.len() >= 6 || Instant::now() >= dispatch_deadline {
-            break requests;
-        }
-    };
-    ensure!(
-        dispatched_requests.len() == 6,
-        "/main did not start the paired MAIN turn; got {} model requests; screen:\n{}",
-        dispatched_requests.len(),
-        terminal.screen_contents()
-    );
-    terminal.wait_for_screen("MAIN_SLASH_DISPATCH_OK")?;
-    submit(&mut terminal, "PROACTIVE_SIDE_SEND")?;
+    submit(&mut terminal, "Hi! Say Hi to MAIN")?;
     terminal.wait_for_screen("Allow the codex_tui MCP server")?;
     ensure!(
-        responses::received_responses_requests(&model)
-            .await
-            .into_iter()
-            .filter(|request| !is_thread_title_body(&request.body_json()))
-            .count()
-            == 7,
-        "proactive SIDE dispatch must pause before a follow-up model request"
+        !terminal.screen_contains("MAIN_PROACTIVE_DISPATCH_OK"),
+        "proactive SIDE dispatch bypassed approval"
     );
-    ensure!(terminal.screen_contains("Allow"));
+    terminal.write_input(b"\r")?;
+    terminal.wait_for_screen("MAIN_PROACTIVE_DISPATCH_OK")?;
+    terminal.wait_for_screen("SIDE_PROACTIVE_SEND_OK")?;
+
+    submit_typed(&mut terminal, "/main verify deterministic dispatch")?;
+    terminal.wait_for_screen("MAIN_SLASH_DISPATCH_OK")?;
+
+    let registry =
+        std::fs::read_to_string(terminal._codex_home.path().join("ai_lab_side_pairs.json"))?;
+    let registry: serde_json::Value = serde_json::from_str(&registry)?;
+    let main_thread_id = registry
+        .get("pairs")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|pairs| pairs.keys().next())
+        .context("missing persisted MAIN/SIDE pair")?
+        .clone();
+    terminal.restart_binary(
+        &codex,
+        &workspace_path,
+        &["resume", &main_thread_id, "--no-daemon", "--no-alt-screen"],
+    )?;
+    terminal.wait_for_startup()?;
+    terminal.wait_for_screen("MAIN_SLASH_DISPATCH_OK")?;
+    terminal.wait_for_screen("SIDE_PROACTIVE_SEND_OK")?;
+    submit(&mut terminal, "/side")?;
+    submit(&mut terminal, "COLD_RESUME_READ")?;
+    terminal.wait_for_screen("SIDE_COLD_RESUME_OK")?;
+
+    let requests = responses::received_responses_requests(&model).await;
+    let cold_output = requests
+        .iter()
+        .map(|request| request.body_json())
+        .find(|body| {
+            let tail = request_tail(body);
+            tail.contains("side-cold-read") && tail.contains("custom_tool_call_output")
+        })
+        .context("missing functions.exec output after cold SIDE resume")?;
+    let cold_output = request_tail(&cold_output);
+    ensure!(
+        cold_output.contains(r#"\"catalogSafe\":true"#),
+        "{cold_output}"
+    );
+    ensure!(
+        cold_output.contains("SIDE_MODEL_READ_NEEDLE"),
+        "{cold_output}"
+    );
 
     Ok(())
 }
