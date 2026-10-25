@@ -31,6 +31,16 @@ explicit, and preserves uncertainty instead of automatically adopting the
 user's preferred framing. This policy is applied both when a SIDE is created
 and when its persistent thread is resumed.
 
+SIDE is strictly read-only even when a later SIDE message requests a mutation.
+Its process sandbox has read-only filesystem access and no shell network access;
+its native tool surface is reduced to inspection operations, hosted web search,
+and read-only MCP tools. MCP tools must advertise `readOnlyHint`, and session
+settings reject later attempts to raise SIDE's filesystem or shell-network
+permissions. The sole state-changing exception is the exact
+`codex_tui.send_message_to_thread` bridge used to deliver advice to the paired
+MAIN UUID. Other task-management, patching, permission-escalation, build, and
+mutating external tools are unavailable.
+
 For mathematical explanations, SIDE defines unfamiliar notation and dimensions,
 translates equations into pseudocode when practical, traces information flow,
 and relates the expression to the implementation without assuming a particular
