@@ -23,7 +23,7 @@ async fn model_call(
     } else {
         responses::ev_function_call_with_namespace(
             tool,
-            "mcp__codex_worktrees",
+            "mcp__codex_tui",
             tool,
             &arguments.to_string(),
         )
@@ -144,7 +144,7 @@ pub(super) async fn exercise(
     let mut overrides = None;
     server.thread_tool_transport().configure_mcp(&mut overrides);
     let overrides = overrides.unwrap();
-    let mcp = &overrides["mcp_servers.codex_worktrees"];
+    let mcp = &overrides["mcp_servers.codex_tui"];
     let client = codex_http_client::HttpClientBuilder::new().build_direct()?;
     tokio::time::timeout(Duration::from_secs(/*secs*/ 20), async {
         loop {
@@ -212,7 +212,7 @@ pub(super) async fn exercise(
             body["tools"]
                 .as_array_mut()
                 .expect("request tools")
-                .retain(|tool| tool["name"] == "mcp__codex_worktrees");
+                .retain(|tool| tool["name"] == "mcp__codex_tui");
             let mut text = body.to_string();
             for (path, label) in [
                 (&root.join(""), "<WORKTREE>/"),

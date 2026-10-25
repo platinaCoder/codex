@@ -1,4 +1,4 @@
-//! Approval-gated MCP transport for task tools owned by a local-daemon TUI.
+//! Approval-gated loopback MCP transport for task tools owned by a local TUI.
 
 use crate::app_event_sender::AppEventSender;
 use crate::dynamic_tools;
@@ -80,8 +80,9 @@ impl ThreadToolTransport {
             Self::Dynamic => {
                 params.dynamic_tools = Some(dynamic_tools::non_delegation_tool_specs());
             }
-            Self::Mcp(_) => {
-                params.dynamic_tools = None;
+            Self::Mcp(server) => {
+                params.dynamic_tools =
+                    (!server.task_tools).then(dynamic_tools::non_delegation_tool_specs);
                 self.configure_mcp(&mut params.config);
             }
         }
@@ -89,17 +90,21 @@ impl ThreadToolTransport {
 
     pub(crate) fn configure_paired_side(&self, params: &mut ThreadStartParams) {
         match self {
-            // In-process/no-daemon sessions do not run the loopback MCP
-            // task-tool server. Give SIDE the bounded read surface plus its
-            // persisted-target bridge through app-server dynamic tools.
+            // If loopback MCP startup failed, embedded/no-daemon sessions can
+            // still give SIDE its bounded read surface and persisted-target
+            // bridge through app-server dynamic tools.
             Self::Disabled | Self::Dynamic => {
                 params.dynamic_tools = Some(dynamic_tools::side_tool_specs());
             }
-            Self::Mcp(_) => {
-                params.dynamic_tools = None;
+            Self::Mcp(server) => {
+                params.dynamic_tools = (!server.task_tools).then(dynamic_tools::side_tool_specs);
                 self.configure_mcp(&mut params.config);
             }
         }
+    }
+
+    pub(crate) fn provides_task_tools(&self) -> bool {
+        matches!(self, Self::Dynamic) || matches!(self, Self::Mcp(server) if server.task_tools)
     }
 
     pub(crate) fn configure_mcp(&self, config: &mut Option<HashMap<String, Value>>) {
@@ -133,6 +138,7 @@ pub(crate) struct DynamicToolMcpServer {
     connection: ToolConnection,
     config: Value,
     namespace: &'static str,
+    task_tools: bool,
     task: JoinHandle<()>,
 }
 
@@ -192,6 +198,7 @@ impl DynamicToolMcpServer {
         if let Some(overrides) = thread_start_params.config.as_mut() {
             overrides.remove("web_search");
         }
+        let task_tools = services.task_tools;
         let connection = Arc::new(RwLock::new(Some((request_handle, app_event_tx))));
         let namespace = services.namespace();
         let handler = DynamicToolMcpHandler {
@@ -223,6 +230,7 @@ impl DynamicToolMcpServer {
             connection,
             config: server_config,
             namespace,
+            task_tools,
             task,
         })
     }

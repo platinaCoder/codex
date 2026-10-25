@@ -1817,6 +1817,195 @@ async fn side_main_mcp_bridge_survives_reattach_multiple_sides_and_cold_resume()
     boxed_future!(side_main_mcp_bridge_transport_scenario()).await
 }
 
+#[tokio::test]
+async fn embedded_side_keeps_read_and_main_bridge_tools_after_cold_resume() -> Result<()> {
+    boxed_future!(embedded_side_tools_cold_resume_scenario()).await
+}
+
+async fn embedded_side_tools_cold_resume_scenario() -> Result<()> {
+    let (mut app, _codex_home) = make_history_test_app().await?;
+    app.config.ephemeral = false;
+    std::fs::create_dir_all(app.config.cwd.as_path())?;
+    let marker = app.config.cwd.join("embedded-side-tool-marker.txt");
+    std::fs::write(&marker, "embedded SIDE read surface\n")?;
+
+    let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+    let event_sender = AppEventSender::new(events_tx);
+    let registration_task = tokio::spawn(async move {
+        while let Some(event) = events_rx.recv().await {
+            if let AppEvent::DynamicToolThreadStarted { registered, .. } = event {
+                let _ = registered.send(());
+            }
+        }
+    });
+
+    let mut server = Box::pin(crate::start_embedded_app_server_for_picker(&app.config)).await?;
+    Box::pin(server.start_dynamic_tool_mcp(
+        app.config.clone(),
+        event_sender.clone(),
+        app.dynamic_tool_status_updates.clone(),
+    ))
+    .await?;
+    let main = Box::pin(server.start_thread(&app.config))
+        .await?
+        .session
+        .thread_id;
+    let side = Box::pin(server.start_side_thread(
+        &crate::local_settings::LocalSettings::from(&app.config),
+        &app.config,
+        main,
+        /*selected_profile*/ None,
+    ))
+    .await?
+    .session
+    .thread_id;
+    for thread_id in [main, side] {
+        server
+            .thread_inject_items(
+                thread_id,
+                vec![serde_json::from_value(serde_json::json!({
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "persist thread identity"}]
+                }))?],
+            )
+            .await?;
+    }
+
+    async fn assert_side_tools(
+        server: &crate::app_server_session::AppServerSession,
+        side: ThreadId,
+    ) -> Result<()> {
+        let inventory: codex_app_server_protocol::ListMcpServerStatusResponse = server
+            .request_handle()
+            .request_typed(ClientRequest::McpServerStatusList {
+                request_id: AppServerRequestId::String(format!("embedded-side-tools-{side}")),
+                params: codex_app_server_protocol::ListMcpServerStatusParams {
+                    server_name: Some(crate::dynamic_tools::NAMESPACE.to_string()),
+                    cursor: None,
+                    limit: None,
+                    detail: Some(
+                        codex_app_server_protocol::McpServerStatusDetail::ToolsAndAuthOnly,
+                    ),
+                    thread_id: Some(side.to_string()),
+                },
+            })
+            .await?;
+        let tools = &inventory
+            .data
+            .iter()
+            .find(|entry| entry.name == crate::dynamic_tools::NAMESPACE)
+            .expect("embedded SIDE must connect to the authenticated task-tool MCP")
+            .tools;
+        assert!(tools.contains_key("read_workspace_file"));
+        assert!(tools.contains_key("send_message_to_main"));
+        Ok(())
+    }
+
+    async fn call_side_tool(
+        server: &crate::app_server_session::AppServerSession,
+        side: ThreadId,
+        tool: &str,
+        arguments: serde_json::Value,
+    ) -> Result<String> {
+        let mut overrides = None;
+        server.thread_tool_transport().configure_mcp(&mut overrides);
+        let mcp = &overrides.expect("embedded SIDE MCP config")["mcp_servers.codex_tui"];
+        let response = codex_http_client::HttpClientBuilder::new()
+            .build_direct()?
+            .post(mcp["url"].as_str().expect("embedded SIDE MCP URL"))
+            .header(
+                "Authorization",
+                mcp["http_headers"]["Authorization"]
+                    .as_str()
+                    .expect("embedded SIDE MCP authorization"),
+            )
+            .header("Accept", "application/json, text/event-stream")
+            .header("MCP-Protocol-Version", "2026-07-28")
+            .header("MCP-Method", "tools/call")
+            .header("MCP-Name", tool)
+            .json(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": format!("embedded-{tool}-{side}"),
+                "method": "tools/call",
+                "params": {
+                    "name": tool,
+                    "arguments": arguments,
+                    "_meta": {
+                        "threadId": side,
+                        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                        "io.modelcontextprotocol/clientCapabilities": {}
+                    }
+                }
+            }))
+            .send()
+            .await?;
+        response.error_for_status_ref()?;
+        Ok(response.text().await?)
+    }
+
+    assert_side_tools(&server, side).await?;
+    let read = call_side_tool(
+        &server,
+        side,
+        "read_workspace_file",
+        serde_json::json!({"path": "embedded-side-tool-marker.txt"}),
+    )
+    .await?;
+    assert!(read.contains("embedded SIDE read surface"), "{read}");
+    let sent = call_side_tool(
+        &server,
+        side,
+        "send_message_to_main",
+        serde_json::json!({"prompt": "fresh embedded SIDE bridge"}),
+    )
+    .await?;
+    assert!(sent.contains(&main.to_string()), "{sent}");
+    let first_transport = server.thread_tool_transport();
+    let crate::dynamic_tools_mcp::ThreadToolTransport::Mcp(_first_tool_server) = &first_transport
+    else {
+        panic!("embedded sessions must use the authenticated task-tool MCP");
+    };
+    server.shutdown().await?;
+    drop(first_transport);
+
+    let mut resumed = Box::pin(crate::start_embedded_app_server_for_picker(&app.config)).await?;
+    Box::pin(resumed.start_dynamic_tool_mcp(
+        app.config.clone(),
+        event_sender,
+        app.dynamic_tool_status_updates.clone(),
+    ))
+    .await?;
+    Box::pin(resumed.resume_thread(
+        &crate::local_settings::LocalSettings::from(&app.config),
+        app.config.clone(),
+        side,
+        crate::app_server_session::ResumeModelSettings::RestoreFromThread,
+    ))
+    .await?;
+    assert_side_tools(&resumed, side).await?;
+    let read = call_side_tool(
+        &resumed,
+        side,
+        "read_workspace_file",
+        serde_json::json!({"path": "embedded-side-tool-marker.txt"}),
+    )
+    .await?;
+    assert!(read.contains("embedded SIDE read surface"), "{read}");
+    let sent = call_side_tool(
+        &resumed,
+        side,
+        "send_message_to_main",
+        serde_json::json!({"prompt": "cold-resumed embedded SIDE bridge"}),
+    )
+    .await?;
+    assert!(sent.contains(&main.to_string()), "{sent}");
+
+    resumed.shutdown().await?;
+    registration_task.abort();
+    Ok(())
+}
+
 async fn side_main_mcp_bridge_transport_scenario() -> Result<()> {
     let (mut app, _events, _ops) = Box::pin(make_test_app_with_channels()).await;
     app.config.ephemeral = false;

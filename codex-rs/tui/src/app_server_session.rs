@@ -519,7 +519,13 @@ impl AppServerSession {
             None
         };
         let services = crate::dynamic_tools_mcp::ToolServices {
-            task_tools: !self.uses_embedded_app_server(),
+            // SIDE must retain its authenticated MAIN bridge across cold
+            // resumes. Dynamic tools are persisted for newly-created embedded
+            // threads, but cannot repair an older SIDE whose original start
+            // omitted them. Hosting task tools on the loopback MCP in embedded
+            // mode gives fresh and resumed SIDE threads the same durable,
+            // caller-bound surface as daemon-backed sessions.
+            task_tools: true,
             worktrees,
         };
         if !services.task_tools && services.worktrees.is_none() {

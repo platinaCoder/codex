@@ -54,9 +54,13 @@ external tools are unavailable.
 
 On resume, the TUI reads persisted thread metadata even when the client did not
 set its SIDE flag. A valid `ai_lab_side:<MAIN_UUID>` marker forces strict mode
-back into the resume request. In `--no-daemon` mode, SIDE receives the same
-bounded read tools and paired-MAIN bridge through app-server dynamic tools;
-MAIN does not receive the SIDE-only bridge.
+back into the resume request. Local daemon and `--no-daemon` sessions both host
+the task surface on an authenticated loopback `codex_tui` MCP service. This
+keeps bounded workspace reads and the paired-MAIN bridge available to fresh,
+reattached, and cold-resumed SIDE threads, including SIDE histories created by
+an older runtime without persisted dynamic tools. If that local MCP cannot be
+started, a fresh embedded SIDE falls back to the equivalent app-server dynamic
+tool surface. MAIN does not receive the SIDE-only bridge.
 
 For mathematical explanations, SIDE defines unfamiliar notation and dimensions,
 translates equations into pseudocode when practical, traces information flow,

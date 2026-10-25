@@ -155,7 +155,9 @@ impl AppServerSession {
         model_settings: ResumeModelSettings,
         permission_overrides: crate::resume_permissions::ResumePermissions,
     ) -> Result<AppServerStartedThread> {
-        self.thread_tool_transport().validate_config(&config)?;
+        let thread_tool_transport = self.thread_tool_transport();
+        thread_tool_transport.validate_config(&config)?;
+        let transport_provides_task_tools = thread_tool_transport.provides_task_tools();
         let session_config = if matches!(
             model_settings,
             ResumeModelSettings::RestoreFromThread | ResumeModelSettings::PreserveExistingThread
@@ -194,8 +196,7 @@ impl AppServerSession {
                 .get_or_insert_default()
                 .insert("strict_read_only_tools".to_string(), true.into());
         }
-        self.thread_tool_transport()
-            .configure_mcp(&mut params.config);
+        thread_tool_transport.configure_mcp(&mut params.config);
         let mut rollout_maintenance_guard = None;
         params.exclude_turns = if self.history_support == ThreadHistorySupport::Paginated {
             let known_legacy_history = self
@@ -274,7 +275,7 @@ impl AppServerSession {
         )
         .await?;
         started.session.fork_parent_title = fork_parent_title;
-        if self.task_tools_available(thread_id) {
+        if transport_provides_task_tools || self.task_tools_available(thread_id) {
             self.remember_task_tool_thread(thread_id);
             started.task_tools_available = true;
         }
