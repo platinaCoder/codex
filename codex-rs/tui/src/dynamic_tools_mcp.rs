@@ -188,6 +188,8 @@ impl DynamicToolMcpServer {
                 "create_thread": {"approval_mode": "prompt"},
                 "send_message_to_thread": {"approval_mode": "prompt"},
                 "send_message_to_main": {"approval_mode": "prompt"},
+                "create_ticket": {"approval_mode": "prompt"},
+                "update_ticket": {"approval_mode": "prompt"},
                 "fork_thread": {"approval_mode": "prompt"},
                 "create_worktree": {"approval_mode": "approve"}
             }
@@ -326,9 +328,11 @@ impl ServerHandler for DynamicToolMcpHandler {
                         | "read_workspace_file"
                         | "list_workspace_directory"
                         | "search_workspace_text"
-                        // Strict SIDE policy treats this as its sole explicit
-                        // state-changing exception; core narrows the codex_tui
-                        // namespace back down to the paired-target-only bridge.
+                        | "list_tickets"
+                        | "read_ticket"
+                        // Strict SIDE policy also admits two bounded ticket mutations, but those
+                        // retain read_only=false and always prompt. The paired bridge is marked
+                        // read-only only to keep its non-filesystem advice channel discoverable.
                         | "send_message_to_main"
                         | "list_worktrees"
                         | "get_worktree_creation_status"

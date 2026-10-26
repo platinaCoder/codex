@@ -138,9 +138,10 @@ impl App {
         tui: &mut tui::Tui,
         screen_size: Size,
     ) -> Result<Rect> {
+        self.refresh_ticket_strip();
         let infer_render = self.inference_render_data();
         let decorated_workspace = infer_render.is_some() || self.paired_main_and_side().is_some();
-        let workspace = if decorated_workspace {
+        let mut workspace = if decorated_workspace {
             Rect::new(
                 PAIRED_WORKSPACE_OUTER_MARGIN,
                 PAIRED_WORKSPACE_OUTER_MARGIN,
@@ -159,6 +160,14 @@ impl App {
                 screen_size.height,
             )
         };
+        let ticket_height = self.ticket_strip_height().min(workspace.height);
+        let ticket_area = (ticket_height > 0)
+            .then(|| Rect::new(workspace.x, workspace.y, workspace.width, ticket_height));
+        if ticket_height > 0 {
+            let consumed = ticket_height + u16::from(workspace.height > ticket_height);
+            workspace.y = workspace.y.saturating_add(consumed);
+            workspace.height = workspace.height.saturating_sub(consumed);
+        }
         let (primary_workspace, infer_area) = if infer_render.is_some()
             && workspace.height > PRIMARY_WORKSPACE_MIN_HEIGHT + INFERENCE_WORKSPACE_GAP
         {
@@ -246,6 +255,7 @@ impl App {
                     active_title,
                     inactive_title,
                 }),
+                ticket_area,
                 infer,
             );
             if let Some(inactive_state) = inactive_state {
@@ -253,7 +263,14 @@ impl App {
             }
             return result;
         }
-        self.render_owned_transcript_in_area(tui, screen_size, primary_workspace, None, infer)
+        self.render_owned_transcript_in_area(
+            tui,
+            screen_size,
+            primary_workspace,
+            None,
+            ticket_area,
+            infer,
+        )
     }
 
     fn render_owned_transcript_in_area(
@@ -262,6 +279,7 @@ impl App {
         screen_size: Size,
         pane: Rect,
         mut paired: Option<PairedPaneRender<'_>>,
+        ticket_area: Option<Rect>,
         infer: Option<(Rect, inference::InferPaneRenderData)>,
     ) -> Result<Rect> {
         self.chat_widget.sync_warnings(&self.transcript_cells);
@@ -306,6 +324,7 @@ impl App {
         .then(crate::bottom_pane::ComposerGap::default);
         let mut prompt_footer = self.prompt_navigation_footer(pane.width.saturating_sub(/*rhs*/ 2));
         let chat_widget = &self.chat_widget;
+        let ticket_ui = &self.ticket_ui;
         let view = &mut self.transcript_view;
         let active_key = chat_widget.active_cell_transcript_key();
         view.sync_history_tail(&self.transcript_cells);
@@ -366,6 +385,9 @@ impl App {
             }
         }
         tui.draw(screen_size.height, |frame| {
+            if let Some(area) = ticket_area {
+                ticket_ui.render(area, frame.buffer);
+            }
             if let Some(paired) = paired.as_mut() {
                 let area = paired.inactive_area;
                 ratatui::widgets::Clear.render(area, frame.buffer);

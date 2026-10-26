@@ -129,9 +129,12 @@ const MCP_RESULT_TELEMETRY_TARGET_ID_MAX_CHARS: usize = 256;
 const MCP_TOOL_CALL_EVENT_RESULT_MAX_BYTES: usize = DEFAULT_OUTPUT_BYTES_CAP;
 const TUI_DYNAMIC_TOOLS_SERVER: &str = "codex_tui";
 const TUI_SEND_MESSAGE_TO_MAIN_TOOL: &str = "send_message_to_main";
+const TUI_APPROVAL_GATED_TICKET_TOOLS: [&str; 2] = ["create_ticket", "update_ticket"];
 
-fn is_tui_send_message_to_main(server: &str, tool_name: &str) -> bool {
-    server == TUI_DYNAMIC_TOOLS_SERVER && tool_name == TUI_SEND_MESSAGE_TO_MAIN_TOOL
+fn is_tui_always_prompt_tool(server: &str, tool_name: &str) -> bool {
+    server == TUI_DYNAMIC_TOOLS_SERVER
+        && (tool_name == TUI_SEND_MESSAGE_TO_MAIN_TOOL
+            || TUI_APPROVAL_GATED_TICKET_TOOLS.contains(&tool_name))
 }
 
 /// Handles the specified tool call and dispatches the appropriate MCP tool-call
@@ -1528,7 +1531,7 @@ async fn maybe_request_mcp_tool_approval(
     let turn_context = &step_context.turn;
     let strict_auto_review = turn_context.strict_auto_review_enabled();
     let requires_explicit_user_approval =
-        is_tui_send_message_to_main(&invocation.server, &invocation.tool);
+        is_tui_always_prompt_tool(&invocation.server, &invocation.tool);
     let approvals_reviewer = connectors::mcp_approvals_reviewer_from_layers(
         &config.config_layer_stack,
         step_context
@@ -1658,8 +1661,7 @@ pub(crate) async fn request_mcp_tool_user_approval(
         unreachable!("only MCP actions can request MCP tool approval");
     };
 
-    if *approval_policy == AskForApproval::Never && !is_tui_send_message_to_main(server, tool_name)
-    {
+    if *approval_policy == AskForApproval::Never && !is_tui_always_prompt_tool(server, tool_name) {
         return ApprovalResolution {
             decision: ReviewDecision::denied(
                 "MCP tool call requires approval, but approval policy is never",

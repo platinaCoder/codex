@@ -639,6 +639,9 @@ pub(crate) enum AppEvent {
         response: DynamicToolCallResponse,
     },
 
+    /// Refresh the canonical ticket strip after an approved bounded mutation.
+    TicketStoreChanged,
+
     /// Register task tools inherited by a dynamically created thread.
     TaskToolsAvailable {
         thread_id: ThreadId,

@@ -560,7 +560,8 @@ pub(crate) fn finalize_tool_router(
 /// workspace, `/tmp`, git config, subprocesses, and device APIs. Only the
 /// locally controlled lab microscope is retained from MCP discovery; arbitrary
 /// third-party `readOnlyHint` annotations are not a zero-mutation boundary. The
-/// one intentional state-changing exception is the paired-MAIN message bridge.
+/// intentional state-changing exceptions are the paired-MAIN message bridge and the two bounded,
+/// approval-gated canonical ticket mutations.
 fn is_strict_read_only_turn(turn_context: &TurnContext) -> bool {
     turn_context.config.strict_read_only_tools
         || matches!(
@@ -578,6 +579,10 @@ fn is_side_codex_tui_tool(name: &str) -> bool {
         "read_workspace_file"
             | "list_workspace_directory"
             | "search_workspace_text"
+            | "list_tickets"
+            | "read_ticket"
+            | "create_ticket"
+            | "update_ticket"
             | "send_message_to_main"
     )
 }

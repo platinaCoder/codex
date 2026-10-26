@@ -281,6 +281,7 @@ mod thread_routing;
 mod thread_session_state;
 mod thread_settings;
 mod thread_title;
+mod tickets;
 mod transcript_export;
 mod tui_mode_picker;
 mod user_turn_submission;
@@ -661,6 +662,8 @@ pub(crate) struct App {
     paired_pane_states: HashMap<ThreadId, PairedPaneState>,
     /// Coalesce background transcript projection work to the terminal frame cadence.
     pending_paired_pane_refreshes: HashSet<ThreadId>,
+    /// Canonical repository ticket index and its dedicated keyboard focus.
+    ticket_ui: tickets::TicketUiState,
     /// AI Lab runtime default: every primary chat owns an independent durable SIDE.
     research_workspace_enabled: bool,
     /// Ephemeral local-model conversation. This state is never written to Codex history.
@@ -1005,6 +1008,12 @@ impl App {
         } else {
             event
         };
+
+        if let TuiEvent::Key(key) = &event
+            && self.handle_ticket_focus_key(tui, *key)
+        {
+            return Ok(AppRunControl::Continue);
+        }
 
         if let TuiEvent::Key(key) = &event
             && self.handle_inference_focus_key(*key)

@@ -920,6 +920,53 @@ async fn dedicated_workspace_tools_read_without_shell_execution() -> color_eyre:
 }
 
 #[test]
+fn ticket_capabilities_are_exact_pathless_and_mcp_only() {
+    let specs = tool_specs();
+    let functions = specs
+        .into_iter()
+        .flat_map(|spec| match spec {
+            DynamicToolSpec::Function(function) => vec![function],
+            DynamicToolSpec::Namespace(namespace) => namespace
+                .tools
+                .into_iter()
+                .map(|tool| match tool {
+                    DynamicToolNamespaceTool::Function(function) => function,
+                })
+                .collect(),
+        })
+        .collect::<Vec<_>>();
+    let ticket_tools = functions
+        .iter()
+        .filter(|function| TICKET_TOOLS.contains(&function.name.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(ticket_tools.len(), 4);
+    for function in ticket_tools {
+        let properties = function.input_schema["properties"]
+            .as_object()
+            .expect("ticket tool properties");
+        assert!(!properties.contains_key("path"));
+        assert!(!properties.contains_key("root"));
+        assert!(!properties.contains_key("cwd"));
+    }
+    let direct_names = side_fallback_tool_specs()
+        .into_iter()
+        .flat_map(|spec| match spec {
+            DynamicToolSpec::Function(function) => vec![function.name],
+            DynamicToolSpec::Namespace(namespace) => namespace
+                .tools
+                .into_iter()
+                .map(|tool| match tool {
+                    DynamicToolNamespaceTool::Function(function) => function.name,
+                })
+                .collect(),
+        })
+        .collect::<Vec<_>>();
+    for name in TICKET_TOOLS {
+        assert!(!direct_names.iter().any(|candidate| candidate == name));
+    }
+}
+
+#[test]
 fn paired_main_bridge_confines_target_to_side_metadata() -> color_eyre::Result<()> {
     std::thread::Builder::new()
         .name("paired-main-bridge-test".to_string())

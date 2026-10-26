@@ -1044,6 +1044,7 @@ See the Codex keymap documentation for supported actions and examples."
             abandoned_side_threads: HashSet::new(),
             paired_pane_states: HashMap::new(),
             pending_paired_pane_refreshes: HashSet::new(),
+            ticket_ui: tickets::TicketUiState::default(),
             research_workspace_enabled: true,
             infer_pane: None,
             active_thread_id: None,

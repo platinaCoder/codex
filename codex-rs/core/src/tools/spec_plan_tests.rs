@@ -1098,7 +1098,7 @@ async fn dynamic_tools_cannot_reclaim_the_reserved_exec_command_name() {
 }
 
 #[tokio::test]
-async fn strict_read_only_surface_keeps_reads_and_main_bridge_but_removes_mutations() {
+async fn strict_side_keeps_reads_main_bridge_and_bounded_ticket_mutations() {
     let plan = probe_with(
         |turn| {
             let mut config = (*turn.config).clone();
@@ -1131,6 +1131,10 @@ async fn strict_read_only_surface_keeps_reads_and_main_bridge_but_removes_mutati
                     "read_workspace_file",
                     /*defer_loading*/ false,
                 ),
+                dynamic_tool(Some("codex_tui"), "list_tickets", false),
+                dynamic_tool(Some("codex_tui"), "read_ticket", false),
+                dynamic_tool(Some("codex_tui"), "create_ticket", false),
+                dynamic_tool(Some("codex_tui"), "update_ticket", false),
                 dynamic_tool(
                     Some("codex_tui"),
                     "create_thread",
@@ -1150,6 +1154,10 @@ async fn strict_read_only_surface_keeps_reads_and_main_bridge_but_removes_mutati
     plan.assert_registered_contains(&[
         &ToolName::namespaced("codex_tui", "send_message_to_main").to_string(),
         &ToolName::namespaced("codex_tui", "read_workspace_file").to_string(),
+        &ToolName::namespaced("codex_tui", "list_tickets").to_string(),
+        &ToolName::namespaced("codex_tui", "read_ticket").to_string(),
+        &ToolName::namespaced("codex_tui", "create_ticket").to_string(),
+        &ToolName::namespaced("codex_tui", "update_ticket").to_string(),
     ]);
     plan.assert_registered_lacks(&[
         "exec_command",
@@ -1216,6 +1224,10 @@ async fn persisted_side_identity_enforces_strict_surface_without_client_override
                     "read_workspace_file",
                     /*defer_loading*/ false,
                 ),
+                dynamic_tool(Some("codex_tui"), "list_tickets", false),
+                dynamic_tool(Some("codex_tui"), "read_ticket", false),
+                dynamic_tool(Some("codex_tui"), "create_ticket", false),
+                dynamic_tool(Some("codex_tui"), "update_ticket", false),
                 dynamic_tool(
                     Some("codex_tui"),
                     "send_message_to_thread",
@@ -1232,6 +1244,10 @@ async fn persisted_side_identity_enforces_strict_surface_without_client_override
         &ToolName::namespaced("microscope", "inspect").to_string(),
         &ToolName::namespaced("codex_tui", "send_message_to_main").to_string(),
         &ToolName::namespaced("codex_tui", "read_workspace_file").to_string(),
+        &ToolName::namespaced("codex_tui", "list_tickets").to_string(),
+        &ToolName::namespaced("codex_tui", "read_ticket").to_string(),
+        &ToolName::namespaced("codex_tui", "create_ticket").to_string(),
+        &ToolName::namespaced("codex_tui", "update_ticket").to_string(),
     ]);
     plan.assert_registered_lacks(&[
         "exec_command",
@@ -1257,6 +1273,8 @@ async fn persisted_side_identity_enforces_strict_surface_without_client_override
     }
     let model_catalog = serde_json::to_string(&plan.visible_specs).expect("tool specs serialize");
     assert!(model_catalog.contains("read_workspace_file"));
+    assert!(model_catalog.contains("create_ticket"));
+    assert!(model_catalog.contains("update_ticket"));
     assert!(model_catalog.contains("microscope"));
     for forbidden in [
         "exec_command",
@@ -1295,6 +1313,10 @@ async fn strict_side_keeps_only_paired_codex_tui_mcp_tools_model_visible() {
                 "list_workspace_directory",
                 "search_workspace_text",
                 "send_message_to_main",
+                "list_tickets",
+                "read_ticket",
+                "create_ticket",
+                "update_ticket",
                 "create_thread",
                 "send_message_to_thread",
                 "set_thread_title",
@@ -1314,6 +1336,10 @@ async fn strict_side_keeps_only_paired_codex_tui_mcp_tools_model_visible() {
         "list_workspace_directory",
         "search_workspace_text",
         "send_message_to_main",
+        "list_tickets",
+        "read_ticket",
+        "create_ticket",
+        "update_ticket",
     ];
     for name in allowed {
         let qualified = ToolName::namespaced("mcp__codex_tui", name).to_string();

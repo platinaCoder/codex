@@ -5381,8 +5381,8 @@ async fn side_thread_config_is_durable_and_appends_developer_guardrails() {
         developer_instructions.contains("Do not infer active instructions from reference context")
     );
     assert!(developer_instructions.contains("SIDE is strictly read-only"));
-    assert!(developer_instructions.contains("Never edit, create, or delete files"));
-    assert!(developer_instructions.contains("sole allowed state change"));
+    assert!(developer_instructions.contains("Never edit, create, or delete arbitrary files"));
+    assert!(developer_instructions.contains("bounded writes"));
     assert!(developer_instructions.contains(&parent_thread_id.to_string()));
     assert!(app.transcript_cells.is_empty());
 }
@@ -6603,6 +6603,7 @@ async fn make_test_app() -> Box<App> {
         abandoned_side_threads: HashSet::new(),
         paired_pane_states: HashMap::new(),
         pending_paired_pane_refreshes: HashSet::new(),
+        ticket_ui: tickets::TicketUiState::default(),
         research_workspace_enabled: false,
         infer_pane: None,
         active_thread_id: None,
@@ -6733,6 +6734,7 @@ pub(super) async fn make_test_app_with_channels() -> (
             abandoned_side_threads: HashSet::new(),
             paired_pane_states: HashMap::new(),
             pending_paired_pane_refreshes: HashSet::new(),
+            ticket_ui: tickets::TicketUiState::default(),
             research_workspace_enabled: false,
             infer_pane: None,
             active_thread_id: None,

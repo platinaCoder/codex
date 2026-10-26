@@ -713,6 +713,13 @@ async fn no_daemon_side_model_tools_and_main_dispatch_are_end_to_end() -> Result
                     ),
                     responses::ev_completed("side-proactive-done-response"),
                 ]
+            } else if tail.contains("side-ticket-create")
+                && tail.contains("custom_tool_call_output")
+            {
+                vec![
+                    responses::ev_assistant_message("side-ticket-done", "SIDE_TICKET_CREATE_OK"),
+                    responses::ev_completed("side-ticket-done-response"),
+                ]
             } else if tail.contains("side-cold-read") && tail.contains("custom_tool_call_output") {
                 vec![
                     responses::ev_assistant_message("side-cold-read-done", "SIDE_COLD_RESUME_OK"),
@@ -729,23 +736,48 @@ const pick = suffix => ALL_TOOLS.find(({ name }) => name.endsWith(`__${suffix}`)
 const readTool = pick("read_workspace_file");
 const listTool = pick("list_workspace_directory");
 const searchTool = pick("search_workspace_text");
+const listTickets = pick("list_tickets");
+const readTicket = pick("read_ticket");
+const createTicket = pick("create_ticket");
+const updateTicket = pick("update_ticket");
 const exposedWrites = ALL_TOOLS.filter(({ name }) =>
   /(?:write|edit|patch|delete|remove|exec_command)/i.test(name)
 ).map(({ name }) => name);
-if (!readTool || !listTool || !searchTool || exposedWrites.length !== 0) {
-  throw new Error(JSON.stringify({ readTool, listTool, searchTool, exposedWrites }));
+if (!readTool || !listTool || !searchTool || !listTickets || !readTicket || !createTicket || !updateTicket || exposedWrites.length !== 0) {
+  throw new Error(JSON.stringify({ readTool, listTool, searchTool, listTickets, readTicket, createTicket, updateTicket, exposedWrites }));
 }
-const [read, list, search] = await Promise.all([
+const [read, list, search, tickets] = await Promise.all([
   tools[readTool.name]({ path: "side-smoke.txt" }),
   tools[listTool.name]({ path: "." }),
   tools[searchTool.name]({ query: "SIDE_MODEL_READ_NEEDLE", path: "." }),
+  tools[listTickets.name]({}),
 ]);
-text(JSON.stringify({ catalogSafe: true, read, list, search }));
+text(JSON.stringify({ catalogSafe: true, read, list, search, tickets }));
 "#;
                 vec![
                     responses::ev_response_created("side-read-response"),
                     responses::ev_custom_tool_call("side-read-suite", "exec", code),
                     responses::ev_completed("side-read-response"),
+                ]
+            } else if tail.contains("CREATE_SIDE_TICKET") {
+                let code = r#"
+const tool = ALL_TOOLS.find(({ name }) => name.endsWith("__create_ticket"));
+if (!tool) throw new Error("create_ticket missing from authenticated SIDE catalog");
+const result = await tools[tool.name]({
+  title: "PTY persistent thought",
+  scope: ["runtime"],
+  proposal: {
+    originalIdea: "Verify the production ticket capability path.",
+    motivation: "Exercise functions.exec through ALL_TOOLS.",
+    acceptanceCriteria: "Canonical files exist after approval."
+  }
+});
+text(JSON.stringify(result));
+"#;
+                vec![
+                    responses::ev_response_created("side-ticket-response"),
+                    responses::ev_custom_tool_call("side-ticket-create", "exec", code),
+                    responses::ev_completed("side-ticket-response"),
                 ]
             } else if tail.contains("Hi! Say Hi to MAIN") {
                 let code = r#"
@@ -831,6 +863,12 @@ text(JSON.stringify({ catalogSafe: true, read }));
         workspace_path.join("side-smoke.txt"),
         "SIDE_MODEL_READ_NEEDLE\n",
     )?;
+    std::fs::create_dir(workspace_path.join("runtime"))?;
+    std::fs::write(
+        workspace_path.join("runtime/codex-upstream.toml"),
+        "url = 'https://example.invalid/codex'\n",
+    )?;
+    std::fs::create_dir(workspace_path.join(".git"))?;
     let home = tempfile::tempdir()?;
     write_test_config(home.path(), &workspace_path)?;
     let model = responses::start_mock_server().await;
@@ -899,6 +937,28 @@ text(JSON.stringify({ catalogSafe: true, read }));
         "{read_output}"
     );
     ensure!(read_output.contains("side-smoke.txt"), "{read_output}");
+
+    submit(&mut terminal, "CREATE_SIDE_TICKET")?;
+    terminal.wait_for_screen("Allow the codex_tui MCP server")?;
+    ensure!(
+        !workspace_path
+            .join(".agents/tickets/1/ticket.toml")
+            .exists(),
+        "ticket mutation bypassed approval"
+    );
+    terminal.write_input(b"\r")?;
+    terminal.wait_for_screen("SIDE_TICKET_CREATE_OK")?;
+    terminal.wait_for_screen("1 active")?;
+    ensure!(
+        workspace_path
+            .join(".agents/tickets/1/ticket.toml")
+            .is_file()
+    );
+    ensure!(
+        workspace_path
+            .join(".agents/tickets/1/proposal.md")
+            .is_file()
+    );
 
     submit(&mut terminal, "Hi! Say Hi to MAIN")?;
     terminal.wait_for_screen("Allow the codex_tui MCP server")?;

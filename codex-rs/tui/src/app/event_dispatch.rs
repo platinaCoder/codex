@@ -349,6 +349,10 @@ impl App {
                 self.repaint_agents_overview();
                 let _ = registered.send(());
             }
+            AppEvent::TicketStoreChanged => {
+                self.refresh_ticket_strip_now();
+                tui.frame_requester().schedule_frame();
+            }
             AppEvent::DynamicToolCallCompleted {
                 request_id,
                 response,

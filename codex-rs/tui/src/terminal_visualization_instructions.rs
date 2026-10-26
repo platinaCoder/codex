@@ -11,19 +11,26 @@ pub(crate) fn with_terminal_visualization_instructions(
     config: &Config,
     control_instructions: Option<String>,
 ) -> Option<String> {
-    if !config
+    let terminal_visualization_enabled = config
         .features
-        .enabled(Feature::TerminalVisualizationInstructions)
-    {
-        return control_instructions;
+        .enabled(Feature::TerminalVisualizationInstructions);
+    let base_instructions = if terminal_visualization_enabled {
+        control_instructions.or_else(|| config.developer_instructions.clone())
+    } else {
+        control_instructions
+    };
+    let mut sections = base_instructions
+        .into_iter()
+        .filter(|section| !section.trim().is_empty())
+        .collect::<Vec<_>>();
+    if terminal_visualization_enabled {
+        sections.push(TERMINAL_VISUALIZATION_INSTRUCTIONS.to_string());
     }
-
-    let existing_instructions =
-        control_instructions.or_else(|| config.developer_instructions.clone());
-    Some(match existing_instructions.as_deref() {
-        Some(existing) if !existing.trim().is_empty() => {
-            format!("{existing}\n\n{TERMINAL_VISUALIZATION_INSTRUCTIONS}")
-        }
-        _ => TERMINAL_VISUALIZATION_INSTRUCTIONS.to_string(),
-    })
+    if let Ok(store) =
+        crate::ticket_store::TicketStore::from_workspace_roots(&config.workspace_roots)
+        && let Ok(index) = store.compact_index()
+    {
+        sections.push(index);
+    }
+    (!sections.is_empty()).then(|| sections.join("\n\n"))
 }

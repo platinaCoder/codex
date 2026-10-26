@@ -102,6 +102,7 @@ pub(crate) async fn make_test_app() -> Box<App> {
         abandoned_side_threads: HashSet::new(),
         paired_pane_states: HashMap::new(),
         pending_paired_pane_refreshes: HashSet::new(),
+        ticket_ui: super::tickets::TicketUiState::default(),
         research_workspace_enabled: false,
         infer_pane: None,
         active_thread_id: None,
