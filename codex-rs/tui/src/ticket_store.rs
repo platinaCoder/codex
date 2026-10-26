@@ -44,8 +44,13 @@ pub(crate) enum Error {
     Stale { expected: u64, current: u64 },
     #[error("invalid ticket: {0}")]
     Invalid(String),
-    #[error("ticket store I/O failed: {0}")]
-    Io(#[from] std::io::Error),
+    #[error("ticket store I/O failed while {operation} `{path}`: {source}")]
+    Io {
+        operation: &'static str,
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("malformed ticket TOML: {0}")]
     Decode(#[from] toml::de::Error),
     #[error("ticket TOML serialization failed: {0}")]
@@ -285,7 +290,11 @@ impl TicketStore {
         if !(1..=1000).contains(&limit) {
             return Err(Error::Invalid("limit must be 1-1000".into()));
         }
-        if !self.root.exists() {
+        if !io_at(
+            self.root.try_exists(),
+            "checking ticket store directory",
+            &self.root,
+        )? {
             return Ok(Vec::new());
         }
         let _lock = Lock::acquire(&self.root)?;
@@ -364,14 +373,23 @@ impl TicketStore {
         };
         let temp = self.root.join(format!(".{id}.tmp-{}", Uuid::new_v4()));
         absent(&temp)?;
-        std::fs::create_dir(&temp)?;
+        io_at(
+            std::fs::create_dir(&temp),
+            "creating ticket staging directory",
+            &temp,
+        )?;
         write_new(
             &temp.join("ticket.toml"),
             &toml::to_string_pretty(&doc.ticket)?,
         )?;
         write_new(&temp.join("proposal.md"), &render(&doc.proposal))?;
         sync_dir(&temp)?;
-        std::fs::rename(&temp, self.dir(id))?;
+        let target = self.dir(id);
+        io_at(
+            std::fs::rename(&temp, &target),
+            "committing ticket staging directory to",
+            &target,
+        )?;
         sync_dir(&self.root)?;
         Ok(doc)
     }
@@ -503,7 +521,11 @@ impl TicketStore {
     }
     fn ensure_root(&self) -> Result<()> {
         no_symlink_ancestors(&self.lab, &self.root)?;
-        std::fs::create_dir_all(&self.root)?;
+        io_at(
+            std::fs::create_dir_all(&self.root),
+            "creating ticket store directory",
+            &self.root,
+        )?;
         reject_symlink(&self.root)?;
         Ok(())
     }
@@ -513,7 +535,7 @@ impl TicketStore {
     /// contents have been flushed.
     fn ensure_identity_locked(&self) -> Result<()> {
         let path = self.root.join("store.toml");
-        if !path.exists() {
+        if !io_at(path.try_exists(), "checking ticket store identity", &path)? {
             let identity = Identity {
                 schema_version: SCHEMA,
                 format_version: FORMAT,
@@ -523,12 +545,18 @@ impl TicketStore {
             };
             match OpenOptions::new().write(true).create_new(true).open(&path) {
                 Ok(mut f) => {
-                    f.write_all(toml::to_string_pretty(&identity)?.as_bytes())?;
-                    f.sync_all()?;
+                    io_at(
+                        f.write_all(toml::to_string_pretty(&identity)?.as_bytes()),
+                        "writing ticket store identity",
+                        &path,
+                    )?;
+                    io_at(f.sync_all(), "syncing ticket store identity", &path)?;
                     sync_dir(&self.root)?;
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(e) => return Err(e.into()),
+                Err(e) => {
+                    return Err(io_error("creating ticket store identity", &path, e));
+                }
             }
         }
         Ok(())
@@ -552,7 +580,13 @@ impl TicketStore {
     fn read_one(&self, id: u64) -> Result<Document> {
         let dir = self.dir(id);
         reject_symlink(&dir)?;
-        if !dir.is_dir() {
+        if !io_at(
+            std::fs::metadata(&dir),
+            "reading ticket directory metadata",
+            &dir,
+        )?
+        .is_dir()
+        {
             return Err(Error::NotFound(id));
         }
         let ticket: Ticket = toml::from_str(&read_regular(&dir.join("ticket.toml"), MAX_META)?)?;
@@ -566,9 +600,17 @@ impl TicketStore {
     fn all(&self) -> Result<Vec<Document>> {
         reject_symlink(&self.root)?;
         let mut ids = Vec::new();
-        for entry in std::fs::read_dir(&self.root)? {
-            let entry = entry?;
-            let kind = entry.file_type()?;
+        for entry in io_at(
+            std::fs::read_dir(&self.root),
+            "reading ticket store directory",
+            &self.root,
+        )? {
+            let entry = io_at(entry, "reading ticket store directory entry", &self.root)?;
+            let kind = io_at(
+                entry.file_type(),
+                "reading ticket store entry type",
+                &entry.path(),
+            )?;
             if kind.is_symlink() {
                 return Err(Error::Unsafe(entry.path().display().to_string()));
             }
@@ -586,20 +628,32 @@ impl TicketStore {
             return Ok(());
         }
         let transactions = self.root.join(".transactions");
-        std::fs::create_dir_all(&transactions)?;
+        io_at(
+            std::fs::create_dir_all(&transactions),
+            "creating ticket transaction directory",
+            &transactions,
+        )?;
         reject_symlink(&transactions)?;
         let transaction_id = Uuid::new_v4();
         let staged = transactions.join(format!(".{transaction_id}.tmp"));
         let committed = transactions.join(transaction_id.to_string());
         absent(&staged)?;
         absent(&committed)?;
-        std::fs::create_dir(&staged)?;
+        io_at(
+            std::fs::create_dir(&staged),
+            "creating staged ticket transaction",
+            &staged,
+        )?;
         let mut ids = Vec::with_capacity(docs.len());
         for doc in docs {
             valid_ticket(&doc.ticket)?;
             valid_proposal(&doc.proposal)?;
             let dir = staged.join(doc.ticket.id.to_string());
-            std::fs::create_dir(&dir)?;
+            io_at(
+                std::fs::create_dir(&dir),
+                "creating staged ticket directory",
+                &dir,
+            )?;
             write_new(
                 &dir.join("ticket.toml"),
                 &toml::to_string_pretty(&doc.ticket)?,
@@ -617,23 +671,47 @@ impl TicketStore {
             })?,
         )?;
         sync_dir(&staged)?;
-        std::fs::rename(&staged, &committed)?;
+        io_at(
+            std::fs::rename(&staged, &committed),
+            "committing staged ticket transaction to",
+            &committed,
+        )?;
         sync_dir(&transactions)?;
         self.apply_transaction(&committed)?;
-        std::fs::remove_dir_all(&committed)?;
+        io_at(
+            std::fs::remove_dir_all(&committed),
+            "removing applied ticket transaction",
+            &committed,
+        )?;
         sync_dir(&transactions)
     }
 
     fn recover_locked(&self) -> Result<()> {
         let transactions = self.root.join(".transactions");
-        if !transactions.exists() {
+        if !io_at(
+            transactions.try_exists(),
+            "checking ticket transaction directory",
+            &transactions,
+        )? {
             return Ok(());
         }
         reject_symlink(&transactions)?;
         let mut committed = Vec::new();
-        for entry in std::fs::read_dir(&transactions)? {
-            let entry = entry?;
-            let kind = entry.file_type()?;
+        for entry in io_at(
+            std::fs::read_dir(&transactions),
+            "reading ticket transaction directory",
+            &transactions,
+        )? {
+            let entry = io_at(
+                entry,
+                "reading ticket transaction directory entry",
+                &transactions,
+            )?;
+            let kind = io_at(
+                entry.file_type(),
+                "reading ticket transaction entry type",
+                &entry.path(),
+            )?;
             if kind.is_symlink() {
                 return Err(Error::Unsafe(entry.path().display().to_string()));
             }
@@ -645,7 +723,11 @@ impl TicketStore {
                 if !kind.is_dir() {
                     return Err(Error::Unsafe(entry.path().display().to_string()));
                 }
-                std::fs::remove_dir_all(entry.path())?;
+                io_at(
+                    std::fs::remove_dir_all(entry.path()),
+                    "removing abandoned ticket transaction",
+                    &entry.path(),
+                )?;
                 continue;
             }
             if !kind.is_dir() || Uuid::parse_str(name).is_err() {
@@ -656,7 +738,11 @@ impl TicketStore {
         committed.sort();
         for transaction in committed {
             self.apply_transaction(&transaction)?;
-            std::fs::remove_dir_all(&transaction)?;
+            io_at(
+                std::fs::remove_dir_all(&transaction),
+                "removing recovered ticket transaction",
+                &transaction,
+            )?;
         }
         sync_dir(&transactions)
     }
@@ -742,12 +828,32 @@ fn primary_checkout(candidate: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 fn repository_binding(lab: &Path) -> Result<String> {
-    let lab = std::fs::canonicalize(lab)?;
+    let lab = io_at(
+        std::fs::canonicalize(lab),
+        "canonicalizing AI Lab root",
+        lab,
+    )?;
     let dotgit = lab.join(".git");
-    let common = if dotgit.is_dir() {
-        std::fs::canonicalize(&dotgit)?
+    let dotgit_metadata = io_at(
+        std::fs::symlink_metadata(&dotgit),
+        "reading repository metadata path",
+        &dotgit,
+    )?;
+    if dotgit_metadata.file_type().is_symlink() {
+        return Err(Error::Unsafe(dotgit.display().to_string()));
+    }
+    let common = if dotgit_metadata.is_dir() {
+        io_at(
+            std::fs::canonicalize(&dotgit),
+            "canonicalizing repository metadata directory",
+            &dotgit,
+        )?
     } else {
-        let pointer = std::fs::read_to_string(&dotgit)?;
+        let pointer = io_at(
+            std::fs::read_to_string(&dotgit),
+            "reading repository metadata pointer",
+            &dotgit,
+        )?;
         let raw = pointer
             .trim()
             .strip_prefix("gitdir:")
@@ -758,14 +864,27 @@ fn repository_binding(lab: &Path) -> Result<String> {
         } else {
             lab.join(raw)
         };
-        let gitdir = std::fs::canonicalize(gitdir)?;
-        let commondir = std::fs::read_to_string(gitdir.join("commondir"))?;
+        let gitdir = io_at(
+            std::fs::canonicalize(&gitdir),
+            "canonicalizing linked checkout metadata directory",
+            &gitdir,
+        )?;
+        let commondir_path = gitdir.join("commondir");
+        let commondir = io_at(
+            std::fs::read_to_string(&commondir_path),
+            "reading linked checkout common directory",
+            &commondir_path,
+        )?;
         let common = if Path::new(commondir.trim()).is_absolute() {
             PathBuf::from(commondir.trim())
         } else {
             gitdir.join(commondir.trim())
         };
-        std::fs::canonicalize(common)?
+        io_at(
+            std::fs::canonicalize(&common),
+            "canonicalizing shared repository metadata directory",
+            &common,
+        )?
     };
     let mut hash = Sha256::new();
     hash.update(b"ai-lab-ticket-repository-v1\0");
@@ -1135,8 +1254,29 @@ fn unique(mut v: Vec<u64>) -> Vec<u64> {
 fn actor(s: &Source) -> String {
     format!("{}:{}", format!("{:?}", s.role).to_lowercase(), s.thread_id)
 }
+fn io_error(operation: &'static str, path: &Path, source: std::io::Error) -> Error {
+    Error::Io {
+        operation,
+        path: path.to_path_buf(),
+        source,
+    }
+}
+fn io_at<T>(
+    result: std::result::Result<T, std::io::Error>,
+    operation: &'static str,
+    path: &Path,
+) -> Result<T> {
+    result.map_err(|source| io_error(operation, path, source))
+}
 fn read_regular(path: &Path, max: u64) -> Result<String> {
-    if std::fs::symlink_metadata(path)?.file_type().is_symlink() {
+    if io_at(
+        std::fs::symlink_metadata(path),
+        "reading metadata for",
+        path,
+    )?
+    .file_type()
+    .is_symlink()
+    {
         return Err(Error::Unsafe(path.display().to_string()));
     }
     let mut options = OpenOptions::new();
@@ -1146,8 +1286,8 @@ fn read_regular(path: &Path, max: u64) -> Result<String> {
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NOFOLLOW);
     }
-    let file = options.open(path)?;
-    let m = file.metadata()?;
+    let file = io_at(options.open(path), "opening ticket store file", path)?;
+    let m = io_at(file.metadata(), "reading open ticket file metadata", path)?;
     if !m.is_file() {
         return Err(Error::Unsafe(path.display().to_string()));
     }
@@ -1155,7 +1295,11 @@ fn read_regular(path: &Path, max: u64) -> Result<String> {
         return Err(Error::Invalid("file too large".into()));
     }
     let mut s = String::new();
-    file.take(max + 1).read_to_string(&mut s)?;
+    io_at(
+        file.take(max + 1).read_to_string(&mut s),
+        "reading ticket store file",
+        path,
+    )?;
     if s.len() as u64 > max {
         return Err(Error::Invalid("file too large".into()));
     }
@@ -1165,11 +1309,18 @@ fn absent(path: &Path) -> Result<()> {
     match std::fs::symlink_metadata(path) {
         Ok(_) => Err(Error::Unsafe(format!("already exists: {}", path.display()))),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e.into()),
+        Err(e) => Err(io_error("checking ticket store path", path, e)),
     }
 }
 fn reject_symlink(path: &Path) -> Result<()> {
-    if std::fs::symlink_metadata(path)?.file_type().is_symlink() {
+    if io_at(
+        std::fs::symlink_metadata(path),
+        "reading metadata for",
+        path,
+    )?
+    .file_type()
+    .is_symlink()
+    {
         Err(Error::Unsafe(path.display().to_string()))
     } else {
         Ok(())
@@ -1183,16 +1334,24 @@ fn no_symlink_ancestors(base: &Path, target: &Path) -> Result<()> {
     reject_symlink(&p)?;
     for c in rel.components() {
         p.push(c);
-        if p.exists() {
+        if io_at(p.try_exists(), "checking ticket store ancestor", &p)? {
             reject_symlink(&p)?;
         }
     }
     Ok(())
 }
 fn write_new(path: &Path, text: &str) -> Result<()> {
-    let mut f = OpenOptions::new().write(true).create_new(true).open(path)?;
-    f.write_all(text.as_bytes())?;
-    f.sync_all()?;
+    let mut f = io_at(
+        OpenOptions::new().write(true).create_new(true).open(path),
+        "creating ticket store file",
+        path,
+    )?;
+    io_at(
+        f.write_all(text.as_bytes()),
+        "writing ticket store file",
+        path,
+    )?;
+    io_at(f.sync_all(), "syncing ticket store file", path)?;
     Ok(())
 }
 fn atomic(path: &Path, text: &str) -> Result<()> {
@@ -1200,12 +1359,16 @@ fn atomic(path: &Path, text: &str) -> Result<()> {
         .parent()
         .ok_or_else(|| Error::Unsafe(path.display().to_string()))?;
     reject_symlink(parent)?;
-    if path.exists() {
+    if io_at(path.try_exists(), "checking ticket store file", path)? {
         reject_symlink(path)?;
     }
     let temp = parent.join(format!(".tmp-{}", Uuid::new_v4()));
     write_new(&temp, text)?;
-    std::fs::rename(temp, path)?;
+    io_at(
+        std::fs::rename(&temp, path),
+        "atomically replacing ticket store file",
+        path,
+    )?;
     sync_dir(parent)
 }
 #[cfg(test)]
@@ -1217,7 +1380,11 @@ fn fail_after_transaction_rename() -> Result<()> {
     TRANSACTION_RENAMES_BEFORE_FAILURE.with(|remaining| match remaining.get() {
         Some(0) => {
             remaining.set(None);
-            Err(std::io::Error::other("injected ticket transaction interruption").into())
+            Err(io_error(
+                "running injected transaction failure",
+                Path::new("<test>"),
+                std::io::Error::other("injected ticket transaction interruption"),
+            ))
         }
         Some(value) => {
             remaining.set(Some(value - 1));
@@ -1235,14 +1402,15 @@ fn fail_transaction_after_renames(successful_renames: usize) {
     TRANSACTION_RENAMES_BEFORE_FAILURE.with(|remaining| remaining.set(Some(successful_renames)));
 }
 fn sync_dir(path: &Path) -> Result<()> {
-    File::open(path)?.sync_all()?;
+    let directory = io_at(File::open(path), "opening ticket store directory", path)?;
+    io_at(directory.sync_all(), "syncing ticket store directory", path)?;
     Ok(())
 }
 struct Lock(File);
 impl Lock {
     fn acquire(root: &Path) -> Result<Self> {
         let p = root.join(".lock");
-        if p.exists() {
+        if io_at(p.try_exists(), "checking ticket store lock", &p)? {
             reject_symlink(&p)?;
         }
         let mut options = OpenOptions::new();
@@ -1252,12 +1420,16 @@ impl Lock {
             use std::os::unix::fs::OpenOptionsExt;
             options.custom_flags(libc::O_NOFOLLOW);
         }
-        let f = options.open(p)?;
+        let f = io_at(options.open(&p), "opening ticket store lock", &p)?;
         #[cfg(unix)]
         {
             use std::os::fd::AsRawFd;
             if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
-                return Err(std::io::Error::last_os_error().into());
+                return Err(io_error(
+                    "locking ticket store lock",
+                    &p,
+                    std::io::Error::last_os_error(),
+                ));
             }
         }
         Ok(Self(f))
@@ -1429,6 +1601,37 @@ mod tests {
         std::fs::remove_file(&p).unwrap();
         symlink("/etc/passwd", p).unwrap();
         assert!(matches!(s.read(1), Err(Error::Unsafe(_))));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn io_errors_report_the_failed_operation_and_exact_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let d = lab();
+        let agents = d.path().join(".agents");
+        std::fs::create_dir(&agents).unwrap();
+        std::fs::set_permissions(&agents, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let expected = agents.join("tickets");
+        let error = match TicketStore::test(d.path()).create(input("permission diagnostic", vec![]))
+        {
+            Ok(_) => panic!("read-only .agents unexpectedly allowed ticket creation"),
+            Err(error) => error,
+        };
+        std::fs::set_permissions(&agents, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        match error {
+            Error::Io {
+                operation,
+                path,
+                source,
+            } => {
+                assert_eq!(operation, "creating ticket store directory");
+                assert_eq!(path, expected);
+                assert_eq!(source.kind(), std::io::ErrorKind::PermissionDenied);
+            }
+            error => panic!("unexpected ticket error: {error}"),
+        }
     }
 
     #[test]

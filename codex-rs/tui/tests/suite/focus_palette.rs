@@ -871,7 +871,24 @@ text(JSON.stringify({ catalogSafe: true, read, list, search, tickets }));
                     responses::ev_completed("side-read-response"),
                 ]
             } else if tail.contains("CREATE_SIDE_TICKET") {
-                let code = r#"
+                let code = if std::env::var_os("AI_LAB_TEST_CANONICAL_WORKSPACE").is_some() {
+                    r#"
+const tool = ALL_TOOLS.find(({ name }) => name.endsWith("__create_ticket"));
+if (!tool) throw new Error("create_ticket missing from authenticated SIDE catalog");
+const result = await tools[tool.name]({
+  title: "Capture real Shift+Enter input before changing newline handling",
+  scope: ["runtime", "tui", "terminal-input"],
+  proposal: {
+    originalIdea: "Record the actual terminal bytes and crossterm KeyEvent produced by Shift+Enter in MAIN and SIDE.",
+    motivation: "Synthetic CSI-u tests prove parser support but do not prove the user's terminal emits a distinguishable modified Enter sequence.",
+    proposedImplementationExperiment: "Capture raw bytes, crossterm events, keyboard-enhancement negotiation, and any tmux translation from the exact staged launch before selecting a code or terminal-configuration fix.",
+    acceptanceCriteria: "The emitted sequence is observed in the user's real terminal path and the chosen fix is validated in both MAIN and SIDE."
+  }
+});
+text(JSON.stringify(result));
+"#
+                } else {
+                    r#"
 const tool = ALL_TOOLS.find(({ name }) => name.endsWith("__create_ticket"));
 if (!tool) throw new Error("create_ticket missing from authenticated SIDE catalog");
 const result = await tools[tool.name]({
@@ -884,7 +901,8 @@ const result = await tools[tool.name]({
   }
 });
 text(JSON.stringify(result));
-"#;
+"#
+                };
                 vec![
                     responses::ev_response_created("side-ticket-response"),
                     responses::ev_custom_tool_call("side-ticket-create", "exec", code),
@@ -968,18 +986,49 @@ text(JSON.stringify({ catalogSafe: true, read }));
         Ok(())
     }
 
+    struct CanonicalMarkerGuard(Option<std::path::PathBuf>);
+    impl Drop for CanonicalMarkerGuard {
+        fn drop(&mut self) {
+            if let Some(path) = self.0.take() {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+
     let workspace = tempfile::tempdir()?;
-    let workspace_path = workspace.path().canonicalize()?;
-    std::fs::write(
-        workspace_path.join("side-smoke.txt"),
-        "SIDE_MODEL_READ_NEEDLE\n",
-    )?;
-    std::fs::create_dir(workspace_path.join("runtime"))?;
-    std::fs::write(
-        workspace_path.join("runtime/codex-upstream.toml"),
-        "url = 'https://example.invalid/codex'\n",
-    )?;
-    std::fs::create_dir(workspace_path.join(".git"))?;
+    let canonical_workspace = std::env::var_os("AI_LAB_TEST_CANONICAL_WORKSPACE");
+    let workspace_path = if let Some(path) = canonical_workspace.as_ref() {
+        std::path::PathBuf::from(path).canonicalize()?
+    } else {
+        workspace.path().canonicalize()?
+    };
+    let marker = workspace_path.join("side-smoke.txt");
+    ensure!(
+        !marker.exists(),
+        "canonical smoke marker already exists: {}",
+        marker.display()
+    );
+    std::fs::write(&marker, "SIDE_MODEL_READ_NEEDLE\n")?;
+    let _canonical_marker_guard =
+        CanonicalMarkerGuard(canonical_workspace.is_some().then_some(marker));
+    if canonical_workspace.is_none() {
+        std::fs::create_dir(workspace_path.join("runtime"))?;
+        std::fs::write(
+            workspace_path.join("runtime/codex-upstream.toml"),
+            "url = 'https://example.invalid/codex'\n",
+        )?;
+        std::fs::create_dir(workspace_path.join(".git"))?;
+    }
+    let ticket_root = workspace_path.join(".agents/tickets");
+    let expected_ticket_id = std::fs::read_dir(&ticket_root)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<u64>().ok())
+        .max()
+        .unwrap_or(0)
+        + 1;
     let home = tempfile::tempdir()?;
     write_test_config(home.path(), &workspace_path)?;
     let model = responses::start_mock_server().await;
@@ -1081,22 +1130,25 @@ text(JSON.stringify({ catalogSafe: true, read }));
     submit(&mut terminal, "CREATE_SIDE_TICKET")?;
     terminal.wait_for_screen("Allow the codex_tui MCP server")?;
     ensure!(
-        !workspace_path
-            .join(".agents/tickets/1/ticket.toml")
+        !ticket_root
+            .join(expected_ticket_id.to_string())
+            .join("ticket.toml")
             .exists(),
         "ticket mutation bypassed approval"
     );
     terminal.write_input(b"\r")?;
     terminal.wait_for_screen("SIDE_TICKET_CREATE_OK")?;
-    terminal.wait_for_screen("1 active")?;
+    terminal.wait_for_screen(&format!("{expected_ticket_id} active"))?;
     ensure!(
-        workspace_path
-            .join(".agents/tickets/1/ticket.toml")
+        ticket_root
+            .join(expected_ticket_id.to_string())
+            .join("ticket.toml")
             .is_file()
     );
     ensure!(
-        workspace_path
-            .join(".agents/tickets/1/proposal.md")
+        ticket_root
+            .join(expected_ticket_id.to_string())
+            .join("proposal.md")
             .is_file()
     );
 
