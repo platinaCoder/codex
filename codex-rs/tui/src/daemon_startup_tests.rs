@@ -336,6 +336,109 @@ async fn daemon_startup_falls_back_only_for_implicit_endpoints() -> color_eyre::
     Ok(())
 }
 
+#[tokio::test]
+async fn local_daemon_policy_epoch_is_required_and_mismatch_falls_back_only_when_implicit()
+-> color_eyre::Result<()> {
+    use codex_app_server_protocol::JSONRPCMessage;
+    use futures::SinkExt;
+    use futures::StreamExt;
+    use serde_json::json;
+    use tokio_tungstenite::tungstenite::Message;
+
+    for (epoch, allow_embedded_fallback) in [
+        (None, true),
+        (Some(0), true),
+        (None, false),
+        (Some(0), false),
+        (Some(codex_app_server_protocol::AI_LAB_POLICY_EPOCH), true),
+        (Some(codex_app_server_protocol::AI_LAB_POLICY_EPOCH), false),
+    ] {
+        let home = TempDir::new()?;
+        let config = ConfigBuilder::default()
+            .codex_home(home.path().to_path_buf())
+            .build()
+            .await?;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = RemoteAppServerEndpoint::WebSocket {
+            websocket_url: format!("ws://{}", listener.local_addr()?),
+            auth_token: None,
+        };
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            while let Some(Ok(Message::Text(text))) = socket.next().await {
+                let JSONRPCMessage::Request(request) = serde_json::from_str(&text).unwrap() else {
+                    continue;
+                };
+                if request.method != "initialize" {
+                    continue;
+                }
+                let mut result = json!({
+                    "userAgent": "codex-test/0.0.0",
+                    "buildCommit": "daemon-policy-test"
+                });
+                if let Some(epoch) = epoch {
+                    result["aiLabPolicyEpoch"] = json!(epoch);
+                }
+                socket
+                    .send(Message::Text(
+                        json!({"id": request.id, "result": result})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+        });
+        let mut target = AppServerTarget::LocalDaemon {
+            endpoint,
+            allow_embedded_fallback,
+        };
+        let mut state_db = None;
+        let result = start_app_server(
+            &mut target,
+            Arg0DispatchPaths::default(),
+            config,
+            Vec::new(),
+            LoaderOverrides::default(),
+            /*strict_config*/ false,
+            CloudConfigBundleLoader::default(),
+            codex_feedback::CodexFeedback::new(),
+            /*log_db*/ None,
+            &mut state_db,
+            Arc::new(EnvironmentManager::default_for_tests()),
+            Default::default(),
+        )
+        .await;
+
+        let compatible = epoch == Some(codex_app_server_protocol::AI_LAB_POLICY_EPOCH);
+        if compatible {
+            let app_server = result?;
+            assert!(matches!(app_server, AppServerClient::Remote(_)));
+            assert!(matches!(target, AppServerTarget::LocalDaemon { .. }));
+            app_server.shutdown().await?;
+        } else if allow_embedded_fallback {
+            let app_server = result?;
+            assert!(matches!(app_server, AppServerClient::InProcess(_)));
+            assert_eq!(target, AppServerTarget::Embedded);
+            app_server.shutdown().await?;
+        } else {
+            let message = match result {
+                Ok(app_server) => {
+                    app_server.shutdown().await?;
+                    panic!("incompatible required daemon must fail");
+                }
+                Err(error) => error.to_string(),
+            };
+            assert!(message.contains("local daemon policy epoch"), "{message}");
+            assert!(message.contains("use --no-daemon"), "{message}");
+            assert!(matches!(target, AppServerTarget::LocalDaemon { .. }));
+        }
+        server.await?;
+    }
+    Ok(())
+}
+
 #[test]
 fn daemon_eligibility_preserves_launch_options_and_explains_exclusions() {
     use clap::Parser;

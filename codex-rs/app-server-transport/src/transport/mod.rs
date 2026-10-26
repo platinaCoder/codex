@@ -383,6 +383,8 @@ mod tests {
             result: Box::new(ClientResponsePayload::Initialize(
                 codex_app_server_protocol::InitializeResponse {
                     user_agent: "codex-test-agent".to_string(),
+                    build_commit: None,
+                    ai_lab_policy_epoch: None,
                     codex_home,
                     platform_family: "unix".to_string(),
                     platform_os: "linux".to_string(),

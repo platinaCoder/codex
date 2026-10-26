@@ -1038,6 +1038,8 @@ mod tests {
             websocket,
             serde_json::json!({
                 "userAgent": "codex_cli_rs/9.8.7-test (Test OS; x86_64) rust",
+                "buildCommit": "0123456789abcdef0123456789abcdef01234567",
+                "aiLabPolicyEpoch": codex_app_server_protocol::AI_LAB_POLICY_EPOCH,
                 "codexHome": "/server/.codex",
             }),
         )
@@ -1481,6 +1483,14 @@ mod tests {
             .expect("remote client should connect");
 
         assert_eq!(client.server_version(), Some("9.8.7-test"));
+        assert_eq!(
+            client.build_commit(),
+            Some("0123456789abcdef0123456789abcdef01234567")
+        );
+        assert_eq!(
+            client.ai_lab_policy_epoch(),
+            Some(codex_app_server_protocol::AI_LAB_POLICY_EPOCH)
+        );
         assert_eq!(client.codex_home(), Some("/server/.codex"));
         let client = AppServerClient::Remote(client);
         let response: GetAccountResponse = client

@@ -212,6 +212,12 @@ impl InitializeRequestProcessor {
         let user_agent = get_codex_user_agent();
         let response = InitializeResponse {
             user_agent,
+            build_commit: Some(
+                codex_build_info::BuildInfo::get()
+                    .build_commit()
+                    .to_string(),
+            ),
+            ai_lab_policy_epoch: Some(codex_app_server_protocol::AI_LAB_POLICY_EPOCH),
             codex_home,
             platform_family: std::env::consts::FAMILY.to_string(),
             platform_os: std::env::consts::OS.to_string(),

@@ -996,10 +996,10 @@ fn ticket_capabilities_are_exact_pathless_and_mcp_only() {
                 .collect(),
         })
         .collect::<Vec<_>>();
-    for name in ["list_tickets", "read_ticket"] {
+    for name in TICKET_TOOLS {
         assert!(direct_names.iter().any(|candidate| candidate == name));
     }
-    for name in TICKET_MUTATION_TOOLS {
+    for name in DELEGATION_TOOLS {
         assert!(!direct_names.iter().any(|candidate| candidate == name));
     }
 }
@@ -1293,6 +1293,12 @@ async fn paired_main_bridge_confines_target_scenario() -> color_eyre::Result<()>
             .iter()
             .any(|name| name == "read_workspace_file")
     );
+    for ticket_tool in TICKET_TOOLS {
+        assert!(
+            side_tool_names.iter().any(|name| name == ticket_tool),
+            "SIDE fallback must retain {ticket_tool}"
+        );
+    }
     for forbidden in [
         "create_thread",
         "send_message_to_thread",

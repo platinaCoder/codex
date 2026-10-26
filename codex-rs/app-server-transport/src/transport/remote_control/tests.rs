@@ -1891,6 +1891,8 @@ async fn remote_control_http_mode_enrolls_before_connecting() {
                     codex_app_server_protocol::ClientResponsePayload::Initialize(
                         codex_app_server_protocol::InitializeResponse {
                             user_agent: "codex-test-agent".to_string(),
+                            build_commit: None,
+                            ai_lab_policy_epoch: None,
                             codex_home: codex_home.path().abs(),
                             platform_family: "test-family".to_string(),
                             platform_os: "test-os".to_string(),

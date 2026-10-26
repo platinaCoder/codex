@@ -487,33 +487,29 @@ pub(crate) fn tool_specs() -> Vec<DynamicToolSpec> {
 }
 
 pub(crate) fn non_delegation_tool_specs() -> Vec<DynamicToolSpec> {
-    tool_specs_without_delegation_except(/*retained_delegation*/ None)
+    filtered_tool_specs(|name| {
+        !DELEGATION_TOOLS.contains(&name) && !TICKET_MUTATION_TOOLS.contains(&name)
+    })
 }
 
 /// External direct-dynamic transports have no MCP approval layer. Keep their
-/// SIDE fallback observational; embedded sessions require the authenticated
-/// loopback MCP instead of advertising direct tools that they cannot execute.
-/// The explicit `/main` UI path calls the paired bridge internally.
+/// SIDE fallback confined to read-only inspection and the typed ticket store.
+/// Ticket handlers and the store independently verify durable SIDE identity;
+/// arbitrary delegation and filesystem mutation remain unavailable.
 pub(crate) fn side_fallback_tool_specs() -> Vec<DynamicToolSpec> {
-    non_delegation_tool_specs()
+    filtered_tool_specs(|name| !DELEGATION_TOOLS.contains(&name))
 }
 
-fn tool_specs_without_delegation_except(retained_delegation: Option<&str>) -> Vec<DynamicToolSpec> {
+fn filtered_tool_specs(mut retain: impl FnMut(&str) -> bool) -> Vec<DynamicToolSpec> {
     tool_specs()
         .into_iter()
         .filter_map(|spec| match spec {
-            DynamicToolSpec::Function(function) => (!DELEGATION_TOOLS
-                .contains(&function.name.as_str())
-                && !TICKET_MUTATION_TOOLS.contains(&function.name.as_str())
-                || retained_delegation == Some(function.name.as_str()))
-            .then_some(DynamicToolSpec::Function(function)),
+            DynamicToolSpec::Function(function) => {
+                retain(&function.name).then_some(DynamicToolSpec::Function(function))
+            }
             DynamicToolSpec::Namespace(mut namespace) => {
                 namespace.tools.retain(|tool| match tool {
-                    DynamicToolNamespaceTool::Function(function) => {
-                        !DELEGATION_TOOLS.contains(&function.name.as_str())
-                            && !TICKET_MUTATION_TOOLS.contains(&function.name.as_str())
-                            || retained_delegation == Some(function.name.as_str())
-                    }
+                    DynamicToolNamespaceTool::Function(function) => retain(&function.name),
                 });
                 Some(DynamicToolSpec::Namespace(namespace))
             }

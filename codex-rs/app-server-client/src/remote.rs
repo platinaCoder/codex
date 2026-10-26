@@ -153,6 +153,8 @@ enum RemoteClientCommand {
 #[derive(Default)]
 struct RemoteServerMetadata {
     server_version: Option<String>,
+    build_commit: Option<String>,
+    ai_lab_policy_epoch: Option<u32>,
     codex_home: Option<String>,
     platform_family: Option<String>,
     platform_os: Option<String>,
@@ -222,6 +224,14 @@ impl RemoteAppServerClient {
 
     pub fn server_version(&self) -> Option<&str> {
         self.metadata.server_version.as_deref()
+    }
+
+    pub fn build_commit(&self) -> Option<&str> {
+        self.metadata.build_commit.as_deref()
+    }
+
+    pub fn ai_lab_policy_epoch(&self) -> Option<u32> {
+        self.metadata.ai_lab_policy_epoch
     }
 
     pub fn codex_home(&self) -> Option<&str> {
@@ -881,6 +891,16 @@ where
                                     let (_, rest) = user_agent.split_once('/')?;
                                     rest.split_whitespace().next().map(str::to_string)
                                 });
+                            metadata.build_commit = response
+                                .result
+                                .get("buildCommit")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_string);
+                            metadata.ai_lab_policy_epoch = response
+                                .result
+                                .get("aiLabPolicyEpoch")
+                                .and_then(serde_json::Value::as_u64)
+                                .and_then(|value| u32::try_from(value).ok());
                             metadata.codex_home = response
                                 .result
                                 .get("codexHome")

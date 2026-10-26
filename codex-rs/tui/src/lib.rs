@@ -592,7 +592,55 @@ async fn start_app_server(
     };
     if let Some(connection) = connection {
         match connection {
-            Ok(app_server) => return Ok(app_server),
+            Ok(app_server) => {
+                let local_daemon = matches!(target, AppServerTarget::LocalDaemon { .. });
+                let allow_embedded_fallback = matches!(
+                    target,
+                    AppServerTarget::LocalDaemon {
+                        allow_embedded_fallback: true,
+                        ..
+                    }
+                );
+                let (server_version, build_commit, policy_epoch) = match &app_server {
+                    AppServerClient::Remote(client) => (
+                        client.server_version().map(str::to_owned),
+                        client.build_commit().map(str::to_owned),
+                        client.ai_lab_policy_epoch(),
+                    ),
+                    _ => (None, None, None),
+                };
+                tracing::info!(
+                    server_version = server_version.as_deref().unwrap_or("unknown"),
+                    build_commit = build_commit.as_deref().unwrap_or("unknown"),
+                    policy_epoch = ?policy_epoch,
+                    local_daemon,
+                    "connected app-server backend"
+                );
+                if local_daemon
+                    && policy_epoch != Some(codex_app_server_protocol::AI_LAB_POLICY_EPOCH)
+                {
+                    let incompatibility = format!(
+                        "local daemon policy epoch is {} (build {}, version {}), but this TUI requires {}",
+                        policy_epoch
+                            .map_or_else(|| "missing".to_string(), |value| value.to_string()),
+                        build_commit.as_deref().unwrap_or("unknown"),
+                        server_version.as_deref().unwrap_or("unknown"),
+                        codex_app_server_protocol::AI_LAB_POLICY_EPOCH,
+                    );
+                    let _ = app_server.shutdown().await;
+                    if allow_embedded_fallback {
+                        tracing::warn!(%incompatibility, "incompatible implicit local daemon; starting embedded app server");
+                        *target = AppServerTarget::Embedded;
+                        *state_db = init_state_db_for_app_server_target(&config, target).await?;
+                    } else {
+                        return Err(color_eyre::eyre::eyre!(
+                            "{incompatibility}; use --no-daemon or promote a matching runtime"
+                        ));
+                    }
+                } else {
+                    return Ok(app_server);
+                }
+            }
             Err(err)
                 if matches!(
                     target,

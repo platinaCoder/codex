@@ -22,6 +22,20 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 30);
 const FOCUS_INPUT_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 5);
 const FOCUS_PROBE_INPUT: &str = "focus-palette-24527";
 
+struct StagedDaemonGuard {
+    codex: std::path::PathBuf,
+    codex_home: std::path::PathBuf,
+}
+
+impl Drop for StagedDaemonGuard {
+    fn drop(&mut self) {
+        let _ = Command::new(&self.codex)
+            .args(["app-server", "daemon", "stop"])
+            .env("CODEX_HOME", &self.codex_home)
+            .output();
+    }
+}
+
 #[path = "external_editor_tests.rs"]
 mod external_editor;
 #[path = "gov_cloud_guidance_tests.rs"]
@@ -803,10 +817,29 @@ async fn no_daemon_side_model_tools_and_main_dispatch_are_end_to_end() -> Result
                     responses::ev_assistant_message("side-cold-read-done", "SIDE_COLD_RESUME_OK"),
                     responses::ev_completed("side-cold-read-done-response"),
                 ]
-            } else if tail.contains("Seed MAIN before SIDE smoke") {
+            } else if tail.contains("main-catalog-check")
+                && tail.contains("custom_tool_call_output")
+            {
                 vec![
                     responses::ev_assistant_message("main-seeded", "MAIN_SEEDED"),
                     responses::ev_completed("main-seeded-response"),
+                ]
+            } else if tail.contains("Seed MAIN before SIDE smoke") {
+                let code = r#"
+const pick = suffix => ALL_TOOLS.find(({ name }) => name.endsWith(`__${suffix}`));
+const listTickets = pick("list_tickets");
+const readTicket = pick("read_ticket");
+const createTicket = pick("create_ticket");
+const updateTicket = pick("update_ticket");
+if (!listTickets || !readTicket || createTicket || updateTicket) {
+  throw new Error(JSON.stringify({ listTickets, readTicket, createTicket, updateTicket }));
+}
+text(JSON.stringify({ mainCatalogSafe: true }));
+"#;
+                vec![
+                    responses::ev_response_created("main-catalog-response"),
+                    responses::ev_custom_tool_call("main-catalog-check", "exec", code),
+                    responses::ev_completed("main-catalog-response"),
                 ]
             } else if tail.contains("READ_SIDE_MARKER") {
                 let code = r#"
@@ -969,20 +1002,49 @@ text(JSON.stringify({ catalogSafe: true, read }));
         .mount(&model)
         .await;
 
-    let codex = if let Some(candidate) = std::env::var_os("AI_LAB_CODEX_STAGED") {
+    let staged_candidate = std::env::var_os("AI_LAB_CODEX_STAGED");
+    let codex = if let Some(candidate) = staged_candidate.as_ref() {
         std::path::PathBuf::from(candidate)
     } else {
         codex_utils_cargo_bin::cargo_bin("codex")?
+    };
+    let use_same_version_daemon = std::env::var_os("AI_LAB_TEST_SAME_VERSION_DAEMON").is_some();
+    ensure!(
+        !use_same_version_daemon || staged_candidate.is_some(),
+        "same-version daemon smoke requires AI_LAB_CODEX_STAGED"
+    );
+    let _daemon_guard = if use_same_version_daemon {
+        let started = Command::new(&codex)
+            .args(["app-server", "daemon", "start"])
+            .env("CODEX_HOME", home.path())
+            .output()
+            .context("start isolated staged daemon")?;
+        ensure!(
+            started.status.success(),
+            "isolated daemon start failed: {}",
+            String::from_utf8_lossy(&started.stderr)
+        );
+        Some(StagedDaemonGuard {
+            codex: codex.clone(),
+            codex_home: home.path().to_path_buf(),
+        })
+    } else {
+        None
+    };
+    let initial_args = if use_same_version_daemon {
+        vec!["--no-alt-screen", "Seed MAIN before SIDE smoke."]
+    } else {
+        vec![
+            "--no-daemon",
+            "--no-alt-screen",
+            "Seed MAIN before SIDE smoke.",
+        ]
     };
     let mut terminal = PtyCodex::start_binary(
         &codex,
         &workspace_path,
         home,
-        &[
-            "--no-daemon",
-            "--no-alt-screen",
-            "Seed MAIN before SIDE smoke.",
-        ],
+        &initial_args,
         /*editor*/ None,
     )?;
     terminal.wait_for_startup()?;
@@ -1060,11 +1122,12 @@ text(JSON.stringify({ catalogSafe: true, read }));
         .and_then(|pairs| pairs.keys().next())
         .context("missing persisted MAIN/SIDE pair")?
         .clone();
-    terminal.restart_binary(
-        &codex,
-        &workspace_path,
-        &["resume", &main_thread_id, "--no-daemon", "--no-alt-screen"],
-    )?;
+    let resume_args = if use_same_version_daemon {
+        vec!["resume", &main_thread_id, "--no-alt-screen"]
+    } else {
+        vec!["resume", &main_thread_id, "--no-daemon", "--no-alt-screen"]
+    };
+    terminal.restart_binary(&codex, &workspace_path, &resume_args)?;
     terminal.wait_for_startup()?;
     terminal.wait_for_screen("MAIN_SLASH_DISPATCH_OK")?;
     terminal.wait_for_screen("SIDE_PROACTIVE_SEND_OK")?;

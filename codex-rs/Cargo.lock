@@ -2073,6 +2073,7 @@ dependencies = [
  "codex-arg0",
  "codex-aws-auth",
  "codex-backend-client",
+ "codex-build-info",
  "codex-chatgpt",
  "codex-cloud-config",
  "codex-code-mode",

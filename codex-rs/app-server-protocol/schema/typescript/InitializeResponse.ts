@@ -5,6 +5,15 @@ import type { AbsolutePathBuf } from "./AbsolutePathBuf";
 
 export type InitializeResponse = { userAgent: string,
 /**
+ * Commit stamped into the app-server executable. Older servers omit it.
+ */
+buildCommit?: string | null,
+/**
+ * Compatibility epoch for AI Lab role and tool-ownership policy. A local TUI must not reuse
+ * a daemon with a different or missing epoch.
+ */
+aiLabPolicyEpoch?: number | null,
+/**
  * Absolute path to the server's $CODEX_HOME directory.
  */
 codexHome: AbsolutePathBuf,

@@ -7,6 +7,22 @@
     }
   },
   "properties": {
+    "aiLabPolicyEpoch": {
+      "description": "Compatibility epoch for AI Lab role and tool-ownership policy. A local TUI must not reuse a daemon with a different or missing epoch.",
+      "format": "uint32",
+      "minimum": 0.0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "buildCommit": {
+      "description": "Commit stamped into the app-server executable. Older servers omit it.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "codexHome": {
       "allOf": [
         {

@@ -1264,12 +1264,9 @@ async fn external_transport_registers_dynamic_tools_and_finds_task_mentions() ->
     let side_tools = side_start["dynamicTools"][0]["tools"]
         .as_array()
         .expect("SIDE dynamic tool namespace");
-    assert_eq!(side_tools.len(), 11);
-    for read in ["list_tickets", "read_ticket"] {
-        assert!(side_tools.iter().any(|tool| tool["name"] == read));
-    }
-    for mutation in ["create_ticket", "update_ticket"] {
-        assert!(!side_tools.iter().any(|tool| tool["name"] == mutation));
+    assert_eq!(side_tools.len(), 13);
+    for ticket_tool in crate::dynamic_tools::TICKET_TOOLS {
+        assert!(side_tools.iter().any(|tool| tool["name"] == ticket_tool));
     }
     for forbidden in crate::dynamic_tools::DELEGATION_TOOLS {
         assert!(!side_tools.iter().any(|tool| tool["name"] == forbidden));

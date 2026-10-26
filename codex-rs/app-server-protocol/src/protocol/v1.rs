@@ -73,6 +73,15 @@ pub struct InitializeCapabilities {
 #[serde(rename_all = "camelCase")]
 pub struct InitializeResponse {
     pub user_agent: String,
+    /// Commit stamped into the app-server executable. Older servers omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional = nullable)]
+    pub build_commit: Option<String>,
+    /// Compatibility epoch for AI Lab role and tool-ownership policy. A local TUI must not reuse
+    /// a daemon with a different or missing epoch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional = nullable)]
+    pub ai_lab_policy_epoch: Option<u32>,
     /// Absolute path to the server's $CODEX_HOME directory.
     pub codex_home: AbsolutePathBuf,
     /// Platform family for the running app-server target, for example
@@ -82,6 +91,8 @@ pub struct InitializeResponse {
     /// `"macos"`, `"linux"`, or `"windows"`.
     pub platform_os: String,
 }
+
+pub const AI_LAB_POLICY_EPOCH: u32 = 1;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(untagged)]
