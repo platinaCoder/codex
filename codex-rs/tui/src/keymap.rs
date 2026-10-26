@@ -1719,6 +1719,7 @@ impl RuntimeKeymap {
             },
             editor: Arc::new(EditorKeymap {
                 insert_newline: default_bindings![
+                    ctrl(KeyCode::Char('n')),
                     ctrl(KeyCode::Char('j')),
                     ctrl(KeyCode::Char('m')),
                     plain(KeyCode::Enter),
@@ -1728,7 +1729,7 @@ impl RuntimeKeymap {
                 move_left: default_bindings![plain(KeyCode::Left), ctrl(KeyCode::Char('b'))],
                 move_right: default_bindings![plain(KeyCode::Right), ctrl(KeyCode::Char('f'))],
                 move_up: default_bindings![plain(KeyCode::Up), ctrl(KeyCode::Char('p'))],
-                move_down: default_bindings![plain(KeyCode::Down), ctrl(KeyCode::Char('n'))],
+                move_down: default_bindings![plain(KeyCode::Down)],
                 move_word_left: default_bindings![
                     alt(KeyCode::Char('b')),
                     raw(KeyBinding::new(KeyCode::Left, KeyModifiers::ALT)),
@@ -4026,12 +4027,17 @@ mod tests {
         assert_eq!(
             runtime.editor.insert_newline,
             vec![
+                key_hint::ctrl(KeyCode::Char('n')),
                 key_hint::ctrl(KeyCode::Char('j')),
                 key_hint::ctrl(KeyCode::Char('m')),
                 key_hint::plain(KeyCode::Enter),
                 key_hint::shift(KeyCode::Enter),
                 key_hint::alt(KeyCode::Enter),
             ]
+        );
+        assert_eq!(
+            runtime.editor.move_down,
+            vec![key_hint::plain(KeyCode::Down)]
         );
     }
 

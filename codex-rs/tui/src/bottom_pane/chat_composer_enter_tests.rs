@@ -10,8 +10,11 @@ use pretty_assertions::assert_eq;
 
 use super::InputResult;
 use super::PasteBurst;
+use super::footer_insert_newline_key;
 use super::tests::new_test_composer;
 use super::tests::snapshot_composer_state_with_width;
+use crate::key_hint;
+use crate::keymap::RuntimeKeymap;
 
 #[test]
 fn enter_expires_paste_state_without_a_ui_tick() {
@@ -107,4 +110,27 @@ fn shift_enter_inserts_newline_while_plain_enter_submits() {
             true,
         )
     );
+}
+
+#[test]
+fn ctrl_n_is_the_newline_hint_with_or_without_enhanced_keys() {
+    let keymap = RuntimeKeymap::defaults();
+    for enhanced_keys_supported in [false, true] {
+        assert_eq!(
+            footer_insert_newline_key(&keymap.editor.insert_newline, enhanced_keys_supported),
+            Some(key_hint::ctrl(KeyCode::Char('n')))
+        );
+    }
+}
+
+#[test]
+fn legacy_c0_ctrl_n_inserts_one_newline_without_entering_paste_detection() {
+    let (mut composer, _rx) = new_test_composer();
+    composer.handle_key_event(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+    composer.handle_key_event(KeyEvent::new(KeyCode::Char('\u{000e}'), KeyModifiers::NONE));
+    composer.handle_key_event(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
+    composer.handle_key_event(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+
+    assert_eq!(composer.current_text(), "a\nb");
+    assert!(!composer.is_in_paste_burst());
 }

@@ -11,11 +11,11 @@ expression: "render_picker(params, 120)"
 
   Type to search shortcuts
 
-› Editor         Insert Newline           ctrl-j, ctrl-m, enter, shift-enter, alt-enter
+› Editor         Insert Newline           ctrl-n, ctrl-j, ctrl-m, enter, shift-enter, alt-enter
   Editor         Move Left                left, ctrl-b
   Editor         Move Right               right, ctrl-f
   Editor         Move Up                  up, ctrl-p
-  Editor         Move Down                down, ctrl-n
+  Editor         Move Down                down
   Editor         Move Word Left           alt-b, alt-left, ctrl-left
   Editor         Move Word Right          alt-f, alt-right, ctrl-right
   Editor         Move Line Start          home, ctrl-a, super-left

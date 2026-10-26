@@ -2935,6 +2935,35 @@ mod tests {
     }
 
     #[test]
+    fn c0_ctrl_n_keeps_contextual_list_navigation() {
+        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
+        let tx = AppEventSender::new(tx_raw);
+        let mut view = ListSelectionView::new(
+            SelectionViewParams {
+                items: vec![
+                    SelectionItem {
+                        name: "First".to_string(),
+                        ..Default::default()
+                    },
+                    SelectionItem {
+                        name: "Second".to_string(),
+                        ..Default::default()
+                    },
+                ],
+                is_searchable: true,
+                ..Default::default()
+            },
+            tx,
+            crate::keymap::RuntimeKeymap::defaults().list,
+        );
+
+        view.handle_key_event(KeyEvent::new(KeyCode::Char('\u{000e}'), KeyModifiers::NONE));
+
+        assert_eq!(view.selected_actual_idx(), Some(1));
+        assert_eq!(view.search_query, "");
+    }
+
+    #[test]
     fn c0_ctrl_p_respects_remapped_list_move_down() {
         let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
         let tx = AppEventSender::new(tx_raw);

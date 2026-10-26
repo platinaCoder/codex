@@ -133,7 +133,7 @@ impl FooterKeyHints {
             agents: None,
             toggle_shortcuts: Some(key_hint::plain(KeyCode::Char('?')).into()),
             queue: Some(key_hint::plain(KeyCode::Tab).into()),
-            insert_newline: Some(key_hint::ctrl(KeyCode::Char('j')).into()),
+            insert_newline: Some(key_hint::ctrl(KeyCode::Char('n')).into()),
             external_editor: Some(key_hint::ctrl(KeyCode::Char('g')).into()),
             edit_previous: Some(key_hint::plain(KeyCode::Esc).into()),
             show_transcript: Some(key_hint::ctrl(KeyCode::Char('t')).into()),

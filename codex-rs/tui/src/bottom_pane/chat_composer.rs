@@ -3653,7 +3653,10 @@ impl ChatComposer {
         let has_non_text_modifier = has_ctrl_or_alt(input.modifiers)
             || input
                 .modifiers
-                .intersects(KeyModifiers::SUPER | KeyModifiers::HYPER | KeyModifiers::META);
+                .intersects(KeyModifiers::SUPER | KeyModifiers::HYPER | KeyModifiers::META)
+            // Legacy terminals report Ctrl+letter as a raw C0 character with no modifier.
+            // Those bytes are shortcuts, not paste text; pass them through to the keymap.
+            || matches!(input.code, KeyCode::Char(ch) if ch.is_ascii_control());
 
         // Intercept text-producing Char inputs to optionally accumulate into a burst buffer.
         //
@@ -4373,6 +4376,11 @@ fn footer_insert_newline_key(
     enhanced_keys_supported: bool,
 ) -> Option<KeyBinding> {
     let bindings = user_bindings(bindings);
+    let ctrl_n = key_hint::ctrl(KeyCode::Char('n'));
+    if bindings.contains(&ctrl_n) {
+        return Some(ctrl_n);
+    }
+
     let shift_enter = key_hint::shift(KeyCode::Enter);
     if enhanced_keys_supported && bindings.contains(&shift_enter) {
         return Some(shift_enter);

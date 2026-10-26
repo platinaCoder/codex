@@ -16,7 +16,7 @@ expression: text
   /        Commands
   @        Mention files
   !        Shell command
-  ⌃j       New line
+  ⌃n       New line
   ⌃v       Paste image
   ⌃g       External editor
   ⌃r       Search history

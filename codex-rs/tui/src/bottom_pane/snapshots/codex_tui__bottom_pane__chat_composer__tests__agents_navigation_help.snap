@@ -8,7 +8,7 @@ expression: terminal.backend()
 "  /        Commands             tab      Send message                           "
 "  @        Mention files        ⌥,       Less reasoning                         "
 "  !        Shell command        ⌥.       More reasoning                         "
-"  ⌃j       New line             ←        Agents (empty prompt)                  "
+"  ⌃n       New line             ←        Agents (empty prompt)                  "
 "  ⌃v       Paste image          ⌥← / ⌥→  Subagents (empty prompt)               "
 "  ⌃g       External editor      f4       Inspect activity                       "
 "  ⌃r       Search history       ⌃c       Quit                                   "

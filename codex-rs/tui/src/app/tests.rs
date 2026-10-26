@@ -6058,7 +6058,7 @@ async fn side_pair_remains_linked_when_focus_returns_to_main() {
 }
 
 #[tokio::test]
-async fn paired_main_and_side_shift_enter_preserves_multiline_drafts_and_plain_enter_submits()
+async fn paired_main_and_side_legacy_ctrl_n_preserves_multiline_drafts_and_plain_enter_submits()
 -> Result<()> {
     let (mut app, mut app_events, mut ops) = make_test_app_with_channels().await;
     let mut app_server = crate::start_embedded_app_server_for_picker(&app.config).await?;
@@ -6078,7 +6078,7 @@ async fn paired_main_and_side_shift_enter_preserves_multiline_drafts_and_plain_e
     app.side_threads
         .insert(side_thread_id, SideThreadState::new(main_thread_id));
     app.research_workspace_enabled = true;
-    app.enhanced_keys_supported = true;
+    app.enhanced_keys_supported = false;
     let mut tui = crate::tui::test_support::make_test_tui()?;
     while app_events.try_recv().is_ok() {}
     while ops.try_recv().is_ok() {}
@@ -6088,7 +6088,8 @@ async fn paired_main_and_side_shift_enter_preserves_multiline_drafts_and_plain_e
     app.handle_tui_event(
         &mut tui,
         &mut app_server,
-        TuiEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
+        // Legacy terminals encode Ctrl+N as the raw C0 byte 0x0e.
+        TuiEvent::Key(KeyEvent::new(KeyCode::Char('\u{000e}'), KeyModifiers::NONE)),
     )
     .await?;
     app.handle_tui_event(&mut tui, &mut app_server, TuiEvent::Paste("main-b".into()))
@@ -6123,7 +6124,7 @@ async fn paired_main_and_side_shift_enter_preserves_multiline_drafts_and_plain_e
     app.handle_tui_event(
         &mut tui,
         &mut app_server,
-        TuiEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
+        TuiEvent::Key(KeyEvent::new(KeyCode::Char('\u{000e}'), KeyModifiers::NONE)),
     )
     .await?;
     app.handle_tui_event(&mut tui, &mut app_server, TuiEvent::Paste("side-b".into()))

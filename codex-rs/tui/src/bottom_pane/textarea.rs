@@ -3456,6 +3456,19 @@ mod tests {
     }
 
     #[test]
+    fn c0_ctrl_n_inserts_newline_while_down_arrow_still_moves_cursor() {
+        let mut t = ta_with("ab\ncd");
+        t.set_cursor(/*pos*/ 1);
+
+        t.input(KeyEvent::new(KeyCode::Char('\u{000e}'), KeyModifiers::NONE));
+        assert_eq!(t.text(), "a\nb\ncd");
+        assert_eq!(t.cursor(), 2);
+
+        t.input(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(t.cursor(), 4);
+    }
+
+    #[test]
     fn c0_control_chars_respect_unbound_editor_movement() {
         let mut t = ta_with("a\nb");
         t.set_cursor(/*pos*/ 2);

@@ -15,7 +15,7 @@ shortcut help:
   /        Commands             tab      Send message
   @        Mention files        ⌥,       Less reasoning
   !        Shell command        ⌥.       More reasoning
-  ⌃j       New line             ⌥← / ⌥→  Subagents (empty prompt)
+  ⌃n       New line             ⌥← / ⌥→  Subagents (empty prompt)
   ⌃v       Paste image          f4       Inspect activity
   ⌃g       External editor      ⌃c       Quit
   ⌃r       Search history
@@ -51,7 +51,7 @@ shortcut help:
   /        Commands             tab      Send message
   @        Mention files        ⌥,       Less reasoning
   !        Shell command        ⌥.       More reasoning
-  ⌃j       New line             ⌥← / ⌥→  Subagents (empty prompt)
+  ⌃n       New line             ⌥← / ⌥→  Subagents (empty prompt)
   ⌃v       Paste image          f4       Inspect activity
   ⌃g       External editor      ⌃c       Quit
   ⌃r       Search history
