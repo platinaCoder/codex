@@ -43,8 +43,6 @@ enum ModalKeyResult {
 enum KeyResult {
     Ignored,
     Consumed,
-    FocusMain,
-    FocusSide,
     Open(u64),
 }
 
@@ -112,12 +110,12 @@ impl TicketUiState {
             return KeyResult::Consumed;
         }
         if crate::key_hint::ctrl(KeyCode::Char('h')).is_press(key) {
-            self.focused = false;
-            return KeyResult::FocusMain;
+            self.selected = self.selected.saturating_sub(1);
+            return KeyResult::Consumed;
         }
         if crate::key_hint::ctrl(KeyCode::Char('l')).is_press(key) {
-            self.focused = false;
-            return KeyResult::FocusSide;
+            self.selected = (self.selected + 1).min(self.tickets.len().saturating_sub(1));
+            return KeyResult::Consumed;
         }
         if crate::key_hint::ctrl(KeyCode::Char('k')).is_press(key) {
             return KeyResult::Consumed;
@@ -185,20 +183,19 @@ impl TicketUiState {
         if area.height == 0 {
             return;
         }
-        let active = self
-            .tickets
-            .iter()
-            .filter(|ticket| !ticket.status.terminal())
-            .count();
+        let view_label = if self.archive { "archived" } else { "active" };
+        let view_count = self.tickets.len();
         let review = self
             .tickets
             .iter()
-            .filter(|ticket| ticket.review_required)
+            .filter(|ticket| ticket.status == Status::AwaitingReview)
             .count();
         if !self.focused {
             Paragraph::new(Line::from(vec![
                 Span::styled(" TICKETS ", Style::default().add_modifier(Modifier::BOLD)),
-                Span::raw(format!("{active} active · {review} review · ctrl+k focus")),
+                Span::raw(format!(
+                    "{view_count} {view_label} · {review} review · ctrl+k focus"
+                )),
             ]))
             .render(area, buffer);
             return;
@@ -207,7 +204,7 @@ impl TicketUiState {
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .title(format!(
-                " TICKETS · arrows navigate · enter open · a {} · ctrl+h/l panes · ctrl+j/esc return ",
+                " TICKETS · arrows/ctrl+h/l navigate · enter open · a {} · ctrl+j/esc return ",
                 if self.archive { "active" } else { "archive" }
             ))
             .render(area, buffer);
@@ -313,20 +310,6 @@ impl App {
             KeyResult::Consumed => {
                 if self.ticket_ui.last_refresh.is_none() {
                     self.ticket_ui.refresh(&self.config.workspace_roots, true);
-                }
-                tui.frame_requester().schedule_frame();
-                true
-            }
-            result @ (KeyResult::FocusMain | KeyResult::FocusSide) => {
-                let target = paired.map(|(main, side)| match result {
-                    KeyResult::FocusMain => main,
-                    KeyResult::FocusSide => side,
-                    _ => unreachable!(),
-                });
-                if let Some(target) = target
-                    && self.current_displayed_thread_id() != Some(target)
-                {
-                    self.app_event_tx.send(AppEvent::SelectAgentThread(target));
                 }
                 tui.frame_requester().schedule_frame();
                 true
@@ -495,6 +478,23 @@ mod tests {
         app.side_threads.insert(side, SideThreadState::new(main));
     }
 
+    fn summary(id: u64, status: Status, review_required: bool) -> Summary {
+        Summary {
+            id,
+            revision: 1,
+            title: format!("ticket {id}"),
+            status,
+            scope: vec!["runtime".into()],
+            review_required,
+        }
+    }
+
+    fn rendered(state: &TicketUiState, height: u16) -> String {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 120, height));
+        state.render(buffer.area, &mut buffer);
+        buffer.content().iter().map(|cell| cell.symbol()).collect()
+    }
+
     #[test]
     fn title_truncation_and_keys() {
         let mut state = TicketUiState {
@@ -528,9 +528,79 @@ mod tests {
         state.focused = true;
         assert!(matches!(
             state.key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL)),
-            KeyResult::FocusMain
+            KeyResult::Consumed
         ));
-        assert!(!state.focused);
+        assert!(state.focused);
+        assert_eq!(state.selected, 0);
+    }
+
+    #[test]
+    fn focused_ctrl_h_l_navigate_clamp_and_open_the_selected_ticket() {
+        let mut state = TicketUiState {
+            available: true,
+            focused: true,
+            tickets: vec![
+                summary(11, Status::Proposed, false),
+                summary(22, Status::Approved, false),
+                summary(33, Status::InProgress, false),
+            ],
+            ..Default::default()
+        };
+        let ctrl = |character| KeyEvent::new(KeyCode::Char(character), KeyModifiers::CONTROL);
+
+        assert!(matches!(state.key(ctrl('h')), KeyResult::Consumed));
+        assert_eq!(state.selected, 0);
+        assert!(state.focused);
+        assert!(matches!(state.key(ctrl('l')), KeyResult::Consumed));
+        assert_eq!(state.selected, 1);
+        assert!(matches!(state.key(ctrl('l')), KeyResult::Consumed));
+        assert_eq!(state.selected, 2);
+        assert!(matches!(state.key(ctrl('l')), KeyResult::Consumed));
+        assert_eq!(state.selected, 2);
+        assert!(matches!(state.key(ctrl('h')), KeyResult::Consumed));
+        assert_eq!(state.selected, 1);
+        assert!(matches!(
+            state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            KeyResult::Open(22)
+        ));
+        assert!(state.focused);
+    }
+
+    #[test]
+    fn collapsed_counts_use_lifecycle_review_and_follow_the_selected_view() {
+        let active = TicketUiState {
+            available: true,
+            tickets: vec![
+                summary(1, Status::AwaitingReview, false),
+                summary(2, Status::InProgress, true),
+            ],
+            ..Default::default()
+        };
+        let active_render = rendered(&active, 1);
+        assert!(
+            active_render.contains("2 active · 1 review"),
+            "{active_render}"
+        );
+
+        let archived = TicketUiState {
+            available: true,
+            archive: true,
+            tickets: vec![
+                summary(3, Status::Accepted, true),
+                summary(4, Status::Cancelled, false),
+            ],
+            ..Default::default()
+        };
+        let archive_render = rendered(&archived, 1);
+        assert!(
+            archive_render.contains("2 archived · 0 review"),
+            "{archive_render}"
+        );
+
+        let mut focused_archive = archived;
+        focused_archive.focused = true;
+        let focused_render = rendered(&focused_archive, 3);
+        assert!(focused_render.contains("ticket 3 !"), "{focused_render}");
     }
     #[test]
     fn actor_actions_are_bounded() {
@@ -702,12 +772,6 @@ mod tests {
             .await?;
             assert!(!app.ticket_ui.focused, "modifier matching must be exact");
 
-            app.handle_tui_event(
-                &mut tui,
-                &mut server,
-                TuiEvent::Key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL)),
-            )
-            .await?;
             let (horizontal_key, expected) = if enter_from_side {
                 ('h', main)
             } else {
