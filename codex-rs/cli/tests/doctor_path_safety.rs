@@ -602,7 +602,7 @@ async fn interactive_tmux_startup_does_not_execute_workspace_helpers() -> Result
         )
     })??;
     assert!(
-        output.contains("\x1b[>5u"),
+        output.contains("\x1b[>13u"),
         "expected safe Ghostty/tmux keyboard flags: {output}"
     );
     assert!(

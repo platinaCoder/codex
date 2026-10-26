@@ -243,7 +243,11 @@ fn keyboard_enhancement_flags(
     tmux_extended_keys_format: Option<&str>,
 ) -> KeyboardEnhancementFlags {
     let flags = KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-        | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS;
+        | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+        // Kitty's protocol deliberately keeps Enter as an unmodified CR unless all keys are
+        // reported as escape codes. Without this flag, Shift+Enter is indistinguishable from
+        // plain Enter even though the terminal reports keyboard-enhancement support.
+        | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES;
 
     // iTerm and Ghostty can leak shortcut release events that the terminal consumes.
     // tmux's xterm key format also loses Shift-Enter when event types are
@@ -389,7 +393,7 @@ mod tests {
                 /*running_in_tmux_session*/ false,
                 /*tmux_extended_keys_format*/ None
             ))),
-            "\x1b[>5u"
+            "\x1b[>13u"
         );
     }
 
@@ -401,7 +405,7 @@ mod tests {
                 /*running_in_tmux_session*/ false,
                 /*tmux_extended_keys_format*/ None
             ))),
-            "\x1b[>5u"
+            "\x1b[>13u"
         );
     }
 
@@ -413,7 +417,7 @@ mod tests {
                 /*running_in_tmux_session*/ false,
                 /*tmux_extended_keys_format*/ None
             ))),
-            "\x1b[>7u"
+            "\x1b[>15u"
         );
     }
 
@@ -425,7 +429,7 @@ mod tests {
                 /*running_in_tmux_session*/ true,
                 Some("csi-u")
             ))),
-            "\x1b[>7u"
+            "\x1b[>15u"
         );
     }
 
@@ -437,7 +441,7 @@ mod tests {
                 /*running_in_tmux_session*/ true,
                 Some("xterm")
             ))),
-            "\x1b[>5u"
+            "\x1b[>13u"
         );
     }
 
@@ -449,7 +453,7 @@ mod tests {
                 /*running_in_tmux_session*/ false,
                 /*tmux_extended_keys_format*/ None
             ))),
-            "\x1b[>7u"
+            "\x1b[>15u"
         );
     }
 
@@ -461,7 +465,7 @@ mod tests {
                 /*running_in_tmux_session*/ true,
                 /*tmux_extended_keys_format*/ None,
             ))),
-            "\x1b[>5u"
+            "\x1b[>13u"
         );
     }
 

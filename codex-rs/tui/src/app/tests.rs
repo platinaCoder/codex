@@ -6058,6 +6058,145 @@ async fn side_pair_remains_linked_when_focus_returns_to_main() {
 }
 
 #[tokio::test]
+async fn paired_main_and_side_shift_enter_preserves_multiline_drafts_and_plain_enter_submits()
+-> Result<()> {
+    let (mut app, mut app_events, mut ops) = make_test_app_with_channels().await;
+    let mut app_server = crate::start_embedded_app_server_for_picker(&app.config).await?;
+    let primary = app_server.start_thread(&app.config).await?;
+    let main_thread_id = primary.session.thread_id;
+    app.enqueue_primary_thread_session(primary.session, primary.turns)
+        .await?;
+
+    let side_thread_id = ThreadId::new();
+    let side_channel = ThreadEventChannel::new(/*capacity*/ 8);
+    side_channel.store.lock().await.set_session(
+        test_thread_session(side_thread_id, app.config.cwd.to_path_buf()),
+        Vec::new(),
+    );
+    app.thread_event_channels
+        .insert(side_thread_id, side_channel);
+    app.side_threads
+        .insert(side_thread_id, SideThreadState::new(main_thread_id));
+    app.research_workspace_enabled = true;
+    app.enhanced_keys_supported = true;
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    while app_events.try_recv().is_ok() {}
+    while ops.try_recv().is_ok() {}
+
+    app.handle_tui_event(&mut tui, &mut app_server, TuiEvent::Paste("main-a".into()))
+        .await?;
+    app.handle_tui_event(
+        &mut tui,
+        &mut app_server,
+        TuiEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
+    )
+    .await?;
+    app.handle_tui_event(&mut tui, &mut app_server, TuiEvent::Paste("main-b".into()))
+        .await?;
+    assert_eq!(
+        app.chat_widget.composer_text_with_pending(),
+        "main-a\nmain-b"
+    );
+    assert!(app_events.try_recv().is_err());
+    assert!(ops.try_recv().is_err());
+
+    app.handle_tui_event(
+        &mut tui,
+        &mut app_server,
+        TuiEvent::Key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL)),
+    )
+    .await?;
+    let switch_to_side = app_events
+        .try_recv()
+        .expect("ctrl+l should select the paired SIDE pane");
+    assert!(matches!(
+        switch_to_side,
+        AppEvent::SelectAgentThread(thread_id) if thread_id == side_thread_id
+    ));
+    app.handle_event(&mut tui, &mut app_server, switch_to_side)
+        .await?;
+    while app_events.try_recv().is_ok() {}
+    assert_eq!(app.active_thread_id, Some(side_thread_id));
+
+    app.handle_tui_event(&mut tui, &mut app_server, TuiEvent::Paste("side-a".into()))
+        .await?;
+    app.handle_tui_event(
+        &mut tui,
+        &mut app_server,
+        TuiEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
+    )
+    .await?;
+    app.handle_tui_event(&mut tui, &mut app_server, TuiEvent::Paste("side-b".into()))
+        .await?;
+    assert_eq!(
+        app.chat_widget.composer_text_with_pending(),
+        "side-a\nside-b"
+    );
+    assert!(app_events.try_recv().is_err());
+    assert!(ops.try_recv().is_err());
+
+    app.handle_tui_event(
+        &mut tui,
+        &mut app_server,
+        TuiEvent::Key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL)),
+    )
+    .await?;
+    let switch_to_main = app_events
+        .try_recv()
+        .expect("ctrl+h should select the paired MAIN pane");
+    assert!(matches!(
+        switch_to_main,
+        AppEvent::SelectAgentThread(thread_id) if thread_id == main_thread_id
+    ));
+    app.handle_event(&mut tui, &mut app_server, switch_to_main)
+        .await?;
+    while app_events.try_recv().is_ok() {}
+    assert_eq!(
+        app.chat_widget.composer_text_with_pending(),
+        "main-a\nmain-b"
+    );
+
+    app.handle_tui_event(
+        &mut tui,
+        &mut app_server,
+        TuiEvent::Key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL)),
+    )
+    .await?;
+    let switch_to_side = app_events
+        .try_recv()
+        .expect("ctrl+l should return to the paired SIDE pane");
+    app.handle_event(&mut tui, &mut app_server, switch_to_side)
+        .await?;
+    while app_events.try_recv().is_ok() {}
+    assert_eq!(
+        app.chat_widget.composer_text_with_pending(),
+        "side-a\nside-b"
+    );
+
+    app.handle_tui_event(
+        &mut tui,
+        &mut app_server,
+        TuiEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+    )
+    .await?;
+    let submitted = std::iter::from_fn(|| app_events.try_recv().ok())
+        .find(|event| matches!(event, AppEvent::CodexOp(AppCommand::UserTurn { .. })))
+        .expect("plain Enter should submit the active SIDE draft");
+    let AppEvent::CodexOp(AppCommand::UserTurn { items, .. }) = submitted else {
+        unreachable!()
+    };
+    assert!(matches!(
+        items.as_slice(),
+        [UserInput::Text { text, .. }] if text == "side-a\nside-b"
+    ));
+    assert_eq!(app.active_thread_id, Some(side_thread_id));
+    assert_eq!(app.chat_widget.composer_text_with_pending(), "");
+
+    app_server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn discard_side_thread_removes_agent_navigation_entry() -> Result<()> {
     Box::pin(async {
         let mut app = make_test_app().await;

@@ -471,6 +471,20 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn enhanced_shift_enter_is_forwarded_without_losing_its_modifier() {
+        let (broker, handle, _draw_tx, draw_rx, terminal_focused) = setup();
+        let mut stream = make_stream(broker, draw_rx, terminal_focused);
+        let shifted_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT);
+
+        handle.send(Ok(Event::Key(shifted_enter)));
+
+        match stream.next().await {
+            Some(TuiEvent::Key(actual)) => assert_eq!(actual, shifted_enter),
+            other => panic!("expected shifted Enter, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn focus_lost_is_forwarded_and_updates_terminal_state() {
         let (broker, handle, _draw_tx, draw_rx, terminal_focused) = setup();
         let mut stream = make_stream(broker, draw_rx, terminal_focused.clone());

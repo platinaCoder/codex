@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::ticket_store::{ActorRole, Document, Status, Summary, TicketStore};
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -43,6 +43,8 @@ enum ModalKeyResult {
 enum KeyResult {
     Ignored,
     Consumed,
+    FocusMain,
+    FocusSide,
     Open(u64),
 }
 
@@ -60,6 +62,7 @@ impl TicketUiState {
             Ok(store) => store,
             Err(_) => {
                 self.available = false;
+                self.focused = false;
                 self.tickets.clear();
                 return;
             }
@@ -85,24 +88,39 @@ impl TicketUiState {
         }
     }
 
+    fn focus(&mut self) -> bool {
+        if !self.available {
+            return false;
+        }
+        self.focused = true;
+        true
+    }
+
     fn key(&mut self, key: KeyEvent) -> KeyResult {
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             return KeyResult::Ignored;
         }
-        if key.modifiers.contains(KeyModifiers::CONTROL)
-            && matches!(key.code, KeyCode::Char('t' | 'T'))
-        {
-            self.focused = !self.focused;
-            return KeyResult::Consumed;
-        }
         if !self.focused {
             return KeyResult::Ignored;
         }
-        if key.modifiers.contains(KeyModifiers::CONTROL)
-            && matches!(key.code, KeyCode::Char('h' | 'j' | 'k' | 'l'))
-        {
+        if crate::key_hint::ctrl(KeyCode::Char('t')).is_press(key) {
             self.focused = false;
             return KeyResult::Ignored;
+        }
+        if crate::key_hint::ctrl(KeyCode::Char('j')).is_press(key) {
+            self.focused = false;
+            return KeyResult::Consumed;
+        }
+        if crate::key_hint::ctrl(KeyCode::Char('h')).is_press(key) {
+            self.focused = false;
+            return KeyResult::FocusMain;
+        }
+        if crate::key_hint::ctrl(KeyCode::Char('l')).is_press(key) {
+            self.focused = false;
+            return KeyResult::FocusSide;
+        }
+        if crate::key_hint::ctrl(KeyCode::Char('k')).is_press(key) {
+            return KeyResult::Consumed;
         }
         match key.code {
             KeyCode::Esc => self.focused = false,
@@ -180,7 +198,7 @@ impl TicketUiState {
         if !self.focused {
             Paragraph::new(Line::from(vec![
                 Span::styled(" TICKETS ", Style::default().add_modifier(Modifier::BOLD)),
-                Span::raw(format!("{active} active · {review} review · ctrl+t focus")),
+                Span::raw(format!("{active} active · {review} review · ctrl+k focus")),
             ]))
             .render(area, buffer);
             return;
@@ -189,7 +207,7 @@ impl TicketUiState {
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .title(format!(
-                " TICKETS · arrows navigate · enter open · a {} · esc return ",
+                " TICKETS · arrows navigate · enter open · a {} · ctrl+h/l panes · ctrl+j/esc return ",
                 if self.archive { "active" } else { "archive" }
             ))
             .render(area, buffer);
@@ -270,11 +288,45 @@ impl App {
         if self.overlay.is_some() {
             return false;
         }
+        let paired = self.paired_main_and_side();
+        if !self.ticket_ui.available {
+            self.ticket_ui.focused = false;
+        }
+        if !self.ticket_ui.focused {
+            if paired.is_none()
+                || self.inference_focused()
+                || !crate::key_hint::ctrl(KeyCode::Char('k')).is_press(key)
+            {
+                return false;
+            }
+            if self.ticket_ui.last_refresh.is_none() {
+                self.ticket_ui.refresh(&self.config.workspace_roots, true);
+            }
+            if !self.ticket_ui.focus() {
+                return false;
+            }
+            tui.frame_requester().schedule_frame();
+            return true;
+        }
         match self.ticket_ui.key(key) {
             KeyResult::Ignored => false,
             KeyResult::Consumed => {
                 if self.ticket_ui.last_refresh.is_none() {
                     self.ticket_ui.refresh(&self.config.workspace_roots, true);
+                }
+                tui.frame_requester().schedule_frame();
+                true
+            }
+            result @ (KeyResult::FocusMain | KeyResult::FocusSide) => {
+                let target = paired.map(|(main, side)| match result {
+                    KeyResult::FocusMain => main,
+                    KeyResult::FocusSide => side,
+                    _ => unreachable!(),
+                });
+                if let Some(target) = target
+                    && self.current_displayed_thread_id() != Some(target)
+                {
+                    self.app_event_tx.send(AppEvent::SelectAgentThread(target));
                 }
                 tui.frame_requester().schedule_frame();
                 true
@@ -419,6 +471,30 @@ fn modal_action(modal: &TicketModalState, key: char) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::owned_transcript::tests::attach_thread;
+    use crossterm::event::KeyModifiers;
+
+    fn install_lab_store(app: &mut App) -> tempfile::TempDir {
+        let lab = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(lab.path().join("runtime")).unwrap();
+        std::fs::write(lab.path().join("runtime/codex-upstream.toml"), "url='test'").unwrap();
+        std::fs::create_dir(lab.path().join(".git")).unwrap();
+        app.config.workspace_roots = vec![
+            AbsolutePathBuf::try_from(lab.path().to_path_buf())
+                .expect("temporary lab path must be absolute"),
+        ];
+        app.refresh_ticket_strip_now();
+        lab
+    }
+
+    fn install_pair(app: &mut App, main: ThreadId, side: ThreadId, active: ThreadId) {
+        attach_thread(app, active);
+        app.active_thread_id = Some(active);
+        app.primary_thread_id = Some(main);
+        app.research_workspace_enabled = true;
+        app.side_threads.insert(side, SideThreadState::new(main));
+    }
+
     #[test]
     fn title_truncation_and_keys() {
         let mut state = TicketUiState {
@@ -452,7 +528,7 @@ mod tests {
         state.focused = true;
         assert!(matches!(
             state.key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL)),
-            KeyResult::Ignored
+            KeyResult::FocusMain
         ));
         assert!(!state.focused);
     }
@@ -549,5 +625,153 @@ mod tests {
         state.refresh(&roots, true);
         assert_eq!(state.tickets[0].title, "after refresh");
         assert_eq!(state.tickets[0].revision, 2);
+    }
+
+    #[tokio::test]
+    async fn full_app_ctrl_t_opens_transcript_without_focusing_tickets() -> Result<()> {
+        let mut app = crate::app::test_support::make_test_app().await;
+        let main = ThreadId::new();
+        let side = ThreadId::new();
+        install_pair(&mut app, main, side, main);
+        let _lab = install_lab_store(&mut app);
+        let mut tui = crate::tui::test_support::make_test_tui()?;
+        let mut server = crate::start_embedded_app_server_for_picker(&app.config).await?;
+
+        app.handle_tui_event(
+            &mut tui,
+            &mut server,
+            TuiEvent::Key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL)),
+        )
+        .await?;
+        assert!(app.ticket_ui.focused);
+        app.handle_tui_event(
+            &mut tui,
+            &mut server,
+            TuiEvent::Key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL)),
+        )
+        .await?;
+
+        assert!(matches!(app.overlay, Some(Overlay::Transcript(_))));
+        assert!(!app.ticket_ui.focused);
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn full_app_ticket_focus_enters_and_returns_from_main_and_side() -> Result<()> {
+        for enter_from_side in [false, true] {
+            let (mut app, mut app_events, _ops) =
+                crate::app::tests::make_test_app_with_channels().await;
+            let main = ThreadId::new();
+            let side = ThreadId::new();
+            let active = if enter_from_side { side } else { main };
+            install_pair(&mut app, main, side, active);
+            let _lab = install_lab_store(&mut app);
+            let mut tui = crate::tui::test_support::make_test_tui()?;
+            let mut server = crate::start_embedded_app_server_for_picker(&app.config).await?;
+            while app_events.try_recv().is_ok() {}
+
+            app.handle_tui_event(
+                &mut tui,
+                &mut server,
+                TuiEvent::Key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL)),
+            )
+            .await?;
+            assert!(app.ticket_ui.focused);
+            assert_eq!(app.current_displayed_thread_id(), Some(active));
+            assert!(app_events.try_recv().is_err());
+
+            app.handle_tui_event(
+                &mut tui,
+                &mut server,
+                TuiEvent::Key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL)),
+            )
+            .await?;
+            assert!(!app.ticket_ui.focused);
+            assert_eq!(app.current_displayed_thread_id(), Some(active));
+            assert!(app_events.try_recv().is_err());
+
+            app.handle_tui_event(
+                &mut tui,
+                &mut server,
+                TuiEvent::Key(KeyEvent::new(
+                    KeyCode::Char('k'),
+                    KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+                )),
+            )
+            .await?;
+            assert!(!app.ticket_ui.focused, "modifier matching must be exact");
+
+            app.handle_tui_event(
+                &mut tui,
+                &mut server,
+                TuiEvent::Key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL)),
+            )
+            .await?;
+            let (horizontal_key, expected) = if enter_from_side {
+                ('h', main)
+            } else {
+                ('l', side)
+            };
+            app.handle_tui_event(
+                &mut tui,
+                &mut server,
+                TuiEvent::Key(KeyEvent::new(
+                    KeyCode::Char(horizontal_key),
+                    KeyModifiers::CONTROL,
+                )),
+            )
+            .await?;
+            assert!(!app.ticket_ui.focused);
+            assert!(matches!(
+                app_events.try_recv(),
+                Ok(AppEvent::SelectAgentThread(thread_id)) if thread_id == expected
+            ));
+            server.shutdown().await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unavailable_or_unpaired_ticket_strip_does_not_consume_ctrl_k() -> Result<()> {
+        let (mut app, mut app_events, _ops) =
+            crate::app::tests::make_test_app_with_channels().await;
+        let main = ThreadId::new();
+        let side = ThreadId::new();
+        install_pair(&mut app, main, side, side);
+        let not_a_lab = tempfile::tempdir().unwrap();
+        app.config.workspace_roots = vec![
+            AbsolutePathBuf::try_from(not_a_lab.path().to_path_buf())
+                .expect("temporary non-lab path must be absolute"),
+        ];
+        let mut tui = crate::tui::test_support::make_test_tui()?;
+        let mut server = crate::start_embedded_app_server_for_picker(&app.config).await?;
+        while app_events.try_recv().is_ok() {}
+
+        app.handle_tui_event(
+            &mut tui,
+            &mut server,
+            TuiEvent::Key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL)),
+        )
+        .await?;
+        assert!(!app.ticket_ui.focused);
+        assert!(matches!(
+            app_events.try_recv(),
+            Ok(AppEvent::SelectAgentThread(thread_id)) if thread_id == main
+        ));
+
+        app.side_threads.clear();
+        let _lab = install_lab_store(&mut app);
+        while app_events.try_recv().is_ok() {}
+        app.handle_tui_event(
+            &mut tui,
+            &mut server,
+            TuiEvent::Key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL)),
+        )
+        .await?;
+        assert!(!app.ticket_ui.focused);
+        assert!(app_events.try_recv().is_err());
+        server.shutdown().await?;
+        Ok(())
     }
 }
