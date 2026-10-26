@@ -1235,7 +1235,7 @@ async fn external_transport_registers_dynamic_tools_and_finds_task_mentions() ->
         assert_eq!(params["dynamicTools"][0]["name"], "codex_tui");
         assert_eq!(
             params["dynamicTools"][0]["tools"].as_array().map(Vec::len),
-            Some(9)
+            Some(11)
         );
         assert!(
             params["dynamicTools"][0]["tools"]
@@ -1264,7 +1264,13 @@ async fn external_transport_registers_dynamic_tools_and_finds_task_mentions() ->
     let side_tools = side_start["dynamicTools"][0]["tools"]
         .as_array()
         .expect("SIDE dynamic tool namespace");
-    assert_eq!(side_tools.len(), 9);
+    assert_eq!(side_tools.len(), 11);
+    for read in ["list_tickets", "read_ticket"] {
+        assert!(side_tools.iter().any(|tool| tool["name"] == read));
+    }
+    for mutation in ["create_ticket", "update_ticket"] {
+        assert!(!side_tools.iter().any(|tool| tool["name"] == mutation));
+    }
     for forbidden in crate::dynamic_tools::DELEGATION_TOOLS {
         assert!(!side_tools.iter().any(|tool| tool["name"] == forbidden));
     }
@@ -1555,8 +1561,11 @@ async fn local_daemon_registers_approval_gated_mcp_tools_for_both_start_paths_sc
         .find(|server| server.name == "codex_tui")
         .expect("local daemon must connect to the TUI MCP server")
         .tools;
-    assert_eq!(tools.len(), 13);
+    assert_eq!(tools.len(), 17);
     for tool in crate::dynamic_tools::DELEGATION_TOOLS {
+        assert!(tools.contains_key(tool));
+    }
+    for tool in crate::dynamic_tools::TICKET_TOOLS {
         assert!(tools.contains_key(tool));
     }
     assert!(
@@ -2302,7 +2311,7 @@ async fn local_mcp_respects_configured_servers_and_managed_requirements() -> Res
         } else {
             assert_eq!(
                 start["dynamicTools"][0]["tools"].as_array().map(Vec::len),
-                Some(9)
+                Some(11)
             );
             assert!(start["config"]["mcp_servers.codex_tui"].is_null());
         }

@@ -100,12 +100,14 @@ const MAX_WAIT_TIMEOUT_MS: u64 = 120_000;
 const MAX_WORKSPACE_FILE_BYTES: u64 = 256 * 1024;
 const MAX_WORKSPACE_RESULTS: usize = 200;
 const MAX_WORKSPACE_VISITED_FILES: usize = 5_000;
-const TICKET_TOOLS: [&str; 4] = [
+#[cfg(test)]
+pub(crate) const TICKET_TOOLS: [&str; 4] = [
     "list_tickets",
     "read_ticket",
     "create_ticket",
     "update_ticket",
 ];
+const TICKET_MUTATION_TOOLS: [&str; 2] = ["create_ticket", "update_ticket"];
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -395,7 +397,7 @@ pub(crate) fn tool_specs() -> Vec<DynamicToolSpec> {
         ),
         (
             "update_ticket",
-            "Apply one typed optimistic-revision update to a canonical AI Lab ticket. SIDE cannot transition lifecycle state. Approval permits only this ticket mutation and is not permission to implement ticket content.",
+            "Apply one typed optimistic-revision update to a canonical AI Lab ticket from SIDE when the user requests it. This includes proposal edits, findings, dependencies, review resolution, cancellation, and lifecycle transitions. Approval permits only this bounded ticket mutation and is never permission to implement ticket content.",
             json!({
                 "ticketId": {"type": "integer", "minimum": 1},
                 "expectedRevision": {"type": "integer", "minimum": 1},
@@ -502,14 +504,14 @@ fn tool_specs_without_delegation_except(retained_delegation: Option<&str>) -> Ve
         .filter_map(|spec| match spec {
             DynamicToolSpec::Function(function) => (!DELEGATION_TOOLS
                 .contains(&function.name.as_str())
-                && !TICKET_TOOLS.contains(&function.name.as_str())
+                && !TICKET_MUTATION_TOOLS.contains(&function.name.as_str())
                 || retained_delegation == Some(function.name.as_str()))
             .then_some(DynamicToolSpec::Function(function)),
             DynamicToolSpec::Namespace(mut namespace) => {
                 namespace.tools.retain(|tool| match tool {
                     DynamicToolNamespaceTool::Function(function) => {
                         !DELEGATION_TOOLS.contains(&function.name.as_str())
-                            && !TICKET_TOOLS.contains(&function.name.as_str())
+                            && !TICKET_MUTATION_TOOLS.contains(&function.name.as_str())
                             || retained_delegation == Some(function.name.as_str())
                     }
                 });
@@ -639,11 +641,9 @@ async fn execute_inner(
         "create_ticket" => {
             let arguments: CreateTicketArguments = parse_arguments(params.arguments)?;
             let source_thread = read_thread(&handle, &params.thread_id).await?;
-            let role = if is_side_thread(&source_thread) {
-                crate::ticket_store::ActorRole::Side
-            } else {
-                crate::ticket_store::ActorRole::Main
-            };
+            if !is_side_thread(&source_thread) {
+                return Err("create_ticket is owned by the paired SIDE thread; MAIN may only list or explicitly read tickets".to_string());
+            }
             let store =
                 crate::ticket_store::TicketStore::from_workspace_roots(&ticket_workspace_roots)
                     .map_err(|error| error.to_string())?;
@@ -653,7 +653,7 @@ async fn execute_inner(
                     scope: arguments.scope,
                     source: crate::ticket_store::Source {
                         thread_id: params.thread_id,
-                        role,
+                        role: crate::ticket_store::ActorRole::Side,
                         turn_id: params.turn_id,
                     },
                     dependencies: arguments.dependencies,
@@ -688,11 +688,9 @@ async fn execute_inner(
                 );
             }
             let source_thread = read_thread(&handle, &params.thread_id).await?;
-            let role = if is_side_thread(&source_thread) {
-                crate::ticket_store::ActorRole::Side
-            } else {
-                crate::ticket_store::ActorRole::Main
-            };
+            if !is_side_thread(&source_thread) {
+                return Err("update_ticket is owned by the paired SIDE thread; MAIN has no ticket mutation or lifecycle authority".to_string());
+            }
             let store =
                 crate::ticket_store::TicketStore::from_workspace_roots(&ticket_workspace_roots)
                     .map_err(|error| error.to_string())?;
@@ -724,7 +722,7 @@ async fn execute_inner(
                 .transpose()?;
             let source = crate::ticket_store::Source {
                 thread_id: params.thread_id,
-                role,
+                role: crate::ticket_store::ActorRole::Side,
                 turn_id: params.turn_id,
             };
             let document = store

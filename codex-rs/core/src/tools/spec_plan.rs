@@ -375,6 +375,7 @@ pub(crate) fn finalize_tool_router(
 ) -> CodexResult<ToolRouter> {
     let model_messages = ResolvedModelMessages::from_model(model_info);
     hosted_specs.retain(|spec| registry.tool_policy.allows(&ToolName::plain(spec.name())));
+    enforce_ticket_ownership(turn_context, &mut registry);
     enforce_strict_read_only_tool_surface(turn_context, &mut registry, &mut hosted_specs);
     apply_direct_model_only_namespace_overrides(turn_context, &mut registry);
     enforce_strict_3p_tools(turn_context, model_info, &mut registry);
@@ -571,6 +572,38 @@ fn is_strict_read_only_turn(turn_context: &TurnContext) -> bool {
                     .strip_prefix("ai_lab_side:")
                     .is_some_and(|main_id| !main_id.is_empty())
         )
+}
+
+fn is_paired_side_turn(turn_context: &TurnContext) -> bool {
+    matches!(
+        turn_context.thread_source.as_ref(),
+        Some(codex_protocol::protocol::ThreadSource::Feature(source))
+            if source
+                .strip_prefix("ai_lab_side:")
+                .is_some_and(|main_id| !main_id.is_empty())
+    )
+}
+
+/// Ticket mutation belongs only to a durably identified paired SIDE thread.
+/// MAIN retains list/read awareness, but neither catalog visibility nor a hidden
+/// invocation path for create/update.
+fn enforce_ticket_ownership(turn_context: &TurnContext, registry: &mut ToolRegistry) {
+    if is_paired_side_turn(turn_context) {
+        return;
+    }
+    let mutations = registry
+        .entries()
+        .filter_map(|tool| {
+            let name = tool.runtime.tool_name().with_default_namespace();
+            let from_tui = name.namespace.as_deref() == Some("codex_tui")
+                || tool.runtime.mcp_server_name() == Some("codex_tui");
+            (from_tui && matches!(name.name.as_str(), "create_ticket" | "update_ticket"))
+                .then(|| tool.runtime.tool_name())
+        })
+        .collect::<Vec<_>>();
+    for mutation in mutations {
+        registry.remove(&mutation);
+    }
 }
 
 fn is_side_codex_tui_tool(name: &str) -> bool {

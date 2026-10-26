@@ -1112,6 +1112,10 @@ async fn strict_side_keeps_reads_main_bridge_and_bounded_ticket_mutations() {
                 .enable(Feature::RequestPermissionsTool)
                 .expect("permissions feature should be configurable");
             turn.config = Arc::new(config);
+            turn.thread_source = Some(ThreadSource::Feature(format!(
+                "ai_lab_side:{}",
+                ThreadId::new()
+            )));
             update_turn_settings_for_test(turn, |settings| {
                 Arc::make_mut(&mut settings.model_info).shell_type =
                     ConfigShellToolType::UnifiedExec;
@@ -1170,6 +1174,35 @@ async fn strict_side_keeps_reads_main_bridge_and_bounded_ticket_mutations() {
         &ToolName::namespaced("codex_tui", "set_thread_title").to_string(),
     ]);
     assert!(!plan.can_manage_children);
+}
+
+#[tokio::test]
+async fn main_catalog_keeps_ticket_reads_but_removes_mutations() {
+    let plan = probe_with(
+        |_| {},
+        ToolPlanInputs {
+            dynamic_tools: [
+                "list_tickets",
+                "read_ticket",
+                "create_ticket",
+                "update_ticket",
+            ]
+            .into_iter()
+            .map(|name| dynamic_tool(Some("codex_tui"), name, false))
+            .collect(),
+            ..ToolPlanInputs::default()
+        },
+    )
+    .await;
+
+    plan.assert_registered_contains(&[
+        &ToolName::namespaced("codex_tui", "list_tickets").to_string(),
+        &ToolName::namespaced("codex_tui", "read_ticket").to_string(),
+    ]);
+    plan.assert_registered_lacks(&[
+        &ToolName::namespaced("codex_tui", "create_ticket").to_string(),
+        &ToolName::namespaced("codex_tui", "update_ticket").to_string(),
+    ]);
 }
 
 #[tokio::test]

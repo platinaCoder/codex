@@ -6,6 +6,7 @@ use app_test_support::create_fake_paginated_rollout;
 use app_test_support::create_fake_rollout;
 use app_test_support::rollout_path;
 use codex_protocol::ThreadId;
+use codex_protocol::protocol::ThreadSource;
 use core_test_support::responses;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
@@ -132,6 +133,40 @@ async fn call_tool(
         },
         ThreadStartParams {
             dynamic_tools: Some(tool_specs()),
+            ephemeral: Some(true),
+            ..ThreadStartParams::default()
+        },
+        Features::with_defaults(),
+        status_receiver,
+        /*app_event_tx*/ None,
+    )
+    .await
+}
+
+async fn call_ticket_tool(
+    server: &AppServerSession,
+    source: &str,
+    name: &str,
+    arguments: Value,
+    workspace_root: &std::path::Path,
+) -> DynamicToolCallResponse {
+    let (_status_sender, status_receiver) = broadcast::channel(/*capacity*/ 8);
+    execute(
+        server.request_handle(),
+        DynamicToolCallParams {
+            thread_id: source.to_string(),
+            turn_id: "ticket-turn".to_string(),
+            call_id: "ticket-call".to_string(),
+            namespace: Some(NAMESPACE.to_string()),
+            tool: name.to_string(),
+            arguments,
+        },
+        ThreadStartParams {
+            dynamic_tools: Some(tool_specs()),
+            runtime_workspace_roots: Some(vec![
+                codex_utils_absolute_path::AbsolutePathBuf::try_from(workspace_root.to_path_buf())
+                    .expect("ticket test root must be absolute"),
+            ]),
             ephemeral: Some(true),
             ..ThreadStartParams::default()
         },
@@ -961,9 +996,85 @@ fn ticket_capabilities_are_exact_pathless_and_mcp_only() {
                 .collect(),
         })
         .collect::<Vec<_>>();
-    for name in TICKET_TOOLS {
+    for name in ["list_tickets", "read_ticket"] {
+        assert!(direct_names.iter().any(|candidate| candidate == name));
+    }
+    for name in TICKET_MUTATION_TOOLS {
         assert!(!direct_names.iter().any(|candidate| candidate == name));
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ticket_handlers_reject_main_mutation_and_allow_side_lifecycle_management()
+-> color_eyre::Result<()> {
+    let lab = tempfile::tempdir()?;
+    std::fs::create_dir_all(lab.path().join("runtime"))?;
+    std::fs::write(lab.path().join("runtime/codex-upstream.toml"), "url='test'")?;
+    std::fs::create_dir(lab.path().join(".git"))?;
+    let codex_home = tempfile::tempdir()?;
+    let mut config = ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .build()
+        .await?;
+    config.cwd = codex_utils_absolute_path::AbsolutePathBuf::try_from(lab.path().to_path_buf())?;
+    let mut server = crate::start_embedded_app_server_for_picker(&config).await?;
+    let main = server
+        .start_thread(&config)
+        .await?
+        .session
+        .thread_id
+        .to_string();
+    let side: codex_app_server_protocol::ThreadStartResponse =
+        request(&server.request_handle(), |request_id| {
+            ClientRequest::ThreadStart {
+                request_id,
+                params: ThreadStartParams {
+                    cwd: Some(lab.path().display().to_string()),
+                    thread_source: Some(
+                        ThreadSource::Feature(format!(
+                            "{}:{}",
+                            crate::app_server_session::PERSISTENT_SIDE_THREAD_SOURCE_PREFIX,
+                            ThreadId::new()
+                        ))
+                        .into(),
+                    ),
+                    ..ThreadStartParams::default()
+                },
+            }
+        })
+        .await
+        .map_err(|error| color_eyre::eyre::eyre!(error))?;
+    let side = side.thread.id;
+    let create = json!({
+        "title": "SIDE-owned lifecycle",
+        "scope": ["runtime"],
+        "proposal": {"originalIdea": "prove role ownership"}
+    });
+    let denied =
+        call_ticket_tool(&server, &main, "create_ticket", create.clone(), lab.path()).await;
+    assert!(!denied.success);
+    assert!(format!("{denied:?}").contains("owned by the paired SIDE"));
+
+    let created =
+        response_json(call_ticket_tool(&server, &side, "create_ticket", create, lab.path()).await);
+    assert_eq!(created["document"]["ticket"]["status"], "proposed");
+    let approved = response_json(
+        call_ticket_tool(
+            &server,
+            &side,
+            "update_ticket",
+            json!({
+                "ticketId": created["document"]["ticket"]["id"],
+                "expectedRevision": created["document"]["ticket"]["revision"],
+                "transition": {"to": "approved", "reason": "user requested approval"}
+            }),
+            lab.path(),
+        )
+        .await,
+    );
+    assert_eq!(approved["document"]["ticket"]["status"], "approved");
+    server.shutdown().await?;
+    Ok(())
 }
 
 #[test]

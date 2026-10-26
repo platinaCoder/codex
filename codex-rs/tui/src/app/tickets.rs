@@ -427,8 +427,8 @@ fn modal_lines(document: &Document, role: ActorRole) -> Vec<Line<'static>> {
 }
 
 fn actions(status: &Status, role: ActorRole, review_required: bool) -> String {
-    if role == ActorRole::Side {
-        return "No lifecycle controls. SIDE may request proposal/finding edits through approved ticket tool calls in chat.".into();
+    if role == ActorRole::Main {
+        return "Read only. MAIN has no ticket mutation or lifecycle controls.".into();
     }
     let mut actions = match status {
         Status::Proposed => vec!["[p] Approve", "[c] Cancel"],
@@ -448,7 +448,7 @@ fn actions(status: &Status, role: ActorRole, review_required: bool) -> String {
 }
 
 fn modal_action(modal: &TicketModalState, key: char) -> Option<&'static str> {
-    if modal.role != ActorRole::Main {
+    if modal.role != ActorRole::Side {
         return None;
     }
     if key == 'v' && modal.review_required && modal.status != Status::Cancelled {
@@ -534,9 +534,9 @@ mod tests {
     }
     #[test]
     fn actor_actions_are_bounded() {
-        assert!(!actions(&Status::Proposed, ActorRole::Side, false).contains("Approve"));
-        assert!(actions(&Status::AwaitingReview, ActorRole::Main, false).contains("Accept"));
-        assert!(actions(&Status::Accepted, ActorRole::Main, false).contains("Terminal"));
+        assert!(!actions(&Status::Proposed, ActorRole::Main, false).contains("Approve"));
+        assert!(actions(&Status::AwaitingReview, ActorRole::Side, false).contains("Accept"));
+        assert!(actions(&Status::Accepted, ActorRole::Side, false).contains("Terminal"));
     }
 
     #[test]
@@ -546,7 +546,7 @@ mod tests {
                 id: 7,
                 revision: 3,
                 status: Status::AwaitingReview,
-                role: ActorRole::Main,
+                role: ActorRole::Side,
                 review_required: true,
             }),
             ..Default::default()
@@ -568,7 +568,7 @@ mod tests {
             id: 7,
             revision: 3,
             status: Status::AwaitingReview,
-            role: ActorRole::Side,
+            role: ActorRole::Main,
             review_required: true,
         });
         assert!(matches!(
@@ -592,8 +592,8 @@ mod tests {
                 title: "before refresh".into(),
                 scope: vec!["runtime".into()],
                 source: crate::ticket_store::Source {
-                    thread_id: "main".into(),
-                    role: ActorRole::Main,
+                    thread_id: "side".into(),
+                    role: ActorRole::Side,
                     turn_id: "turn".into(),
                 },
                 dependencies: vec![],

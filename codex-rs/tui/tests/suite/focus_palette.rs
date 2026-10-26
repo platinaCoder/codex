@@ -53,6 +53,84 @@ fn focus_gained_with_unanswered_palette_queries_preserves_immediate_input() -> R
     Ok(())
 }
 
+#[test]
+fn owned_screen_accepts_shift_enter_in_main_and_side_from_real_terminal_streams() -> Result<()> {
+    let repo_root = codex_utils_cargo_bin::repo_root()?;
+    for (label, sequence) in [
+        ("csi-u", b"\x1b[13;2u".as_slice()),
+        ("tmux-xterm", b"\x1b[27;2;13~".as_slice()),
+    ] {
+        let codex_home = tempfile::tempdir()?;
+        write_test_config(codex_home.path(), &repo_root)?;
+        let mut terminal = PtyCodex::start(&repo_root, codex_home, &[])?;
+        terminal.wait_for_startup()?;
+        terminal.wait_for_screen("GPT-5.6-Terra")?;
+        terminal.wait_for_screen("MAIN • focused")?;
+        let first = format!("{label}-main-first");
+        let second = format!("{label}-main-second");
+        terminal.write_input(first.as_bytes())?;
+        terminal.write_input(sequence)?;
+        terminal.write_input(second.as_bytes())?;
+        terminal.wait_for_screen(&second)?;
+
+        let screen = terminal.screen_contents();
+        let rows = screen.lines().collect::<Vec<_>>();
+        let first_row = rows
+            .iter()
+            .position(|row| row.contains(&first))
+            .with_context(|| format!("missing first {label} draft row:\n{screen}"))?;
+        let second_row = rows
+            .iter()
+            .position(|row| row.contains(&second))
+            .with_context(|| format!("missing second {label} draft row:\n{screen}"))?;
+        assert_eq!(
+            second_row,
+            first_row + 1,
+            "{label} Shift+Enter did not remain one adjacent MAIN draft:\n{screen}"
+        );
+
+        // Exercise the same bytes after the application's actual paired-pane focus switch. Raw
+        // form-feed is the legacy terminal spelling of Ctrl+L and remains accepted alongside the
+        // enhanced-key spelling that a real terminal emits after the startup negotiation.
+        terminal.write_input(b"\x0c")?;
+        terminal.wait_for_screen("SIDE • focused")?;
+        let first = format!("{label}-side-first");
+        let second = format!("{label}-side-second");
+        terminal.write_input(first.as_bytes())?;
+        terminal.write_input(sequence)?;
+        terminal.write_input(second.as_bytes())?;
+        terminal.wait_for_screen(&second)?;
+
+        let screen = terminal.screen_contents();
+        let rows = screen.lines().collect::<Vec<_>>();
+        let first_row = rows
+            .iter()
+            .position(|row| row.contains(&first))
+            .with_context(|| format!("missing first {label} SIDE draft row:\n{screen}"))?;
+        let second_row = rows
+            .iter()
+            .position(|row| row.contains(&second))
+            .with_context(|| format!("missing second {label} SIDE draft row:\n{screen}"))?;
+        assert_eq!(
+            second_row,
+            first_row + 1,
+            "{label} Shift+Enter did not remain one adjacent SIDE draft:\n{screen}"
+        );
+        ensure!(
+            terminal
+                .output
+                .windows(b"\x1b[>13u".len())
+                .any(|bytes| bytes == b"\x1b[>13u")
+                || terminal
+                    .output
+                    .windows(b"\x1b[>15u".len())
+                    .any(|bytes| bytes == b"\x1b[>15u"),
+            "owned-screen launch did not request all-key reporting for {label}"
+        );
+    }
+    Ok(())
+}
+
 #[cfg(target_os = "macos")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interactive_startup_honors_codex_home_symlink_opt_out() -> Result<()> {

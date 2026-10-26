@@ -5998,7 +5998,7 @@ checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
 [[package]]
 name = "crossterm"
 version = "0.29.0"
-source = "git+https://github.com/openai-oss-forks/crossterm?rev=ed1cdab335221515706178d68495bba2aed1924f#ed1cdab335221515706178d68495bba2aed1924f"
+source = "git+https://github.com/platinaCoder/crossterm?rev=75ba903e7a9726110c1e03829330db4fcd93cd73#75ba903e7a9726110c1e03829330db4fcd93cd73"
 dependencies = [
  "bitflags 2.13.1",
  "crossterm_winapi",

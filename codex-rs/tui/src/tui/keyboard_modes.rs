@@ -277,10 +277,10 @@ fn tmux_should_enable_modify_other_keys_for(
     running_in_tmux_session: bool,
     extended_keys_format: Option<&str>,
 ) -> bool {
-    // Only request mode 2 when tmux confirms csi-u formatting. Older tmux
-    // versions do not expose this option and may emit xterm-style sequences,
-    // which crossterm does not parse consistently for modified keys.
-    running_in_tmux_session && matches!(extended_keys_format, Some("csi-u"))
+    // Request mode 2 for both formats tmux advertises. The pinned Crossterm fork parses tmux's
+    // xterm `CSI 27;modifier;codepoint~` form as well as CSI-u, so either transport preserves
+    // Shift+Enter instead of collapsing it to plain Enter.
+    running_in_tmux_session && matches!(extended_keys_format, Some("csi-u" | "xterm"))
 }
 
 pub(super) fn restore_keyboard_enhancement_stack(writer: &mut impl Write) {
@@ -551,17 +551,17 @@ mod tests {
     }
 
     #[test]
-    fn tmux_modify_other_keys_only_requests_confirmed_csi_u_format() {
+    fn tmux_modify_other_keys_requests_supported_extended_key_formats() {
         assert!(tmux_should_enable_modify_other_keys_for(
             /*running_in_tmux_session*/ true,
             Some("csi-u")
         ));
-        assert!(!tmux_should_enable_modify_other_keys_for(
-            /*running_in_tmux_session*/ true, /*extended_keys_format*/ None
-        ));
-        assert!(!tmux_should_enable_modify_other_keys_for(
+        assert!(tmux_should_enable_modify_other_keys_for(
             /*running_in_tmux_session*/ true,
             Some("xterm")
+        ));
+        assert!(!tmux_should_enable_modify_other_keys_for(
+            /*running_in_tmux_session*/ true, /*extended_keys_format*/ None
         ));
         assert!(!tmux_should_enable_modify_other_keys_for(
             /*running_in_tmux_session*/ true,
