@@ -6,7 +6,6 @@ use app_test_support::create_fake_paginated_rollout;
 use app_test_support::create_fake_rollout;
 use app_test_support::rollout_path;
 use codex_protocol::ThreadId;
-use codex_protocol::protocol::ThreadSource;
 use core_test_support::responses;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
@@ -150,12 +149,31 @@ async fn call_ticket_tool(
     arguments: Value,
     workspace_root: &std::path::Path,
 ) -> DynamicToolCallResponse {
+    call_ticket_tool_at_turn(
+        server,
+        source,
+        "ticket-turn",
+        name,
+        arguments,
+        workspace_root,
+    )
+    .await
+}
+
+async fn call_ticket_tool_at_turn(
+    server: &AppServerSession,
+    source: &str,
+    turn_id: &str,
+    name: &str,
+    arguments: Value,
+    workspace_root: &std::path::Path,
+) -> DynamicToolCallResponse {
     let (_status_sender, status_receiver) = broadcast::channel(/*capacity*/ 8);
     execute(
         server.request_handle(),
         DynamicToolCallParams {
             thread_id: source.to_string(),
-            turn_id: "ticket-turn".to_string(),
+            turn_id: turn_id.to_string(),
             call_id: "ticket-call".to_string(),
             namespace: Some(NAMESPACE.to_string()),
             tool: name.to_string(),
@@ -1004,9 +1022,23 @@ fn ticket_capabilities_are_exact_pathless_and_mcp_only() {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn ticket_handlers_reject_main_mutation_and_allow_side_lifecycle_management()
+#[test]
+fn ticket_handlers_reject_main_mutation_and_allow_side_lifecycle_management()
 -> color_eyre::Result<()> {
+    std::thread::Builder::new()
+        .name("ticket-dispatch-flow-test".to_string())
+        .stack_size(32 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(ticket_dispatch_flow_scenario())
+        })?
+        .join()
+        .map_err(|panic| color_eyre::eyre::eyre!("ticket dispatch test panicked: {panic:?}"))?
+}
+
+async fn ticket_dispatch_flow_scenario() -> color_eyre::Result<()> {
     let lab = tempfile::tempdir()?;
     std::fs::create_dir_all(lab.path().join("runtime"))?;
     std::fs::write(lab.path().join("runtime/codex-upstream.toml"), "url='test'")?;
@@ -1018,33 +1050,53 @@ async fn ticket_handlers_reject_main_mutation_and_allow_side_lifecycle_managemen
         .await?;
     config.cwd = codex_utils_absolute_path::AbsolutePathBuf::try_from(lab.path().to_path_buf())?;
     let mut server = crate::start_embedded_app_server_for_picker(&config).await?;
+    let (events_tx, _events_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (status_updates, _status_rx) = broadcast::channel(/*capacity*/ 8);
+    server
+        .start_dynamic_tool_mcp(
+            config.clone(),
+            AppEventSender::new(events_tx),
+            status_updates,
+        )
+        .await?;
     let main = server
         .start_thread(&config)
         .await?
         .session
         .thread_id
         .to_string();
-    let side: codex_app_server_protocol::ThreadStartResponse =
-        request(&server.request_handle(), |request_id| {
-            ClientRequest::ThreadStart {
-                request_id,
-                params: ThreadStartParams {
-                    cwd: Some(lab.path().display().to_string()),
-                    thread_source: Some(
-                        ThreadSource::Feature(format!(
-                            "{}:{}",
-                            crate::app_server_session::PERSISTENT_SIDE_THREAD_SOURCE_PREFIX,
-                            ThreadId::new()
-                        ))
-                        .into(),
-                    ),
-                    ..ThreadStartParams::default()
-                },
-            }
-        })
-        .await
-        .map_err(|error| color_eyre::eyre::eyre!(error))?;
-    let side = side.thread.id;
+    server
+        .thread_inject_items(
+            ThreadId::from_string(&main)?,
+            vec![serde_json::from_value(json!({
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "materialized MAIN history"}]
+            }))?],
+        )
+        .await?;
+    let mut side_config = config.clone();
+    side_config.strict_read_only_tools = true;
+    let side = server
+        .start_side_thread(
+            &crate::local_settings::LocalSettings::from(&side_config),
+            &side_config,
+            ThreadId::from_string(&main)?,
+            /*selected_profile*/ None,
+        )
+        .await?
+        .session
+        .thread_id;
+    server
+        .thread_inject_items(
+            side,
+            vec![serde_json::from_value(json!({
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "materialized SIDE history"}]
+            }))?],
+        )
+        .await?;
     let create = json!({
         "title": "SIDE-owned lifecycle",
         "scope": ["runtime"],
@@ -1055,13 +1107,21 @@ async fn ticket_handlers_reject_main_mutation_and_allow_side_lifecycle_managemen
     assert!(!denied.success);
     assert!(format!("{denied:?}").contains("owned by the paired SIDE"));
 
-    let created =
-        response_json(call_ticket_tool(&server, &side, "create_ticket", create, lab.path()).await);
+    let created = response_json(
+        call_ticket_tool(
+            &server,
+            &side.to_string(),
+            "create_ticket",
+            create,
+            lab.path(),
+        )
+        .await,
+    );
     assert_eq!(created["document"]["ticket"]["status"], "proposed");
     let approved = response_json(
         call_ticket_tool(
             &server,
-            &side,
+            &side.to_string(),
             "update_ticket",
             json!({
                 "ticketId": created["document"]["ticket"]["id"],
@@ -1073,6 +1133,126 @@ async fn ticket_handlers_reject_main_mutation_and_allow_side_lifecycle_managemen
         .await,
     );
     assert_eq!(approved["document"]["ticket"]["status"], "approved");
+
+    let ordinary = response_json(
+        call_ticket_tool(
+            &server,
+            &side.to_string(),
+            "send_message_to_main",
+            json!({"prompt": "ordinary advice without a ticket binding"}),
+            lab.path(),
+        )
+        .await,
+    );
+    assert_eq!(ordinary["threadId"], main);
+    assert!(ordinary.get("ticketId").is_none());
+    assert_eq!(
+        crate::ticket_store::TicketStore::test(lab.path())
+            .read(1)?
+            .ticket
+            .status,
+        crate::ticket_store::Status::Approved
+    );
+
+    let stale = call_ticket_tool(
+        &server,
+        &side.to_string(),
+        "send_message_to_main",
+        json!({
+            "prompt": "stale ticket dispatch",
+            "ticketContext": {
+                "ticketId": approved["document"]["ticket"]["id"],
+                "expectedRevision": approved["document"]["ticket"]["revision"].as_u64().unwrap() - 1,
+                "implementation": true
+            }
+        }),
+        lab.path(),
+    )
+    .await;
+    assert!(!stale.success);
+
+    let dispatched = response_json(
+        call_ticket_tool(
+            &server,
+            &side.to_string(),
+            "send_message_to_main",
+            json!({
+                "prompt": "implement and verify the approved ticket",
+                "ticketContext": {
+                    "ticketId": approved["document"]["ticket"]["id"],
+                    "expectedRevision": approved["document"]["ticket"]["revision"],
+                    "implementation": true
+                }
+            }),
+            lab.path(),
+        )
+        .await,
+    );
+    assert_eq!(dispatched["threadId"], main);
+    assert_eq!(dispatched["ticketStatus"], "in_progress");
+    let implementation_turn = dispatched["turnId"].as_str().unwrap();
+    let retry = response_json(
+        call_ticket_tool(
+            &server,
+            &side.to_string(),
+            "send_message_to_main",
+            json!({
+                "prompt": "exact retry must not start another turn",
+                "ticketContext": {
+                    "ticketId": approved["document"]["ticket"]["id"],
+                    "expectedRevision": approved["document"]["ticket"]["revision"],
+                    "implementation": true
+                }
+            }),
+            lab.path(),
+        )
+        .await,
+    );
+    assert_eq!(retry["turnId"], implementation_turn);
+    assert_eq!(retry["idempotent"], true);
+
+    let wrong_turn = call_ticket_tool_at_turn(
+        &server,
+        &main,
+        "unbound-main-turn",
+        "report_ticket_ready",
+        json!({}),
+        lab.path(),
+    )
+    .await;
+    assert!(!wrong_turn.success);
+    assert_eq!(
+        crate::ticket_store::TicketStore::test(lab.path())
+            .read(1)?
+            .ticket
+            .status,
+        crate::ticket_store::Status::InProgress
+    );
+    let ready = response_json(
+        call_ticket_tool_at_turn(
+            &server,
+            &main,
+            implementation_turn,
+            "report_ticket_ready",
+            json!({}),
+            lab.path(),
+        )
+        .await,
+    );
+    assert_eq!(ready["ticketStatus"], "awaiting_review");
+    assert_eq!(ready["idempotent"], false);
+    let duplicate = response_json(
+        call_ticket_tool_at_turn(
+            &server,
+            &main,
+            implementation_turn,
+            "report_ticket_ready",
+            json!({}),
+            lab.path(),
+        )
+        .await,
+    );
+    assert_eq!(duplicate["idempotent"], true);
     server.shutdown().await?;
     Ok(())
 }
@@ -1274,7 +1454,27 @@ async fn paired_main_bridge_confines_target_scenario() -> color_eyre::Result<()>
         .as_object()
         .expect("properties");
     assert!(properties.contains_key("prompt"));
+    assert!(properties.contains_key("ticketContext"));
     assert!(!properties.contains_key("threadId"));
+    assert_eq!(
+        properties["ticketContext"]["properties"]["implementation"]["const"],
+        true
+    );
+    let ready_spec = tool_specs()
+        .into_iter()
+        .find_map(|spec| match spec {
+            DynamicToolSpec::Namespace(namespace) => namespace.tools.into_iter().find_map(|tool| {
+                let DynamicToolNamespaceTool::Function(function) = tool;
+                (function.name == "report_ticket_ready").then_some(function)
+            }),
+            DynamicToolSpec::Function(_) => None,
+        })
+        .expect("ticket completion tool");
+    assert!(
+        ready_spec.input_schema["properties"]
+            .as_object()
+            .is_some_and(serde_json::Map::is_empty)
+    );
     let side_tool_names = side_fallback_tool_specs()
         .into_iter()
         .flat_map(|spec| match spec {

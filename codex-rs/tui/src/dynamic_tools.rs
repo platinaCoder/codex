@@ -5,6 +5,8 @@ use crate::app_event_sender::AppEventSender;
 use codex_app_server_client::AppServerRequestHandle;
 use codex_app_server_client::TypedRequestError;
 use codex_app_server_protocol::Account;
+use codex_app_server_protocol::AdditionalContextEntry;
+use codex_app_server_protocol::AdditionalContextKind;
 use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::DynamicToolCallOutputContentItem;
 use codex_app_server_protocol::DynamicToolCallParams;
@@ -100,6 +102,7 @@ const MAX_WAIT_TIMEOUT_MS: u64 = 120_000;
 const MAX_WORKSPACE_FILE_BYTES: u64 = 256 * 1024;
 const MAX_WORKSPACE_RESULTS: usize = 200;
 const MAX_WORKSPACE_VISITED_FILES: usize = 5_000;
+pub(crate) const TICKET_DISPATCH_METADATA_KEY: &str = "ai_lab_ticket_dispatch";
 #[cfg(test)]
 pub(crate) const TICKET_TOOLS: [&str; 4] = [
     "list_tickets",
@@ -152,6 +155,24 @@ struct SendArguments {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct PairedMainSendArguments {
     prompt: String,
+    ticket_context: Option<TicketImplementationContext>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TicketImplementationContext {
+    ticket_id: u64,
+    expected_revision: u64,
+    implementation: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmptyArguments {}
+
+struct DelegatedMessage {
+    thread_id: String,
+    turn_id: String,
 }
 
 #[derive(Deserialize)]
@@ -362,9 +383,27 @@ pub(crate) fn tool_specs() -> Vec<DynamicToolSpec> {
         ),
         (
             "send_message_to_main",
-            "Send advice only to this SIDE conversation's durably paired MAIN thread. The target is resolved by the runtime and cannot be selected by the model. Proactive sends require user approval; use /main for an explicit user-directed send.",
-            json!({"prompt": prompt}),
+            "Send advice only to this SIDE conversation's durably paired MAIN thread. The target is resolved by the runtime and cannot be selected by the model. Proactive sends require user approval; use /main for an explicit user-directed send. To dispatch implementation of an explicitly Approved ticket, provide the typed ticketContext; never infer a ticket id from prose.",
+            json!({
+                "prompt": prompt,
+                "ticketContext": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "ticketId": {"type": "integer", "minimum": 1},
+                        "expectedRevision": {"type": "integer", "minimum": 1},
+                        "implementation": {"type": "boolean", "const": true}
+                    },
+                    "required": ["ticketId", "expectedRevision", "implementation"]
+                }
+            }),
             vec!["prompt"],
+        ),
+        (
+            "report_ticket_ready",
+            "Report successful implementation and verification for the ticket durably bound to this exact MAIN turn. Takes no ticket id. Do not call on failure, uncertainty, or when questions remain.",
+            json!({}),
+            Vec::new(),
         ),
         (
             "list_tickets",
@@ -1157,6 +1196,7 @@ async fn execute_inner(
                 /*model*/ None,
                 sandbox_policy,
                 cyber_access_program,
+                /*ticket_context*/ None,
             )
             .await?;
             Ok(json!({"threadId": thread_id}))
@@ -1250,7 +1290,57 @@ async fn execute_inner(
         "send_message_to_main" => {
             let arguments: PairedMainSendArguments = parse_arguments(params.arguments)?;
             let target_thread_id = paired_main_thread_id(&handle, &params.thread_id).await?;
-            send_delegated_message(
+            let Some(ticket_context) = arguments.ticket_context else {
+                let sent = send_delegated_message(
+                    &handle,
+                    &features,
+                    app_event_tx,
+                    &params.thread_id,
+                    &target_thread_id,
+                    arguments.prompt,
+                    /*model*/ None,
+                    mcp_config,
+                    "send_message_to_main",
+                    /*ticket_context*/ None,
+                )
+                .await?;
+                return Ok(json!({"threadId": sent.thread_id}));
+            };
+            if !ticket_context.implementation {
+                return Err("ticketContext.implementation must be true".to_string());
+            }
+            let store =
+                crate::ticket_store::TicketStore::from_workspace_roots(&ticket_workspace_roots)
+                    .map_err(|error| error.to_string())?;
+            match store
+                .check_implementation_dispatch(
+                    ticket_context.ticket_id,
+                    ticket_context.expected_revision,
+                    &params.thread_id,
+                    &target_thread_id,
+                )
+                .map_err(|error| error.to_string())?
+            {
+                crate::ticket_store::DispatchCheck::AlreadyAccepted(document) => {
+                    let dispatch = document
+                        .ticket
+                        .implementation_dispatch
+                        .as_ref()
+                        .ok_or_else(|| {
+                            "accepted ticket dispatch is missing its durable binding".to_string()
+                        })?;
+                    return Ok(json!({
+                        "threadId": dispatch.main_thread_id,
+                        "turnId": dispatch.main_turn_id,
+                        "ticketId": document.ticket.id,
+                        "ticketRevision": document.ticket.revision,
+                        "ticketStatus": document.ticket.status,
+                        "idempotent": true
+                    }));
+                }
+                crate::ticket_store::DispatchCheck::Ready => {}
+            }
+            let sent = send_delegated_message(
                 &handle,
                 &features,
                 app_event_tx,
@@ -1258,14 +1348,112 @@ async fn execute_inner(
                 &target_thread_id,
                 arguments.prompt,
                 /*model*/ None,
-                mcp_config,
+                mcp_config.clone(),
                 "send_message_to_main",
+                Some(&ticket_context),
             )
-            .await
+            .await?;
+            let document = store
+                .accept_implementation_dispatch(
+                    ticket_context.ticket_id,
+                    ticket_context.expected_revision,
+                    crate::ticket_store::Source {
+                        thread_id: params.thread_id,
+                        role: crate::ticket_store::ActorRole::Side,
+                        turn_id: params.turn_id,
+                    },
+                    sent.thread_id.clone(),
+                    sent.turn_id.clone(),
+                )
+                .map_err(|error| {
+                    format!(
+                        "MAIN accepted turn {} but ticket dispatch could not be recorded; ticket status was not advanced: {error}",
+                        sent.turn_id
+                    )
+                })?;
+            if let Some(app_event_tx) = app_event_tx {
+                app_event_tx.send(AppEvent::TicketStoreChanged);
+            }
+            Ok(json!({
+                "threadId": sent.thread_id,
+                "turnId": sent.turn_id,
+                "ticketId": document.ticket.id,
+                "ticketRevision": document.ticket.revision,
+                "ticketStatus": document.ticket.status,
+                "idempotent": false
+            }))
+        }
+        "report_ticket_ready" => {
+            let _: EmptyArguments = parse_arguments(params.arguments)?;
+            let source_thread = read_thread(&handle, &params.thread_id).await?;
+            if is_side_thread(&source_thread) {
+                return Err("report_ticket_ready is available only to a bound MAIN turn".into());
+            }
+            let store =
+                crate::ticket_store::TicketStore::from_workspace_roots(&ticket_workspace_roots)
+                    .map_err(|error| error.to_string())?;
+            let (_document, dispatch) = store
+                .implementation_dispatch_for_turn(&params.thread_id, &params.turn_id)
+                .map_err(|error| error.to_string())?;
+            let paired_main = paired_main_thread_id(&handle, &dispatch.side_thread_id).await?;
+            if !same_thread_id(&paired_main, &params.thread_id) {
+                return Err(
+                    "ticket dispatch SIDE is no longer paired with this MAIN thread".into(),
+                );
+            }
+            let binding = store
+                .report_implementation_ready(&params.thread_id, &params.turn_id)
+                .map_err(|error| error.to_string())?;
+            let mut document = binding.document;
+            if binding.notification_required {
+                let notification = format!(
+                    "Ticket #{} was reported implementation-complete and verified by its bound MAIN turn. Its lifecycle is now Awaiting Review. Review the result; do not accept it automatically.",
+                    document.ticket.id
+                );
+                let sent = send_delegated_message(
+                    &handle,
+                    &features,
+                    app_event_tx,
+                    &params.thread_id,
+                    &binding.side_thread_id,
+                    notification,
+                    /*model*/ None,
+                    /*mcp_config*/ None,
+                    "report_ticket_ready",
+                    /*ticket_context*/ None,
+                )
+                .await
+                .map_err(|error| {
+                    format!(
+                        "ticket #{} is Awaiting Review, but SIDE notification failed: {error}",
+                        document.ticket.id
+                    )
+                })?;
+                document = store
+                    .record_ready_notification(&params.thread_id, &params.turn_id, &sent.turn_id)
+                    .map_err(|error| {
+                        format!(
+                            "ticket #{} is Awaiting Review and SIDE was notified in turn {}, but notification provenance could not be recorded: {error}",
+                            document.ticket.id, sent.turn_id
+                        )
+                    })?;
+            }
+            if binding.transitioned || binding.notification_required {
+                if let Some(app_event_tx) = app_event_tx {
+                    app_event_tx.send(AppEvent::TicketStoreChanged);
+                }
+            }
+            Ok(json!({
+                "ticketId": document.ticket.id,
+                "ticketRevision": document.ticket.revision,
+                "ticketStatus": document.ticket.status,
+                "sideThreadId": binding.side_thread_id,
+                "idempotent": !binding.transitioned
+            }))
         }
         "send_message_to_thread" => {
             let arguments: SendArguments = parse_arguments(params.arguments)?;
-            send_delegated_message(
+            let sent = send_delegated_message(
                 &handle,
                 &features,
                 app_event_tx,
@@ -1275,8 +1463,10 @@ async fn execute_inner(
                 arguments.model,
                 mcp_config,
                 "send_message_to_thread",
+                /*ticket_context*/ None,
             )
-            .await
+            .await?;
+            Ok(json!({"threadId": sent.thread_id}))
         }
         "set_thread_title" => {
             let arguments: TitleArguments = parse_arguments(params.arguments)?;
@@ -1845,7 +2035,8 @@ async fn send_delegated_message(
     model: Option<String>,
     mcp_config: Option<HashMap<String, Value>>,
     tool_name: &str,
-) -> Result<Value, String> {
+    ticket_context: Option<&TicketImplementationContext>,
+) -> Result<DelegatedMessage, String> {
     if model.as_deref().is_some_and(str::is_empty) {
         return Err("model must not be empty".to_string());
     }
@@ -1883,7 +2074,7 @@ async fn send_delegated_message(
         daybreak_enabled,
     )
     .await?;
-    start_turn(
+    let response = start_turn(
         handle,
         target_thread_id,
         tool_name,
@@ -1891,9 +2082,13 @@ async fn send_delegated_message(
         model,
         /*sandbox_policy*/ None,
         cyber_access_program,
+        ticket_context,
     )
     .await?;
-    Ok(json!({"threadId": target_thread_id}))
+    Ok(DelegatedMessage {
+        thread_id: target_thread_id.to_string(),
+        turn_id: response.turn.id,
+    })
 }
 
 async fn start_turn(
@@ -1904,7 +2099,30 @@ async fn start_turn(
     model: Option<String>,
     sandbox_policy: Option<SandboxPolicy>,
     cyber_access_program: Option<codex_app_server_protocol::CyberAccessProgram>,
+    ticket_context: Option<&TicketImplementationContext>,
 ) -> Result<TurnStartResponse, String> {
+    let (responsesapi_client_metadata_patch, additional_context) = ticket_context
+        .map(|context| {
+            let binding = format!("v1:{}:{}", context.ticket_id, context.expected_revision);
+            let instruction = format!(
+                "This MAIN turn is durably bound to AI Lab ticket #{} at approved revision {}. Implement and verify exactly that ticket. Call codex_tui.report_ticket_ready only after implementation and verification both succeed. If implementation fails, verification fails, uncertainty remains, or you need an answer from the user, do not call it; leave the ticket In Progress. The completion tool accepts no ticket id and cannot approve, reject, or cancel a ticket.",
+                context.ticket_id, context.expected_revision
+            );
+            (
+                Some(HashMap::from([(
+                    TICKET_DISPATCH_METADATA_KEY.to_string(),
+                    binding,
+                )])),
+                Some(HashMap::from([(
+                    "ai_lab_ticket_implementation".to_string(),
+                    AdditionalContextEntry {
+                        value: instruction,
+                        kind: AdditionalContextKind::Application,
+                    },
+                )])),
+            )
+        })
+        .unwrap_or((None, None));
     request(handle, |request_id| ClientRequest::TurnStart {
         request_id,
         params: TurnStartParams {
@@ -1921,6 +2139,8 @@ async fn start_turn(
             model,
             sandbox_policy,
             cyber_access_program,
+            responsesapi_client_metadata_patch,
+            additional_context,
             ..TurnStartParams::default()
         },
     })

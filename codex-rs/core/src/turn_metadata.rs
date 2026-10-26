@@ -447,6 +447,14 @@ impl TurnMetadataState {
             .cloned()
     }
 
+    pub(crate) fn responsesapi_client_metadata_value(&self, key: &str) -> Option<String> {
+        self.responsesapi_client_metadata
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(key)
+            .cloned()
+    }
+
     fn responses_metadata_template(&self) -> CodexResponsesMetadata {
         let mut metadata = self.mcp_metadata_template();
         if metadata.parent_thread_id.is_some() {

@@ -115,6 +115,24 @@ pub(crate) struct History {
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+pub(crate) struct ImplementationDispatch {
+    pub(crate) requested_revision: u64,
+    pub(crate) side_thread_id: String,
+    pub(crate) side_turn_id: String,
+    pub(crate) main_thread_id: String,
+    pub(crate) main_turn_id: String,
+    pub(crate) dispatched_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) ready_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) ready_turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) side_notified_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) side_notification_turn_id: Option<String>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct Ticket {
     pub(crate) schema_version: u32,
     pub(crate) id: u64,
@@ -131,6 +149,8 @@ pub(crate) struct Ticket {
     pub(crate) review_reason: Option<String>,
     #[serde(default)]
     pub(crate) relevant_revisions: Vec<RelevantRevision>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) implementation_dispatch: Option<ImplementationDispatch>,
     pub(crate) history: Vec<History>,
 }
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -215,6 +235,18 @@ pub(crate) struct Update {
     pub(crate) resolve_review_reason: Option<String>,
 }
 
+pub(crate) enum DispatchCheck {
+    Ready,
+    AlreadyAccepted(Document),
+}
+
+pub(crate) struct ReadyForReview {
+    pub(crate) document: Document,
+    pub(crate) side_thread_id: String,
+    pub(crate) transitioned: bool,
+    pub(crate) notification_required: bool,
+}
+
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Identity {
@@ -245,7 +277,7 @@ impl TicketStore {
         })
     }
     #[cfg(test)]
-    fn test(lab: &Path) -> Self {
+    pub(crate) fn test(lab: &Path) -> Self {
         Self {
             lab: lab.into(),
             root: lab.join(".agents/tickets"),
@@ -362,6 +394,7 @@ impl TicketStore {
                 review_required: false,
                 review_reason: None,
                 relevant_revisions: input.relevant_revisions,
+                implementation_dispatch: None,
                 history: vec![History {
                     timestamp: now,
                     actor: actor(&input.source),
@@ -518,6 +551,352 @@ impl TicketStore {
         docs.into_iter()
             .find(|d| d.ticket.id == id)
             .ok_or(Error::NotFound(id))
+    }
+
+    pub(crate) fn check_implementation_dispatch(
+        &self,
+        id: u64,
+        expected: u64,
+        side_thread_id: &str,
+        main_thread_id: &str,
+    ) -> Result<DispatchCheck> {
+        let document = self.read(id)?;
+        if document.ticket.status == Status::InProgress {
+            let dispatch = document
+                .ticket
+                .implementation_dispatch
+                .as_ref()
+                .ok_or_else(|| {
+                    Error::Invalid(format!(
+                        "ticket {id} is In Progress without an implementation dispatch binding"
+                    ))
+                })?;
+            if dispatch.requested_revision == expected
+                && dispatch.side_thread_id == side_thread_id
+                && dispatch.main_thread_id == main_thread_id
+            {
+                return Ok(DispatchCheck::AlreadyAccepted(document));
+            }
+            return Err(Error::Stale {
+                expected,
+                current: document.ticket.revision,
+            });
+        }
+        if document.ticket.revision != expected {
+            return Err(Error::Stale {
+                expected,
+                current: document.ticket.revision,
+            });
+        }
+        if document.ticket.status != Status::Approved {
+            return Err(Error::Invalid(format!(
+                "ticket {id} must be Approved before implementation dispatch; current status is {}",
+                document.ticket.status.label()
+            )));
+        }
+        if document.ticket.implementation_dispatch.is_some() {
+            return Err(Error::Invalid(format!(
+                "ticket {id} already has an implementation dispatch binding"
+            )));
+        }
+        Ok(DispatchCheck::Ready)
+    }
+
+    pub(crate) fn accept_implementation_dispatch(
+        &self,
+        id: u64,
+        expected: u64,
+        source: Source,
+        main_thread_id: String,
+        main_turn_id: String,
+    ) -> Result<Document> {
+        if source.role != ActorRole::Side {
+            return Err(Error::Invalid(
+                "implementation dispatch is owned by the paired SIDE thread".into(),
+            ));
+        }
+        if main_thread_id.trim().is_empty() || main_turn_id.trim().is_empty() {
+            return Err(Error::Invalid(
+                "implementation dispatch requires a MAIN thread and turn id".into(),
+            ));
+        }
+        self.ensure_root()?;
+        let _lock = Lock::acquire(&self.root)?;
+        self.ensure_identity_locked()?;
+        self.identity()?;
+        self.recover_locked()?;
+        let mut docs = self.all()?;
+        let index = docs
+            .iter()
+            .position(|document| document.ticket.id == id)
+            .ok_or(Error::NotFound(id))?;
+        if docs[index].ticket.status == Status::InProgress {
+            let dispatch = docs[index]
+                .ticket
+                .implementation_dispatch
+                .as_ref()
+                .ok_or_else(|| {
+                    Error::Invalid(format!(
+                        "ticket {id} is In Progress without an implementation dispatch binding"
+                    ))
+                })?;
+            if dispatch.requested_revision == expected
+                && dispatch.side_thread_id == source.thread_id
+                && dispatch.main_thread_id == main_thread_id
+                && dispatch.main_turn_id == main_turn_id
+            {
+                return Ok(docs[index].clone());
+            }
+            if dispatch.requested_revision == expected
+                && dispatch.side_thread_id == source.thread_id
+                && dispatch.main_thread_id == main_thread_id
+            {
+                return Err(Error::Invalid(format!(
+                    "ticket {id} dispatch was concurrently bound to MAIN turn {}; newly started turn {main_turn_id} is not bound",
+                    dispatch.main_turn_id
+                )));
+            }
+            return Err(Error::Stale {
+                expected,
+                current: docs[index].ticket.revision,
+            });
+        }
+        if docs[index].ticket.revision != expected {
+            return Err(Error::Stale {
+                expected,
+                current: docs[index].ticket.revision,
+            });
+        }
+        if docs[index].ticket.status != Status::Approved {
+            return Err(Error::Invalid(format!(
+                "ticket {id} must be Approved before implementation dispatch; current status is {}",
+                docs[index].ticket.status.label()
+            )));
+        }
+        if docs.iter().any(|document| {
+            document
+                .ticket
+                .implementation_dispatch
+                .as_ref()
+                .is_some_and(|dispatch| {
+                    dispatch.main_thread_id == main_thread_id
+                        && dispatch.main_turn_id == main_turn_id
+                })
+        }) {
+            return Err(Error::Invalid(format!(
+                "MAIN turn {main_turn_id} is already bound to another ticket"
+            )));
+        }
+        let now = Utc::now();
+        docs[index].ticket.status = Status::InProgress;
+        docs[index].ticket.implementation_dispatch = Some(ImplementationDispatch {
+            requested_revision: expected,
+            side_thread_id: source.thread_id.clone(),
+            side_turn_id: source.turn_id.clone(),
+            main_thread_id: main_thread_id.clone(),
+            main_turn_id: main_turn_id.clone(),
+            dispatched_at: now,
+            ready_at: None,
+            ready_turn_id: None,
+            side_notified_at: None,
+            side_notification_turn_id: None,
+        });
+        bump(
+            &mut docs[index],
+            &source,
+            "implementation_dispatched",
+            &format!("implementation dispatched to MAIN {main_thread_id} turn {main_turn_id}"),
+        )?;
+        let document = docs[index].clone();
+        self.transactional_replace(std::slice::from_ref(&document))?;
+        Ok(document)
+    }
+
+    pub(crate) fn report_implementation_ready(
+        &self,
+        main_thread_id: &str,
+        main_turn_id: &str,
+    ) -> Result<ReadyForReview> {
+        self.ensure_root()?;
+        let _lock = Lock::acquire(&self.root)?;
+        self.ensure_identity_locked()?;
+        self.identity()?;
+        self.recover_locked()?;
+        let mut docs = self.all()?;
+        let matches = docs
+            .iter()
+            .enumerate()
+            .filter_map(|(index, document)| {
+                document
+                    .ticket
+                    .implementation_dispatch
+                    .as_ref()
+                    .filter(|dispatch| {
+                        dispatch.main_thread_id == main_thread_id
+                            && dispatch.main_turn_id == main_turn_id
+                    })
+                    .map(|_| index)
+            })
+            .collect::<Vec<_>>();
+        let [index] = matches.as_slice() else {
+            return Err(Error::Invalid(if matches.is_empty() {
+                format!(
+                    "MAIN thread {main_thread_id} turn {main_turn_id} is not bound to a ticket dispatch"
+                )
+            } else {
+                format!(
+                    "MAIN thread {main_thread_id} turn {main_turn_id} has multiple ticket bindings"
+                )
+            }));
+        };
+        let index = *index;
+        let Some(dispatch) = docs[index].ticket.implementation_dispatch.as_ref() else {
+            return Err(Error::Invalid(
+                "matched ticket is missing its implementation dispatch binding".into(),
+            ));
+        };
+        let side_thread_id = dispatch.side_thread_id.clone();
+        if docs[index].ticket.status == Status::AwaitingReview
+            && dispatch.ready_turn_id.as_deref() == Some(main_turn_id)
+        {
+            return Ok(ReadyForReview {
+                document: docs[index].clone(),
+                side_thread_id,
+                transitioned: false,
+                notification_required: dispatch.side_notification_turn_id.is_none(),
+            });
+        }
+        if docs[index].ticket.status != Status::InProgress {
+            return Err(Error::Invalid(format!(
+                "ticket {} cannot be reported ready from status {}",
+                docs[index].ticket.id,
+                docs[index].ticket.status.label()
+            )));
+        }
+        let now = Utc::now();
+        let Some(dispatch) = docs[index].ticket.implementation_dispatch.as_mut() else {
+            return Err(Error::Invalid(
+                "matched ticket is missing its implementation dispatch binding".into(),
+            ));
+        };
+        dispatch.ready_at = Some(now);
+        dispatch.ready_turn_id = Some(main_turn_id.to_string());
+        docs[index].ticket.status = Status::AwaitingReview;
+        let source = Source {
+            thread_id: main_thread_id.to_string(),
+            role: ActorRole::Main,
+            turn_id: main_turn_id.to_string(),
+        };
+        bump(
+            &mut docs[index],
+            &source,
+            "implementation_ready",
+            "bound MAIN reported successful implementation and verification",
+        )?;
+        let document = docs[index].clone();
+        self.transactional_replace(std::slice::from_ref(&document))?;
+        Ok(ReadyForReview {
+            document,
+            side_thread_id,
+            transitioned: true,
+            notification_required: true,
+        })
+    }
+
+    pub(crate) fn implementation_dispatch_for_turn(
+        &self,
+        main_thread_id: &str,
+        main_turn_id: &str,
+    ) -> Result<(Document, ImplementationDispatch)> {
+        let _lock = Lock::acquire(&self.root)?;
+        self.identity()?;
+        self.recover_locked()?;
+        let mut matches = self.all()?.into_iter().filter_map(|document| {
+            let dispatch = document.ticket.implementation_dispatch.clone()?;
+            (dispatch.main_thread_id == main_thread_id && dispatch.main_turn_id == main_turn_id)
+                .then_some((document, dispatch))
+        });
+        let Some(binding) = matches.next() else {
+            return Err(Error::Invalid(format!(
+                "MAIN thread {main_thread_id} turn {main_turn_id} is not bound to a ticket dispatch"
+            )));
+        };
+        if matches.next().is_some() {
+            return Err(Error::Invalid(format!(
+                "MAIN thread {main_thread_id} turn {main_turn_id} has multiple ticket bindings"
+            )));
+        }
+        Ok(binding)
+    }
+
+    pub(crate) fn record_ready_notification(
+        &self,
+        main_thread_id: &str,
+        main_turn_id: &str,
+        side_notification_turn_id: &str,
+    ) -> Result<Document> {
+        if side_notification_turn_id.trim().is_empty() {
+            return Err(Error::Invalid(
+                "SIDE notification requires a non-empty turn id".into(),
+            ));
+        }
+        self.ensure_root()?;
+        let _lock = Lock::acquire(&self.root)?;
+        self.ensure_identity_locked()?;
+        self.identity()?;
+        self.recover_locked()?;
+        let mut docs = self.all()?;
+        let matches = docs
+            .iter()
+            .enumerate()
+            .filter_map(|(index, document)| {
+                document
+                    .ticket
+                    .implementation_dispatch
+                    .as_ref()
+                    .filter(|dispatch| {
+                        dispatch.main_thread_id == main_thread_id
+                            && dispatch.main_turn_id == main_turn_id
+                    })
+                    .map(|_| index)
+            })
+            .collect::<Vec<_>>();
+        let [index] = matches.as_slice() else {
+            return Err(Error::Invalid(if matches.is_empty() {
+                format!(
+                    "MAIN thread {main_thread_id} turn {main_turn_id} is not bound to a ticket dispatch"
+                )
+            } else {
+                format!(
+                    "MAIN thread {main_thread_id} turn {main_turn_id} has multiple ticket bindings"
+                )
+            }));
+        };
+        let index = *index;
+        if docs[index].ticket.status != Status::AwaitingReview {
+            return Err(Error::Invalid(format!(
+                "ticket {} is not Awaiting Review",
+                docs[index].ticket.id
+            )));
+        }
+        let Some(dispatch) = docs[index].ticket.implementation_dispatch.as_mut() else {
+            return Err(Error::Invalid(
+                "matched ticket is missing its implementation dispatch binding".into(),
+            ));
+        };
+        if dispatch.ready_turn_id.as_deref() != Some(main_turn_id) {
+            return Err(Error::Invalid(
+                "ticket ready provenance does not match the reporting MAIN turn".into(),
+            ));
+        }
+        if dispatch.side_notification_turn_id.is_some() {
+            return Ok(docs[index].clone());
+        }
+        dispatch.side_notified_at = Some(Utc::now());
+        dispatch.side_notification_turn_id = Some(side_notification_turn_id.to_string());
+        let document = docs[index].clone();
+        self.transactional_replace(std::slice::from_ref(&document))?;
+        Ok(document)
     }
     fn ensure_root(&self) -> Result<()> {
         no_symlink_ancestors(&self.lab, &self.root)?;
@@ -1070,6 +1449,27 @@ fn valid_ticket(t: &Ticket) -> Result<()> {
     }
     if t.history.len() > 2048 {
         return Err(Error::Invalid("history too large".into()));
+    }
+    if let Some(dispatch) = &t.implementation_dispatch {
+        if dispatch.requested_revision == 0
+            || [
+                &dispatch.side_thread_id,
+                &dispatch.side_turn_id,
+                &dispatch.main_thread_id,
+                &dispatch.main_turn_id,
+            ]
+            .into_iter()
+            .any(|value| {
+                value.trim().is_empty() || value.len() > 256 || value.chars().any(char::is_control)
+            })
+            || dispatch.ready_at.is_some() != dispatch.ready_turn_id.is_some()
+            || dispatch.side_notified_at.is_some() != dispatch.side_notification_turn_id.is_some()
+            || dispatch.side_notified_at.is_some() && dispatch.ready_at.is_none()
+        {
+            return Err(Error::Invalid(
+                "invalid implementation dispatch binding".into(),
+            ));
+        }
     }
     Ok(())
 }
@@ -1685,6 +2085,160 @@ mod tests {
                 .update(1, revision, source, Update::default())
                 .is_err()
         );
+    }
+
+    #[test]
+    fn implementation_dispatch_and_ready_report_are_exact_idempotent_and_restart_safe() {
+        let d = lab();
+        let store = TicketStore::test(d.path());
+        let created = store
+            .create(input("implement exact ticket", vec![]))
+            .unwrap();
+        assert!(matches!(
+            store.check_implementation_dispatch(
+                created.ticket.id,
+                created.ticket.revision,
+                "side",
+                "main"
+            ),
+            Err(Error::Invalid(_))
+        ));
+        let approved = store
+            .update(
+                created.ticket.id,
+                created.ticket.revision,
+                created.ticket.source.clone(),
+                Update {
+                    transition: Some(Transition {
+                        to: Status::Approved,
+                        reason: "explicit approval".into(),
+                    }),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            store.check_implementation_dispatch(
+                approved.ticket.id,
+                approved.ticket.revision - 1,
+                "side",
+                "main"
+            ),
+            Err(Error::Stale { .. })
+        ));
+        assert!(matches!(
+            store
+                .check_implementation_dispatch(
+                    approved.ticket.id,
+                    approved.ticket.revision,
+                    "side",
+                    "main"
+                )
+                .unwrap(),
+            DispatchCheck::Ready
+        ));
+
+        let dispatched = store
+            .accept_implementation_dispatch(
+                approved.ticket.id,
+                approved.ticket.revision,
+                Source {
+                    thread_id: "side".into(),
+                    role: ActorRole::Side,
+                    turn_id: "side-dispatch-turn".into(),
+                },
+                "main".into(),
+                "main-implementation-turn".into(),
+            )
+            .unwrap();
+        assert_eq!(dispatched.ticket.status, Status::InProgress);
+        let retry = store
+            .check_implementation_dispatch(
+                approved.ticket.id,
+                approved.ticket.revision,
+                "side",
+                "main",
+            )
+            .unwrap();
+        let DispatchCheck::AlreadyAccepted(retry) = retry else {
+            panic!("exact dispatch retry was not idempotent");
+        };
+        assert_eq!(retry.ticket.revision, dispatched.ticket.revision);
+        let accepted_retry = store
+            .accept_implementation_dispatch(
+                approved.ticket.id,
+                approved.ticket.revision,
+                Source {
+                    thread_id: "side".into(),
+                    role: ActorRole::Side,
+                    turn_id: "side-dispatch-turn".into(),
+                },
+                "main".into(),
+                "main-implementation-turn".into(),
+            )
+            .unwrap();
+        assert_eq!(accepted_retry.ticket.revision, dispatched.ticket.revision);
+        assert!(
+            store
+                .accept_implementation_dispatch(
+                    approved.ticket.id,
+                    approved.ticket.revision,
+                    Source {
+                        thread_id: "side".into(),
+                        role: ActorRole::Side,
+                        turn_id: "concurrent-side-turn".into(),
+                    },
+                    "main".into(),
+                    "unbound-concurrent-turn".into(),
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .report_implementation_ready("other-main", "main-implementation-turn")
+                .is_err()
+        );
+        assert!(
+            store
+                .report_implementation_ready("main", "other-turn")
+                .is_err()
+        );
+        assert_eq!(
+            store.read(approved.ticket.id).unwrap().ticket.status,
+            Status::InProgress
+        );
+
+        let ready = store
+            .report_implementation_ready("main", "main-implementation-turn")
+            .unwrap();
+        assert!(ready.transitioned);
+        assert!(ready.notification_required);
+        assert_eq!(ready.document.ticket.status, Status::AwaitingReview);
+        let duplicate = store
+            .report_implementation_ready("main", "main-implementation-turn")
+            .unwrap();
+        assert!(!duplicate.transitioned);
+        assert!(duplicate.notification_required);
+        let notified = store
+            .record_ready_notification("main", "main-implementation-turn", "side-notification-turn")
+            .unwrap();
+        let dispatch = notified.ticket.implementation_dispatch.unwrap();
+        assert_eq!(
+            dispatch.side_notification_turn_id.as_deref(),
+            Some("side-notification-turn")
+        );
+
+        let reopened = TicketStore::test(d.path());
+        let duplicate = reopened
+            .report_implementation_ready("main", "main-implementation-turn")
+            .unwrap();
+        assert!(!duplicate.transitioned);
+        assert!(!duplicate.notification_required);
+        let (document, dispatch) = reopened
+            .implementation_dispatch_for_turn("main", "main-implementation-turn")
+            .unwrap();
+        assert_eq!(document.ticket.status, Status::AwaitingReview);
+        assert_eq!(dispatch.side_thread_id, "side");
     }
 
     #[test]

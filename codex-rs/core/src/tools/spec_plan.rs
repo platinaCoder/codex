@@ -102,6 +102,7 @@ use tracing::instrument;
 
 const IMAGE_GEN_NAMESPACE: &str = "image_gen";
 const IMAGEGEN_TOOL_NAME: &str = "imagegen";
+const TICKET_DISPATCH_METADATA_KEY: &str = "ai_lab_ticket_dispatch";
 
 #[derive(Clone, Copy)]
 struct CoreToolPlanContext<'a> {
@@ -591,18 +592,34 @@ fn enforce_ticket_ownership(turn_context: &TurnContext, registry: &mut ToolRegis
     if is_paired_side_turn(turn_context) {
         return;
     }
-    let mutations = registry
+    let report_is_bound = turn_context
+        .turn_metadata_state
+        .responsesapi_client_metadata_value(TICKET_DISPATCH_METADATA_KEY)
+        .is_some_and(|binding| {
+            let mut parts = binding.split(':');
+            parts.next() == Some("v1")
+                && parts
+                    .next()
+                    .is_some_and(|id| id.parse::<u64>().is_ok_and(|id| id > 0))
+                && parts
+                    .next()
+                    .is_some_and(|revision| revision.parse::<u64>().is_ok_and(|value| value > 0))
+                && parts.next().is_none()
+        });
+    let forbidden = registry
         .entries()
         .filter_map(|tool| {
             let name = tool.runtime.tool_name().with_default_namespace();
             let from_tui = name.namespace.as_deref() == Some("codex_tui")
                 || tool.runtime.mcp_server_name() == Some("codex_tui");
-            (from_tui && matches!(name.name.as_str(), "create_ticket" | "update_ticket"))
+            (from_tui
+                && (matches!(name.name.as_str(), "create_ticket" | "update_ticket")
+                    || (name.name == "report_ticket_ready" && !report_is_bound)))
                 .then(|| tool.runtime.tool_name())
         })
         .collect::<Vec<_>>();
-    for mutation in mutations {
-        registry.remove(&mutation);
+    for tool in forbidden {
+        registry.remove(&tool);
     }
 }
 

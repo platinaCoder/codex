@@ -1139,6 +1139,7 @@ async fn strict_side_keeps_reads_main_bridge_and_bounded_ticket_mutations() {
                 dynamic_tool(Some("codex_tui"), "read_ticket", false),
                 dynamic_tool(Some("codex_tui"), "create_ticket", false),
                 dynamic_tool(Some("codex_tui"), "update_ticket", false),
+                dynamic_tool(Some("codex_tui"), "report_ticket_ready", false),
                 dynamic_tool(
                     Some("codex_tui"),
                     "create_thread",
@@ -1172,6 +1173,7 @@ async fn strict_side_keeps_reads_main_bridge_and_bounded_ticket_mutations() {
         &ToolName::namespaced("codex_tui", "send_message_to_thread").to_string(),
         &ToolName::namespaced("codex_tui", "create_thread").to_string(),
         &ToolName::namespaced("codex_tui", "set_thread_title").to_string(),
+        &ToolName::namespaced("codex_tui", "report_ticket_ready").to_string(),
     ]);
     assert!(!plan.can_manage_children);
 }
@@ -1186,6 +1188,7 @@ async fn main_catalog_keeps_ticket_reads_but_removes_mutations() {
                 "read_ticket",
                 "create_ticket",
                 "update_ticket",
+                "report_ticket_ready",
             ]
             .into_iter()
             .map(|name| dynamic_tool(Some("codex_tui"), name, false))
@@ -1202,6 +1205,38 @@ async fn main_catalog_keeps_ticket_reads_but_removes_mutations() {
     plan.assert_registered_lacks(&[
         &ToolName::namespaced("codex_tui", "create_ticket").to_string(),
         &ToolName::namespaced("codex_tui", "update_ticket").to_string(),
+        &ToolName::namespaced("codex_tui", "report_ticket_ready").to_string(),
+    ]);
+}
+
+#[tokio::test]
+async fn report_ticket_ready_is_visible_only_on_a_bound_main_turn() {
+    let plan = probe_with(
+        |turn| {
+            turn.turn_metadata_state
+                .update_responsesapi_client_metadata(
+                    codex_protocol::turn_input::ResponsesApiClientMetadataUpdate {
+                        replacement: None,
+                        patch: Some(std::collections::HashMap::from([(
+                            super::TICKET_DISPATCH_METADATA_KEY.to_string(),
+                            "v1:7:3".to_string(),
+                        )])),
+                    },
+                );
+        },
+        ToolPlanInputs {
+            dynamic_tools: vec![dynamic_tool(
+                Some("codex_tui"),
+                "report_ticket_ready",
+                false,
+            )],
+            ..ToolPlanInputs::default()
+        },
+    )
+    .await;
+
+    plan.assert_registered_contains(&[
+        &ToolName::namespaced("codex_tui", "report_ticket_ready").to_string()
     ]);
 }
 
