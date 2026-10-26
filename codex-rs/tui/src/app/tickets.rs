@@ -22,6 +22,22 @@ pub(super) struct TicketUiState {
     tickets: Vec<Summary>,
     last_refresh: Option<Instant>,
     error: Option<String>,
+    modal: Option<TicketModalState>,
+}
+
+#[derive(Clone)]
+struct TicketModalState {
+    id: u64,
+    revision: u64,
+    status: Status,
+    role: ActorRole,
+    review_required: bool,
+}
+
+enum ModalKeyResult {
+    Ignored,
+    Consumed,
+    Compose(String),
 }
 
 enum KeyResult {
@@ -111,6 +127,42 @@ impl TicketUiState {
         KeyResult::Consumed
     }
 
+    fn modal_key(&mut self, key: KeyEvent) -> ModalKeyResult {
+        if key.kind != KeyEventKind::Press {
+            return ModalKeyResult::Ignored;
+        }
+        let Some(modal) = self.modal.as_ref() else {
+            return ModalKeyResult::Ignored;
+        };
+        if key.code == KeyCode::Esc || matches!(key.code, KeyCode::Char('q' | 'Q')) {
+            self.modal = None;
+            return ModalKeyResult::Ignored;
+        }
+        let KeyCode::Char(key) = key.code else {
+            return ModalKeyResult::Ignored;
+        };
+        let Some(update) = modal_action(modal, key.to_ascii_lowercase()) else {
+            return if matches!(
+                key.to_ascii_lowercase(),
+                'a' | 'b' | 'c' | 'p' | 'r' | 's' | 'v'
+            ) {
+                ModalKeyResult::Consumed
+            } else {
+                ModalKeyResult::Ignored
+            };
+        };
+        let prompt = format!(
+            "Call codex_tui.update_ticket exactly once with ticketId {}, expectedRevision {}, and {update}. Set its required reason to exactly the text after `Reason:`. Do not implement the ticket contents. Reason: ",
+            modal.id, modal.revision
+        );
+        self.modal = None;
+        ModalKeyResult::Compose(prompt)
+    }
+
+    pub(super) fn dismiss_modal(&mut self) {
+        self.modal = None;
+    }
+
     pub(super) fn render(&self, area: Rect, buffer: &mut Buffer) {
         if area.height == 0 {
             return;
@@ -193,6 +245,18 @@ impl TicketUiState {
 }
 
 impl App {
+    pub(crate) fn ticket_modal_key(&mut self, key: KeyEvent) -> Option<Option<String>> {
+        match self.ticket_ui.modal_key(key) {
+            ModalKeyResult::Ignored => None,
+            ModalKeyResult::Consumed => Some(None),
+            ModalKeyResult::Compose(prompt) => Some(Some(prompt)),
+        }
+    }
+
+    pub(crate) fn dismiss_ticket_modal(&mut self) {
+        self.ticket_ui.dismiss_modal();
+    }
+
     pub(super) fn refresh_ticket_strip(&mut self) {
         self.ticket_ui.refresh(&self.config.workspace_roots, false);
     }
@@ -223,7 +287,16 @@ impl App {
                 let document = TicketStore::from_workspace_roots(&self.config.workspace_roots)
                     .and_then(|store| store.read(id));
                 let lines = match document {
-                    Ok(document) => modal_lines(&document, role),
+                    Ok(document) => {
+                        self.ticket_ui.modal = Some(TicketModalState {
+                            id,
+                            revision: document.ticket.revision,
+                            status: document.ticket.status.clone(),
+                            role,
+                            review_required: document.ticket.review_required,
+                        });
+                        modal_lines(&document, role)
+                    }
                     Err(error) => vec![Line::from(format!("Unable to read ticket: {error}"))],
                 };
                 let _ = tui.enter_alt_screen();
@@ -292,24 +365,54 @@ fn modal_lines(document: &Document, role: ActorRole) -> Vec<Line<'static>> {
         lines.push(Line::default());
     }
     lines.push(Line::from("Valid actions").bold());
-    lines.push(Line::from(actions(&ticket.status, role)));
+    lines.push(Line::from(actions(
+        &ticket.status,
+        role,
+        ticket.review_required,
+    )));
     lines.push(Line::from("Actions require an explicit user request and approved ticket tool call; approval never authorizes implementation."));
     lines
 }
 
-fn actions(status: &Status, role: ActorRole) -> String {
+fn actions(status: &Status, role: ActorRole, review_required: bool) -> String {
     if role == ActorRole::Side {
-        return "Append finding; edit proposal metadata. SIDE cannot transition lifecycle state."
-            .into();
+        return "No lifecycle controls. SIDE may request proposal/finding edits through approved ticket tool calls in chat.".into();
     }
-    match status {
-        Status::Proposed => "Approve; Cancel".into(),
-        Status::Approved => "Start implementation; Cancel".into(),
-        Status::InProgress => "Mark Awaiting Review; Cancel".into(),
-        Status::AwaitingReview => "Return to In Progress; Accept; Cancel".into(),
-        Status::Accepted | Status::Cancelled => {
-            "No mutations: terminal. Create a linked successor ticket.".into()
-        }
+    let mut actions = match status {
+        Status::Proposed => vec!["[p] Approve", "[c] Cancel"],
+        Status::Approved => vec!["[s] Start implementation", "[c] Cancel"],
+        Status::InProgress => vec!["[r] Mark Awaiting Review", "[c] Cancel"],
+        Status::AwaitingReview => vec!["[b] Return to In Progress", "[a] Accept", "[c] Cancel"],
+        Status::Accepted | Status::Cancelled => Vec::new(),
+    };
+    if review_required && *status != Status::Cancelled {
+        actions.push("[v] Resolve dependency review");
+    }
+    if actions.is_empty() {
+        "No available actions. Terminal tickets require a linked successor.".into()
+    } else {
+        actions.join(" · ")
+    }
+}
+
+fn modal_action(modal: &TicketModalState, key: char) -> Option<&'static str> {
+    if modal.role != ActorRole::Main {
+        return None;
+    }
+    if key == 'v' && modal.review_required && modal.status != Status::Cancelled {
+        return Some("resolveReview.reason set from the text below");
+    }
+    match (&modal.status, key) {
+        (Status::Proposed, 'p') => Some("transition.to = `approved`"),
+        (
+            Status::Proposed | Status::Approved | Status::InProgress | Status::AwaitingReview,
+            'c',
+        ) => Some("transition.to = `cancelled`"),
+        (Status::Approved, 's') => Some("transition.to = `in_progress`"),
+        (Status::InProgress, 'r') => Some("transition.to = `awaiting_review`"),
+        (Status::AwaitingReview, 'b') => Some("transition.to = `in_progress`"),
+        (Status::AwaitingReview, 'a') => Some("transition.to = `accepted`"),
+        _ => None,
     }
 }
 
@@ -355,8 +458,96 @@ mod tests {
     }
     #[test]
     fn actor_actions_are_bounded() {
-        assert!(!actions(&Status::Proposed, ActorRole::Side).contains("Approve;"));
-        assert!(actions(&Status::AwaitingReview, ActorRole::Main).contains("Accept"));
-        assert!(actions(&Status::Accepted, ActorRole::Main).contains("terminal"));
+        assert!(!actions(&Status::Proposed, ActorRole::Side, false).contains("Approve"));
+        assert!(actions(&Status::AwaitingReview, ActorRole::Main, false).contains("Accept"));
+        assert!(actions(&Status::Accepted, ActorRole::Main, false).contains("Terminal"));
+    }
+
+    #[test]
+    fn modal_keys_are_actor_status_and_revision_bounded() {
+        let mut state = TicketUiState {
+            modal: Some(TicketModalState {
+                id: 7,
+                revision: 3,
+                status: Status::AwaitingReview,
+                role: ActorRole::Main,
+                review_required: true,
+            }),
+            ..Default::default()
+        };
+        assert!(matches!(
+            state.modal_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE)),
+            ModalKeyResult::Consumed
+        ));
+        let ModalKeyResult::Compose(prompt) =
+            state.modal_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))
+        else {
+            panic!("accept should open a reason draft")
+        };
+        assert!(prompt.contains("ticketId 7"));
+        assert!(prompt.contains("expectedRevision 3"));
+        assert!(prompt.contains("accepted"));
+
+        state.modal = Some(TicketModalState {
+            id: 7,
+            revision: 3,
+            status: Status::AwaitingReview,
+            role: ActorRole::Side,
+            review_required: true,
+        });
+        assert!(matches!(
+            state.modal_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+            ModalKeyResult::Consumed
+        ));
+        assert!(state.modal.is_some());
+    }
+
+    #[test]
+    fn forced_refresh_observes_an_approved_tool_style_update() {
+        let lab = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(lab.path().join("runtime")).unwrap();
+        std::fs::write(lab.path().join("runtime/codex-upstream.toml"), "url='test'").unwrap();
+        std::fs::create_dir(lab.path().join(".git")).unwrap();
+        let root = AbsolutePathBuf::try_from(lab.path().to_path_buf()).unwrap();
+        let roots = vec![root];
+        let store = TicketStore::from_workspace_roots(&roots).unwrap();
+        let created = store
+            .create(crate::ticket_store::Create {
+                title: "before refresh".into(),
+                scope: vec!["runtime".into()],
+                source: crate::ticket_store::Source {
+                    thread_id: "main".into(),
+                    role: ActorRole::Main,
+                    turn_id: "turn".into(),
+                },
+                dependencies: vec![],
+                relevant_revisions: vec![],
+                proposal: crate::ticket_store::Proposal {
+                    original_idea: "refresh test".into(),
+                    ..Default::default()
+                },
+            })
+            .unwrap();
+        let mut state = TicketUiState::default();
+        state.refresh(&roots, true);
+        assert_eq!(state.tickets[0].title, "before refresh");
+
+        store
+            .update(
+                created.ticket.id,
+                created.ticket.revision,
+                created.ticket.source,
+                crate::ticket_store::Update {
+                    patch: crate::ticket_store::Patch {
+                        title: Some("after refresh".into()),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        state.refresh(&roots, true);
+        assert_eq!(state.tickets[0].title, "after refresh");
+        assert_eq!(state.tickets[0].revision, 2);
     }
 }

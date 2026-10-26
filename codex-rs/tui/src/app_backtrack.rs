@@ -99,8 +99,24 @@ impl App {
         app_server: &mut AppServerSession,
         event: TuiEvent,
     ) -> Result<bool> {
+        if let TuiEvent::Key(key) = &event {
+            match self.ticket_modal_key(*key) {
+                None => {}
+                Some(None) => return Ok(true),
+                Some(Some(prompt)) => {
+                    self.close_transcript_overlay(tui);
+                    self.chat_widget
+                        .restore_user_message_to_composer(UserMessage::from(prompt));
+                    tui.frame_requester().schedule_frame();
+                    return Ok(true);
+                }
+            }
+        }
         if !matches!(self.overlay, Some(Overlay::Transcript(_))) {
             self.overlay_forward_event(tui, event)?;
+            if self.overlay.is_none() {
+                self.dismiss_ticket_modal();
+            }
             return Ok(true);
         }
         self.handle_legacy_transcript_event(tui, app_server, event)

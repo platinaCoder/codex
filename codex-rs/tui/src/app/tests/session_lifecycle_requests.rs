@@ -1587,6 +1587,9 @@ async fn local_daemon_registers_approval_gated_mcp_tools_for_both_start_paths_sc
         for tool in crate::dynamic_tools::DELEGATION_TOOLS {
             assert_eq!(server["tools"][tool]["approval_mode"], "prompt");
         }
+        for tool in ["create_ticket", "update_ticket"] {
+            assert_eq!(server["tools"][tool]["approval_mode"], "prompt");
+        }
     }
 
     let mcp_url = starts[0]["config"]["mcp_servers.codex_tui"]["url"]
