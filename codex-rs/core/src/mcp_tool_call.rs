@@ -127,6 +127,12 @@ const MCP_RESULT_TELEMETRY_SERVER_USER_FLOW_SPAN_ATTR: &str =
     "codex.mcp.server_user_flow.triggered";
 const MCP_RESULT_TELEMETRY_TARGET_ID_MAX_CHARS: usize = 256;
 const MCP_TOOL_CALL_EVENT_RESULT_MAX_BYTES: usize = DEFAULT_OUTPUT_BYTES_CAP;
+const TUI_DYNAMIC_TOOLS_SERVER: &str = "codex_tui";
+const TUI_SEND_MESSAGE_TO_MAIN_TOOL: &str = "send_message_to_main";
+
+fn is_tui_send_message_to_main(server: &str, tool_name: &str) -> bool {
+    server == TUI_DYNAMIC_TOOLS_SERVER && tool_name == TUI_SEND_MESSAGE_TO_MAIN_TOOL
+}
 
 /// Handles the specified tool call and dispatches the appropriate MCP tool-call
 /// item lifecycle events to the `Session`.
@@ -1521,6 +1527,8 @@ async fn maybe_request_mcp_tool_approval(
 ) -> Option<McpToolApproval> {
     let turn_context = &step_context.turn;
     let strict_auto_review = turn_context.strict_auto_review_enabled();
+    let requires_explicit_user_approval =
+        is_tui_send_message_to_main(&invocation.server, &invocation.tool);
     let approvals_reviewer = connectors::mcp_approvals_reviewer_from_layers(
         &config.config_layer_stack,
         step_context
@@ -1533,6 +1541,7 @@ async fn maybe_request_mcp_tool_approval(
         metadata.link_id.as_deref(),
     );
     if !strict_auto_review
+        && !requires_explicit_user_approval
         && mcp_permission_prompt_is_auto_approved(
             config.approval_policy.value(),
             permission_profile,
@@ -1545,7 +1554,10 @@ async fn maybe_request_mcp_tool_approval(
     }
 
     let annotations = metadata.annotations.as_ref();
-    if !strict_auto_review && !requires_mcp_tool_approval_for_mode(annotations, policy.mode) {
+    if !strict_auto_review
+        && !requires_explicit_user_approval
+        && !requires_mcp_tool_approval_for_mode(annotations, policy.mode)
+    {
         return None;
     }
 
@@ -1557,6 +1569,7 @@ async fn maybe_request_mcp_tool_approval(
         None
     };
     if !strict_auto_review
+        && !requires_explicit_user_approval
         && let Some(key) = session_approval_key.as_ref()
         && mcp_tool_approval_is_remembered(sess, key).await
     {
@@ -1645,7 +1658,8 @@ pub(crate) async fn request_mcp_tool_user_approval(
         unreachable!("only MCP actions can request MCP tool approval");
     };
 
-    if *approval_policy == AskForApproval::Never {
+    if *approval_policy == AskForApproval::Never && !is_tui_send_message_to_main(server, tool_name)
+    {
         return ApprovalResolution {
             decision: ReviewDecision::denied(
                 "MCP tool call requires approval, but approval policy is never",

@@ -3478,6 +3478,142 @@ async fn prompt_mode_waits_for_approval_when_annotations_do_not_require_approval
 }
 
 #[tokio::test]
+async fn side_send_to_main_prompts_when_global_approval_policy_is_never() {
+    let (session, mut turn_context, rx_event) = make_session_and_context_with_rx().await;
+    let mutable_turn_context =
+        Arc::get_mut(&mut turn_context).expect("single turn context reference");
+    Arc::make_mut(&mut mutable_turn_context.config)
+        .permissions
+        .approval_policy
+        .set(AskForApproval::Never)
+        .expect("test setup should allow updating approval policy");
+    Arc::make_mut(&mut mutable_turn_context.config)
+        .permissions
+        .set_permission_profile(PermissionProfile::Disabled)
+        .expect("test setup should allow updating permission profile");
+    *session.active_turn.lock().await = Some(ActiveTurn::default());
+
+    let invocation = McpInvocation {
+        server: TUI_DYNAMIC_TOOLS_SERVER.to_string(),
+        tool: TUI_SEND_MESSAGE_TO_MAIN_TOOL.to_string(),
+        arguments: Some(serde_json::json!({"prompt": "Review this result"})),
+    };
+    let approval_task = tokio::spawn({
+        let session = Arc::clone(&session);
+        let turn_context = Arc::clone(&turn_context);
+        let invocation = invocation.clone();
+        async move {
+            maybe_request_mcp_tool_approval(
+                &session,
+                &StepContext::for_test(Arc::clone(&turn_context)),
+                &CancellationToken::new(),
+                "call-side-to-main",
+                &invocation,
+                &ToolName::namespaced(&invocation.server, &invocation.tool),
+                &HookToolName::new("mcp__codex_tui__send_message_to_main"),
+                &approval_metadata(
+                    /*connector_id*/ None,
+                    /*connector_name*/ None,
+                    /*connector_description*/ None,
+                    Some("Send message to MAIN"),
+                    /*tool_description*/ None,
+                ),
+                &approval_config(&turn_context),
+                turn_context.config.permissions.permission_profile(),
+                test_environment_id(&turn_context),
+                McpToolApprovalPolicy::for_server(AppToolApproval::Prompt),
+            )
+            .await
+        }
+    });
+
+    let request = loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), rx_event.recv())
+            .await
+            .expect("SIDE to MAIN approval elicitation timed out")
+            .expect("expected SIDE to MAIN approval elicitation event");
+        if let EventMsg::ElicitationRequest(request) = event.msg {
+            break request;
+        }
+    };
+    assert_eq!(request.server_name, TUI_DYNAMIC_TOOLS_SERVER);
+    session
+        .resolve_elicitation(
+            TUI_DYNAMIC_TOOLS_SERVER.to_string(),
+            rmcp::model::RequestId::String("mcp_tool_call_approval_call-side-to-main".into()),
+            ElicitationResponse {
+                action: ElicitationAction::Accept,
+                content: None,
+                meta: None,
+            },
+        )
+        .await
+        .expect("SIDE to MAIN approval elicitation should resolve");
+
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_secs(1), approval_task)
+            .await
+            .expect("SIDE to MAIN approval task timed out")
+            .expect("SIDE to MAIN approval task failed"),
+        Some(McpToolApproval {
+            decision: ReviewDecision::Approved,
+            source: Some(ApprovalResolutionSource::User),
+            cancellation_reason: None,
+        }),
+    );
+}
+
+#[tokio::test]
+async fn global_never_still_rejects_other_prompt_mcp_tools() {
+    let (session, mut turn_context) = make_session_and_context().await;
+    Arc::make_mut(&mut turn_context.config)
+        .permissions
+        .approval_policy
+        .set(AskForApproval::Never)
+        .expect("test setup should allow updating approval policy");
+    let session = Arc::new(session);
+    let turn_context = Arc::new(turn_context);
+    let invocation = McpInvocation {
+        server: "custom_server".to_string(),
+        tool: "write_record".to_string(),
+        arguments: Some(serde_json::json!({"value": 42})),
+    };
+
+    let decision = maybe_request_mcp_tool_approval(
+        &session,
+        &StepContext::for_test(Arc::clone(&turn_context)),
+        &CancellationToken::new(),
+        "call-other-prompt-tool",
+        &invocation,
+        &ToolName::namespaced(&invocation.server, &invocation.tool),
+        &HookToolName::new("mcp__custom_server__write_record"),
+        &approval_metadata(
+            /*connector_id*/ None,
+            /*connector_name*/ None,
+            /*connector_description*/ None,
+            Some("Write record"),
+            /*tool_description*/ None,
+        ),
+        &approval_config(&turn_context),
+        turn_context.config.permissions.permission_profile(),
+        test_environment_id(&turn_context),
+        McpToolApprovalPolicy::for_server(AppToolApproval::Prompt),
+    )
+    .await;
+
+    assert_eq!(
+        decision,
+        Some(McpToolApproval {
+            decision: ReviewDecision::denied(
+                "MCP tool call requires approval, but approval policy is never"
+            ),
+            source: Some(ApprovalResolutionSource::User),
+            cancellation_reason: None,
+        }),
+    );
+}
+
+#[tokio::test]
 async fn full_access_mode_skips_mcp_tool_approval_for_all_approval_modes() {
     let (session, mut turn_context) = make_session_and_context().await;
     Arc::make_mut(&mut turn_context.config)

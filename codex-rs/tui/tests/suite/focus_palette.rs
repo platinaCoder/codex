@@ -842,7 +842,7 @@ text(JSON.stringify({ catalogSafe: true, read }));
     std::fs::write(
         &config_path,
         format!(
-            "{config}\n[model_providers.side-smoke]\nname = \"SIDE smoke\"\nbase_url = \"{}/v1\"\nwire_api = \"responses\"\nrequires_openai_auth = false\nsupports_websockets = false\nrequest_max_retries = 0\nstream_max_retries = 0\n",
+            "approval_policy = \"never\"\n{config}\n[model_providers.side-smoke]\nname = \"SIDE smoke\"\nbase_url = \"{}/v1\"\nwire_api = \"responses\"\nrequires_openai_auth = false\nsupports_websockets = false\nrequest_max_retries = 0\nstream_max_retries = 0\n",
             model.uri()
         ),
     )?;
