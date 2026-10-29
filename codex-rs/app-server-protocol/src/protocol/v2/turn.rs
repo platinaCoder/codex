@@ -169,6 +169,11 @@ pub struct TurnToolOutput {
 #[ts(export_to = "v2/")]
 pub struct TurnStartParams {
     pub thread_id: String,
+    /// Optional stable identifier for an idempotent, start-only-if-idle turn.
+    /// Repeating the request with the same identifier returns the turn that was
+    /// already started instead of steering or starting a duplicate.
+    #[ts(optional = nullable)]
+    pub idempotency_key: Option<String>,
     /// Replace this thread's disabled plugin IDs.
     /// Omitted/null preserves the list; [] clears it.
     #[ts(optional = nullable)]

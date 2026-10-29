@@ -1023,6 +1023,139 @@ fn ticket_capabilities_are_exact_pathless_and_mcp_only() {
 }
 
 #[test]
+fn ticket_delivery_recovers_claim_before_turn_start_without_duplicates() -> color_eyre::Result<()> {
+    std::thread::Builder::new()
+        .name("ticket-claim-boundary-test".to_string())
+        .stack_size(32 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(ticket_claim_boundary_scenario())
+        })?
+        .join()
+        .map_err(|panic| color_eyre::eyre::eyre!("ticket boundary test panicked: {panic:?}"))?
+}
+
+async fn ticket_claim_boundary_scenario() -> color_eyre::Result<()> {
+    let lab = tempfile::tempdir()?;
+    std::fs::create_dir_all(lab.path().join("runtime"))?;
+    std::fs::write(lab.path().join("runtime/codex-upstream.toml"), "url='test'")?;
+    std::fs::create_dir(lab.path().join(".git"))?;
+    let codex_home = tempfile::tempdir()?;
+    let mut config = ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .build()
+        .await?;
+    config.cwd = codex_utils_absolute_path::AbsolutePathBuf::try_from(lab.path().to_path_buf())?;
+    let mut server = crate::start_embedded_app_server_for_picker(&config).await?;
+    let main = server
+        .start_thread(&config)
+        .await?
+        .session
+        .thread_id
+        .to_string();
+    server
+        .thread_inject_items(
+            ThreadId::from_string(&main)?,
+            vec![serde_json::from_value(json!({
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "materialized MAIN history"}]
+            }))?],
+        )
+        .await?;
+
+    let store = crate::ticket_store::TicketStore::test(lab.path());
+    let source = crate::ticket_store::Source {
+        thread_id: "side-claim-boundary".into(),
+        role: crate::ticket_store::ActorRole::Side,
+        turn_id: "side-claim-boundary-turn".into(),
+    };
+    let created = store.create(crate::ticket_store::Create {
+        title: "recover claim before TurnStart".into(),
+        scope: vec!["runtime".into()],
+        source: source.clone(),
+        dependencies: Vec::new(),
+        relevant_revisions: Vec::new(),
+        proposal: crate::ticket_store::Proposal {
+            original_idea: "retry the exact delivery boundary".into(),
+            ..crate::ticket_store::Proposal::default()
+        },
+    })?;
+    let pending = match store.implement(
+        created.ticket.id,
+        created.ticket.revision,
+        source,
+        main.clone(),
+        "persist and claim before TurnStart".into(),
+    )? {
+        crate::ticket_store::ImplementCheck::Pending(document) => document,
+        crate::ticket_store::ImplementCheck::Delivered(_) => unreachable!(),
+    };
+    let notification_id = pending
+        .ticket
+        .assignment
+        .as_ref()
+        .unwrap()
+        .notification_id
+        .clone();
+    let (_, first_attempt) =
+        store.begin_delivery_attempt(created.ticket.id, &notification_id, &main)?;
+    assert!(first_attempt);
+
+    let thread_start_params = ThreadStartParams {
+        runtime_workspace_roots: Some(vec![codex_utils_absolute_path::AbsolutePathBuf::try_from(
+            lab.path().to_path_buf(),
+        )?]),
+        ..ThreadStartParams::default()
+    };
+    let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+    let registration = tokio::spawn(async move {
+        let Some(crate::app_event::AppEvent::DynamicToolThreadStarted { registered, .. }) =
+            events_rx.recv().await
+        else {
+            panic!("expected recovered ticket turn registration");
+        };
+        let _ = registered.send(());
+    });
+    let recovered = retry_pending_ticket_notifications(
+        server.request_handle(),
+        thread_start_params.clone(),
+        Features::with_defaults(),
+        AppEventSender::new(events_tx),
+    )
+    .await
+    .map_err(|error| color_eyre::eyre::eyre!(error))?;
+    registration.await?;
+    assert_eq!(recovered, 1);
+    let delivered = store.read(created.ticket.id)?;
+    let assignment = delivered.ticket.assignment.unwrap();
+    assert_eq!(
+        assignment.delivery_state,
+        crate::ticket_store::DeliveryState::Delivered
+    );
+    assert_eq!(
+        assignment.delivered_main_turn_id.as_deref(),
+        Some(notification_id.as_str())
+    );
+
+    let (retry_tx, retry_rx) = tokio::sync::mpsc::unbounded_channel();
+    drop(retry_rx);
+    let retried = retry_pending_ticket_notifications(
+        server.request_handle(),
+        thread_start_params,
+        Features::with_defaults(),
+        AppEventSender::new(retry_tx),
+    )
+    .await
+    .map_err(|error| color_eyre::eyre::eyre!(error))?;
+    assert_eq!(retried, 0);
+    server.shutdown().await?;
+    Ok(())
+}
+
+#[test]
 fn ticket_handlers_reject_main_mutation_and_allow_side_lifecycle_management()
 -> color_eyre::Result<()> {
     std::thread::Builder::new()
@@ -1246,6 +1379,23 @@ async fn ticket_dispatch_flow_scenario() -> color_eyre::Result<()> {
         )
         .await;
 
+    let store = crate::ticket_store::TicketStore::test(lab.path());
+    let crash_main = server
+        .start_thread(&config)
+        .await?
+        .session
+        .thread_id
+        .to_string();
+    server
+        .thread_inject_items(
+            ThreadId::from_string(&crash_main)?,
+            vec![serde_json::from_value(json!({
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "materialized crash MAIN history"}]
+            }))?],
+        )
+        .await?;
     let crash_ticket = response_json(
         call_ticket_tool(
             &server,
@@ -1260,7 +1410,6 @@ async fn ticket_dispatch_flow_scenario() -> color_eyre::Result<()> {
         )
         .await,
     );
-    let store = crate::ticket_store::TicketStore::test(lab.path());
     let pending = match store.implement(
         2,
         crash_ticket["document"]["ticket"]["revision"]
@@ -1271,7 +1420,7 @@ async fn ticket_dispatch_flow_scenario() -> color_eyre::Result<()> {
             role: crate::ticket_store::ActorRole::Side,
             turn_id: "crash-window-side-turn".into(),
         },
-        main.clone(),
+        crash_main.clone(),
         "persist before external delivery".into(),
     )? {
         crate::ticket_store::ImplementCheck::Pending(document) => document,
@@ -1279,14 +1428,15 @@ async fn ticket_dispatch_flow_scenario() -> color_eyre::Result<()> {
     };
     let pending_assignment = pending.ticket.assignment.as_ref().unwrap();
     let (_, first_attempt) =
-        store.begin_delivery_attempt(2, &pending_assignment.notification_id, &main)?;
+        store.begin_delivery_attempt(2, &pending_assignment.notification_id, &crash_main)?;
     assert!(first_attempt);
     let started: TurnStartResponse = server
         .request_handle()
         .request_typed(ClientRequest::TurnStart {
             request_id: RequestId::String("simulate-crash-after-turn-start".into()),
             params: TurnStartParams {
-                thread_id: main.clone(),
+                thread_id: crash_main.clone(),
+                idempotency_key: Some(pending_assignment.notification_id.clone()),
                 client_user_message_id: Some(pending_assignment.notification_id.clone()),
                 input: vec![UserInput::Text {
                     text: "Ticket #2 is assigned to you and approved for implementation.".into(),
@@ -1296,7 +1446,31 @@ async fn ticket_dispatch_flow_scenario() -> color_eyre::Result<()> {
             },
         })
         .await?;
-    let (pump_events_tx, _pump_events_rx) = tokio::sync::mpsc::unbounded_channel();
+    let replayed: TurnStartResponse = server
+        .request_handle()
+        .request_typed(ClientRequest::TurnStart {
+            request_id: RequestId::String("replay-crash-after-turn-start".into()),
+            params: TurnStartParams {
+                thread_id: crash_main.clone(),
+                idempotency_key: Some(pending_assignment.notification_id.clone()),
+                client_user_message_id: Some(pending_assignment.notification_id.clone()),
+                input: vec![UserInput::Text {
+                    text: "Ticket #2 is assigned to you and approved for implementation.".into(),
+                    text_elements: Vec::new(),
+                }],
+                ..Default::default()
+            },
+        })
+        .await?;
+    assert_eq!(replayed.turn.id, started.turn.id);
+    let (pump_events_tx, mut pump_events_rx) = tokio::sync::mpsc::unbounded_channel();
+    let pump_registration = tokio::spawn(async move {
+        if let Some(crate::app_event::AppEvent::DynamicToolThreadStarted { registered, .. }) =
+            pump_events_rx.recv().await
+        {
+            let _ = registered.send(());
+        }
+    });
     let recovered = retry_pending_ticket_notifications(
         server.request_handle(),
         ThreadStartParams {
@@ -1310,7 +1484,10 @@ async fn ticket_dispatch_flow_scenario() -> color_eyre::Result<()> {
     )
     .await
     .map_err(|error| color_eyre::eyre::eyre!(error))?;
-    assert_eq!(recovered, 1);
+    pump_registration.abort();
+    // The MCP startup pump may win this reconciliation race before the explicit
+    // pump runs. Either path must converge on the same already-started turn.
+    assert!(recovered <= 1);
     let recovered_document = store.read(2)?;
     let recovered_assignment = recovered_document.ticket.assignment.unwrap();
     assert_eq!(
@@ -1321,7 +1498,8 @@ async fn ticket_dispatch_flow_scenario() -> color_eyre::Result<()> {
         recovered_assignment.delivery_state,
         crate::ticket_store::DeliveryState::Delivered
     );
-    let (second_events_tx, _second_events_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (second_events_tx, second_events_rx) = tokio::sync::mpsc::unbounded_channel();
+    drop(second_events_rx);
     let second_recovered = retry_pending_ticket_notifications(
         server.request_handle(),
         ThreadStartParams {

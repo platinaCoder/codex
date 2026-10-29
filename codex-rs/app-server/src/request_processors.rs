@@ -344,6 +344,7 @@ use codex_core::NewThread;
 use codex_core::NotSubmittedReason;
 #[cfg(test)]
 use codex_core::SessionMeta;
+use codex_core::StartIfIdleSubmission;
 use codex_core::StartThreadOptions;
 use codex_core::SteerSubmission;
 use codex_core::ThreadConfigSnapshot;

@@ -2249,8 +2249,8 @@ fn ticket_notification_message(
 }
 
 /// Retry every durable pending ticket notification after startup, reconnect, or a
-/// ticket-store refresh. Delivery remains effectively-once because the store claims the
-/// first external attempt and every later invocation reconciles the stable notification id.
+/// ticket-store refresh. The stable notification UUID is also the idempotent turn ID, so
+/// every replay either finds or starts the same MAIN turn without a timing heuristic.
 pub(crate) async fn retry_pending_ticket_notifications(
     handle: AppServerRequestHandle,
     thread_start_params: ThreadStartParams,
@@ -2306,22 +2306,6 @@ pub(crate) async fn retry_pending_ticket_notifications(
         }
     }
     Ok(recovered)
-}
-
-async fn find_ticket_notification_turn(
-    handle: &AppServerRequestHandle,
-    thread_id: &str,
-    notification_id: &str,
-) -> Result<Option<String>, String> {
-    for _ in 0..20 {
-        if let Some(turn_id) =
-            find_ticket_notification_turn_once(handle, thread_id, notification_id).await?
-        {
-            return Ok(Some(turn_id));
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    Ok(None)
 }
 
 async fn find_ticket_notification_turn_once(
@@ -2451,7 +2435,7 @@ async fn deliver_ticket_notification(
         )
         .map_err(|error| error.to_string())?;
     if !first_attempt {
-        if let Some(turn_id) = find_ticket_notification_turn(
+        if let Some(turn_id) = find_ticket_notification_turn_once(
             handle,
             &assignment_context.assignee_thread_id,
             &assignment_context.notification_id,
@@ -2478,10 +2462,6 @@ async fn deliver_ticket_notification(
                 "recoveredDelivery": true
             }));
         }
-        return Err(format!(
-            "ticket notification {} has a durable delivery attempt but no persisted MAIN turn is visible yet; retry later instead of starting a duplicate",
-            assignment_context.notification_id
-        ));
     }
     let sent = send_delegated_message(
         handle,
@@ -2658,10 +2638,11 @@ async fn start_turn(
         request_id,
         params: TurnStartParams {
             thread_id: thread_id.to_string(),
+            idempotency_key: ticket_context.map(|context| context.notification_id.clone()),
             client_user_message_id,
             input,
-            // Ticket notifications use a persisted user-message client ID so a crash after
-            // TurnStart can be reconciled without starting a duplicate implementation turn.
+            // Ticket notifications use the persisted notification UUID for both the user-message
+            // client ID and idempotent turn ID, covering either side of the TurnStart boundary.
             tool_output,
             model,
             sandbox_policy,

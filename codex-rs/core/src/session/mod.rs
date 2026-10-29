@@ -1122,6 +1122,18 @@ impl SessionIo {
         mode: TurnInputMode,
     ) -> CodexResult<TurnInputSubmission> {
         let id = new_submission_id();
+        self.submit_turn_input_with_id(request, mode, id).await
+    }
+
+    /// Submits ordered turn input using a caller-selected stable submission id.
+    /// Callers must ensure repeats use start-only-if-idle semantics and first
+    /// reconcile an already persisted turn with the same id.
+    pub(crate) async fn submit_turn_input_with_id(
+        &self,
+        request: impl Into<WithTurnExtensionData<TurnInputRequest>>,
+        mode: TurnInputMode,
+        id: String,
+    ) -> CodexResult<TurnInputSubmission> {
         let (reply_tx, reply_rx) = oneshot::channel();
         let WithTurnExtensionData {
             mut request,

@@ -12,6 +12,11 @@ import type { TurnToolOutput } from "./TurnToolOutput";
 import type { UserInput } from "./UserInput";
 
 export type TurnStartParams = {threadId: string, /**
+ * Optional stable identifier for an idempotent, start-only-if-idle turn.
+ * Repeating the request with the same identifier returns the turn that was
+ * already started instead of steering or starting a duplicate.
+ */
+idempotencyKey?: string | null, /**
  * Replace this thread's disabled plugin IDs.
  * Omitted/null preserves the list; [] clears it.
  */

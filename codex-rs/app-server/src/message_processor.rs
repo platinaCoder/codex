@@ -550,6 +550,7 @@ impl MessageProcessor {
             analytics_events_client.clone(),
             Arc::clone(&config),
             config_manager.clone(),
+            Arc::clone(&thread_store),
             pending_thread_unloads,
             thread_state_manager,
             thread_watch_manager,

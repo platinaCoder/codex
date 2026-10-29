@@ -450,6 +450,37 @@ impl CodexThread {
         }
     }
 
+    /// Starts a regular turn only when idle, using a caller-selected stable
+    /// turn id. This is the submission half of an idempotent host protocol;
+    /// the host must first return any persisted turn with the same id.
+    pub async fn start_turn_if_idle_with_id(
+        &self,
+        request: impl Into<WithTurnExtensionData<TurnInputRequest>>,
+        submission_id: String,
+    ) -> CodexResult<StartIfIdleSubmission> {
+        self.ensure_execution_capacity_for_turn_start(self.session.services.agent_control.as_ref())
+            .await?;
+        match self
+            .io
+            .submit_turn_input_with_id(request, TurnInputMode::StartIfIdle, submission_id)
+            .await?
+        {
+            TurnInputSubmission::Started {
+                turn_id,
+                root_turn_id,
+            } => Ok(StartIfIdleSubmission::Started {
+                turn_id,
+                root_turn_id,
+            }),
+            TurnInputSubmission::NotSubmitted { reason } => {
+                Ok(StartIfIdleSubmission::NotSubmitted { reason })
+            }
+            TurnInputSubmission::Steered { .. } => {
+                unreachable!("start-if-idle submission cannot steer")
+            }
+        }
+    }
+
     /// Starts a new internal continuation turn when idle, including in Plan mode.
     /// Rejects if a newer task has started, even if it has already finished.
     /// The input must be a response item; it is never treated as user authorization.

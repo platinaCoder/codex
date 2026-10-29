@@ -1565,6 +1565,7 @@ impl AppServerSession {
                 params: TurnStartParams {
                     disabled_plugin_ids: None,
                     thread_id: thread_id.to_string(),
+                    idempotency_key: None,
                     turn_trigger: Some("user".to_string()),
                     parent_turn_id: None,
                     root_turn_id: None,

@@ -6392,7 +6392,7 @@ fn stored_thread_item_to_entry(
     })
 }
 
-fn stored_turn_to_api_turn(
+pub(super) fn stored_turn_to_api_turn(
     turn: StoredTurn,
     items_view: TurnItemsView,
 ) -> Result<Turn, JSONRPCErrorError> {

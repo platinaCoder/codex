@@ -26433,6 +26433,13 @@
             ],
             "description": "Override the reasoning effort for this turn and subsequent turns."
           },
+          "idempotencyKey": {
+            "description": "Optional stable identifier for an idempotent, start-only-if-idle turn. Repeating the request with the same identifier returns the turn that was already started instead of steering or starting a duplicate.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "input": {
             "items": {
               "$ref": "#/definitions/v2/UserInput"

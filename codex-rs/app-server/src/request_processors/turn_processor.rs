@@ -12,6 +12,7 @@ use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ImageReference as CoreImageReference;
 use codex_protocol::protocol::AdditionalContextEntry as CoreAdditionalContextEntry;
 use codex_protocol::protocol::AdditionalContextKind as CoreAdditionalContextKind;
+use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::TurnEnvironmentRequests;
 use codex_protocol::protocol::TurnSettingsUpdate;
 use codex_protocol::protocol::TurnSettingsUpdateOutcome;
@@ -89,6 +90,7 @@ pub(crate) struct TurnRequestProcessor {
     analytics_events_client: AnalyticsEventsClient,
     config: Arc<Config>,
     config_manager: ConfigManager,
+    thread_store: Arc<dyn ThreadStore>,
     pending_thread_unloads: PendingThreadUnloads,
     thread_state_manager: ThreadStateManager,
     thread_watch_manager: ThreadWatchManager,
@@ -151,6 +153,7 @@ impl TurnRequestProcessor {
         analytics_events_client: AnalyticsEventsClient,
         config: Arc<Config>,
         config_manager: ConfigManager,
+        thread_store: Arc<dyn ThreadStore>,
         pending_thread_unloads: PendingThreadUnloads,
         thread_state_manager: ThreadStateManager,
         thread_watch_manager: ThreadWatchManager,
@@ -166,6 +169,7 @@ impl TurnRequestProcessor {
             analytics_events_client,
             config,
             config_manager,
+            thread_store,
             pending_thread_unloads,
             thread_state_manager,
             thread_watch_manager,
@@ -190,6 +194,63 @@ impl TurnRequestProcessor {
         )
         .await
         .map(|response| Some(response.into()))
+    }
+
+    async fn find_persisted_idempotent_turn(
+        &self,
+        thread_id: ThreadId,
+        thread: &CodexThread,
+        key: &str,
+    ) -> Result<Option<Turn>, JSONRPCErrorError> {
+        if thread.config_snapshot().await.history_mode == ThreadHistoryMode::Paginated {
+            let mut cursor = None;
+            loop {
+                let page = self
+                    .thread_store
+                    .list_turns(StoreListTurnsParams {
+                        thread_id,
+                        include_archived: true,
+                        cursor: cursor.clone(),
+                        page_size: 100,
+                        sort_direction: StoreSortDirection::Desc,
+                        items_view: StoredTurnItemsView::NotLoaded,
+                    })
+                    .await
+                    .map_err(|error| {
+                        internal_error(format!(
+                            "failed to reconcile idempotent turn start: {error}"
+                        ))
+                    })?;
+                if let Some(turn) = page.turns.into_iter().find(|turn| turn.turn_id == key) {
+                    return super::thread_processor::stored_turn_to_api_turn(
+                        turn,
+                        TurnItemsView::NotLoaded,
+                    )
+                    .map(Some);
+                }
+                let Some(next_cursor) = page.next_cursor else {
+                    return Ok(None);
+                };
+                if cursor.as_ref() == Some(&next_cursor) {
+                    return Err(internal_error(
+                        "idempotent turn reconciliation cursor did not advance",
+                    ));
+                }
+                cursor = Some(next_cursor);
+            }
+        }
+
+        let history = thread
+            .load_history(/*include_archived*/ true)
+            .await
+            .map_err(|error| {
+                internal_error(format!(
+                    "failed to reconcile idempotent turn start: {error}"
+                ))
+            })?;
+        Ok(build_legacy_api_turns_from_rollout_items(&history.items)
+            .into_iter()
+            .find(|turn| turn.id == key))
     }
 
     pub(crate) async fn thread_inject_items(
@@ -537,6 +598,22 @@ impl TurnRequestProcessor {
                 })?;
         self.ensure_direct_input_allowed(&request_id, thread.as_ref())
             .await?;
+        let idempotency_key = params.idempotency_key.clone();
+        if let Some(key) = idempotency_key.as_deref() {
+            if Uuid::parse_str(key).is_err() {
+                return Err(invalid_request("`idempotencyKey` must be a UUID"));
+            }
+            if params.client_user_message_id.as_deref() != Some(key) {
+                return Err(invalid_request(
+                    "`idempotencyKey` must equal `clientUserMessageId`",
+                ));
+            }
+            if params.input.is_empty() || params.tool_output.is_some() {
+                return Err(invalid_request(
+                    "idempotent turn starts require nonempty `input` and no `toolOutput`",
+                ));
+            }
+        }
         self.config_manager
             .check_thread_model_provider(thread.config().await.as_ref())
             .await
@@ -579,6 +656,30 @@ impl TurnRequestProcessor {
                 Some(AnalyticsJsonRpcError::Input(InputError::TooLarge)),
             );
             return Err(error);
+        }
+        if let Some(key) = idempotency_key.as_deref() {
+            let existing = if let Some(root_turn_id) = thread.active_turn_root(key).await {
+                Some(Turn {
+                    id: key.to_string(),
+                    root_turn_id: Some(root_turn_id),
+                    items: vec![],
+                    items_view: TurnItemsView::NotLoaded,
+                    error: None,
+                    status: TurnStatus::InProgress,
+                    started_at: None,
+                    completed_at: None,
+                    duration_ms: None,
+                })
+            } else {
+                self.find_persisted_idempotent_turn(thread_id, thread.as_ref(), key)
+                    .await?
+            };
+            if let Some(turn) = existing {
+                self.outgoing
+                    .record_request_turn_id(&request_id, &turn.id)
+                    .await;
+                return Ok(TurnStartResponse { turn });
+            }
         }
         Self::set_app_server_client_info(
             thread.as_ref(),
@@ -658,30 +759,43 @@ impl TurnRequestProcessor {
             )
             .await?;
 
-        let submission = thread
-            .start_or_steer_turn(
-                TurnInputRequest::new(input)
-                    .with_thread_settings(thread_settings)
-                    .on_start(TurnStartOptions {
-                        turn_trigger: params.turn_trigger,
-                        parent_turn_id: params.parent_turn_id,
-                        initiating_agent_path: None,
-                        root_turn_id: params.root_turn_id,
-                        final_output_json_schema: params.output_schema,
-                        service_tier: params.service_tier_for_turn,
-                        cyber_access_program: params.cyber_access_program.map(Into::into),
-                    })
-                    .with_additional_context(additional_context)
-                    .with_responses_metadata(params.responsesapi_client_metadata)
-                    .with_responses_metadata_patch(params.responsesapi_client_metadata_patch)
-                    .with_trace(self.request_trace_context(&request_id).await),
-            )
-            .await
-            .map_err(|err| {
-                let error = internal_error(format!("failed to submit turn input: {err}"));
-                self.track_error_response(&request_id, &error, /*error_type*/ None);
-                error
-            })?;
+        let turn_request = TurnInputRequest::new(input)
+            .with_thread_settings(thread_settings)
+            .on_start(TurnStartOptions {
+                turn_trigger: params.turn_trigger,
+                parent_turn_id: params.parent_turn_id,
+                initiating_agent_path: None,
+                root_turn_id: params.root_turn_id,
+                final_output_json_schema: params.output_schema,
+                service_tier: params.service_tier_for_turn,
+                cyber_access_program: params.cyber_access_program.map(Into::into),
+            })
+            .with_additional_context(additional_context)
+            .with_responses_metadata(params.responsesapi_client_metadata)
+            .with_responses_metadata_patch(params.responsesapi_client_metadata_patch)
+            .with_trace(self.request_trace_context(&request_id).await);
+        let submission = if let Some(key) = idempotency_key {
+            match thread.start_turn_if_idle_with_id(turn_request, key).await {
+                Ok(StartIfIdleSubmission::Started {
+                    turn_id,
+                    root_turn_id,
+                }) => Ok(TurnInputSubmission::Started {
+                    turn_id,
+                    root_turn_id,
+                }),
+                Ok(StartIfIdleSubmission::NotSubmitted { reason }) => {
+                    Ok(TurnInputSubmission::NotSubmitted { reason })
+                }
+                Err(error) => Err(error),
+            }
+        } else {
+            thread.start_or_steer_turn(turn_request).await
+        }
+        .map_err(|err| {
+            let error = internal_error(format!("failed to submit turn input: {err}"));
+            self.track_error_response(&request_id, &error, /*error_type*/ None);
+            error
+        })?;
         let (turn_id, root_turn_id, started) = match submission {
             TurnInputSubmission::Started {
                 turn_id,
