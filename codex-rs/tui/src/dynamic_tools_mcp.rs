@@ -126,6 +126,19 @@ impl ThreadToolTransport {
             );
         }
     }
+
+    pub(crate) fn configure_resume(
+        &self,
+        params: &mut codex_app_server_protocol::ThreadResumeParams,
+    ) {
+        self.configure_mcp(&mut params.config);
+        if matches!(self, Self::Mcp(_)) {
+            // A cold-resumed legacy SIDE can carry its original direct-tool catalog in session
+            // metadata. The authenticated MCP transport replaces that catalog rather than being
+            // merged with obsolete capabilities such as `send_message_to_main`.
+            params.dynamic_tools = Some(Vec::new());
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -225,6 +238,9 @@ impl DynamicToolMcpServer {
                 "create_ticket": {"approval_mode": "prompt"},
                 "update_ticket": {"approval_mode": "prompt"},
                 "implement_ticket": {"approval_mode": "prompt"},
+                "resume_ticket_review": {"approval_mode": "prompt"},
+                "reassign_ticket": {"approval_mode": "prompt"},
+                "retry_ticket_notification": {"approval_mode": "prompt"},
                 "append_ticket_comment": {"approval_mode": "prompt"},
                 "fork_thread": {"approval_mode": "prompt"},
                 "create_worktree": {"approval_mode": "approve"}

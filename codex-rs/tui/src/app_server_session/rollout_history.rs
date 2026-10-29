@@ -201,7 +201,7 @@ impl AppServerSession {
                 .get_or_insert_default()
                 .insert("strict_read_only_tools".to_string(), true.into());
         }
-        thread_tool_transport.configure_mcp(&mut params.config);
+        thread_tool_transport.configure_resume(&mut params);
         let mut rollout_maintenance_guard = None;
         params.exclude_turns = if self.history_support == ThreadHistorySupport::Paginated {
             let known_legacy_history = self

@@ -38,6 +38,32 @@ use codex_analytics::CompactionImplementation;
 use codex_analytics::CompactionPhase;
 use codex_analytics::CompactionReason;
 use codex_analytics::CompactionTrigger;
+
+#[test]
+fn explicit_empty_dynamic_tools_replace_persisted_catalog_on_resume() {
+    let legacy = codex_protocol::dynamic_tools::DynamicToolSpec::Function(
+        codex_protocol::dynamic_tools::DynamicToolFunctionSpec {
+            name: "send_message_to_main".to_string(),
+            description: "legacy bridge".to_string(),
+            input_schema: serde_json::json!({"type": "object"}),
+            defer_loading: false,
+        },
+    );
+    let history =
+        InitialHistory::Forked(vec![RolloutItem::SessionMeta(Box::new(SessionMetaLine {
+            meta: SessionMeta {
+                dynamic_tools: Some(vec![legacy.clone()]),
+                ..SessionMeta::default()
+            },
+            git: None,
+        }))]);
+
+    assert_eq!(
+        resolve_dynamic_tools(Vec::new(), true, &history),
+        vec![legacy]
+    );
+    assert!(resolve_dynamic_tools(Vec::new(), false, &history).is_empty());
+}
 use codex_config::ConfigLayerStack;
 use codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID;
 use codex_config::LoaderOverrides;

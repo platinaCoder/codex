@@ -309,6 +309,8 @@ pub struct StartThreadOptions {
     /// Creation metadata forwarded to storage; never inherited from a fork source.
     pub attached_thread: bool,
     pub dynamic_tools: Vec<codex_protocol::dynamic_tools::DynamicToolSpec>,
+    /// Whether an empty `dynamic_tools` value restores the catalog persisted in history.
+    pub inherit_dynamic_tools: bool,
     pub metrics_service_name: Option<String>,
     pub parent_trace: Option<W3cTraceContext>,
     pub environments: Option<Vec<TurnEnvironmentRequest>>,
@@ -341,6 +343,7 @@ impl StartThreadOptions {
             thread_source: None,
             attached_thread: false,
             dynamic_tools: Vec::new(),
+            inherit_dynamic_tools: true,
             metrics_service_name: None,
             parent_trace: None,
             environments: None,
@@ -2180,6 +2183,7 @@ impl ThreadManagerState {
             thread_source,
             attached_thread,
             dynamic_tools,
+            inherit_dynamic_tools,
             metrics_service_name,
             parent_trace,
             environments: environment_requests,
@@ -2442,6 +2446,7 @@ impl ThreadManagerState {
             originator,
             agent_control,
             dynamic_tools,
+            inherit_dynamic_tools,
             metrics_service_name,
             inherited_environments,
             inherited_exec_policy,

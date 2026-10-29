@@ -412,6 +412,13 @@ pub struct ThreadResumeParams {
     pub base_instructions: Option<String>,
     #[ts(optional = nullable)]
     pub developer_instructions: Option<String>,
+    /// [UNSTABLE] Replace the dynamic tools persisted when the thread was created.
+    ///
+    /// Omit this field to restore the saved catalog. Send an empty array when a host-owned
+    /// transport (for example an MCP server) replaces that catalog on cold resume.
+    #[experimental("thread/resume.dynamicTools")]
+    #[ts(optional = nullable)]
+    pub dynamic_tools: Option<Vec<DynamicToolSpec>>,
     /// @deprecated `friendly` and `pragmatic` no longer select a style.
     /// Changing this does not rewrite the thread's existing instructions.
     #[ts(optional = nullable)]

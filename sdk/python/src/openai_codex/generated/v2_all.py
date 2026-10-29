@@ -12635,6 +12635,13 @@ class TurnStartParams(BaseModel):
         ReasoningEffort | None,
         Field(description="Override the reasoning effort for this turn and subsequent turns."),
     ] = None
+    idempotency_key: Annotated[
+        str | None,
+        Field(
+            alias="idempotencyKey",
+            description="Optional stable identifier for an idempotent, start-only-if-idle turn. Repeating the request with the same identifier returns the turn that was already started instead of steering or starting a duplicate.",
+        ),
+    ] = None
     input: list[UserInput]
     model: Annotated[
         str | None, Field(description="Override the model for this turn and subsequent turns.")

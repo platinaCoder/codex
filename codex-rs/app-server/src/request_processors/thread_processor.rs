@@ -4006,6 +4006,7 @@ impl ThreadRequestProcessor {
             config: mut request_overrides,
             base_instructions,
             developer_instructions,
+            dynamic_tools,
             personality,
             exclude_turns,
             initial_turns_page,
@@ -4324,10 +4325,18 @@ impl ThreadRequestProcessor {
         }
         let response_history = thread_history.clone();
 
+        let inherit_dynamic_tools = dynamic_tools.is_none();
+        let dynamic_tools = dynamic_tools.unwrap_or_default();
+        if !dynamic_tools.is_empty() {
+            validate_dynamic_tools(&dynamic_tools).map_err(invalid_request)?;
+        }
+
         match self
             .thread_manager
             .start_thread(StartThreadOptions {
                 initial_history: thread_history,
+                dynamic_tools,
+                inherit_dynamic_tools,
                 parent_trace: match target {
                     ThreadResumeTarget::Client(request_id) => {
                         self.request_trace_context(request_id).await

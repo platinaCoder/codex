@@ -722,6 +722,7 @@ mod thread_processor_behavior_tests {
             config: None,
             base_instructions: None,
             developer_instructions: None,
+            dynamic_tools: None,
             personality: None,
             exclude_turns: false,
             initial_turns_page: None,

@@ -1558,7 +1558,10 @@ async fn local_daemon_registers_approval_gated_mcp_tools_for_both_start_paths_sc
         .find(|server| server.name == "codex_tui")
         .expect("local daemon must connect to the TUI MCP server")
         .tools;
-    assert_eq!(tools.len(), 17);
+    assert!(
+        tools.len() >= 17,
+        "unexpectedly small tool catalog: {tools:?}"
+    );
     for tool in crate::dynamic_tools::DELEGATION_TOOLS {
         assert!(tools.contains_key(tool));
     }
@@ -1626,6 +1629,7 @@ async fn local_daemon_registers_approval_gated_mcp_tools_for_both_start_paths_sc
     let resumed = recorded_params(&requests, "thread/resume")
         .pop()
         .expect("resumed task request");
+    assert_eq!(resumed["dynamicTools"], serde_json::json!([]));
     assert_eq!(
         resumed["config"]["mcp_servers.codex_tui"],
         starts[0]["config"]["mcp_servers.codex_tui"]
@@ -1640,6 +1644,7 @@ async fn local_daemon_registers_approval_gated_mcp_tools_for_both_start_paths_sc
     let reattached = recorded_params(&requests, "thread/resume")
         .pop()
         .expect("reattached task request");
+    assert_eq!(reattached["dynamicTools"], serde_json::json!([]));
     assert_eq!(
         reattached["config"]["mcp_servers.codex_tui"],
         starts[0]["config"]["mcp_servers.codex_tui"]

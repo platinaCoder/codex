@@ -146,6 +146,7 @@ pub(crate) async fn run_codex_thread_interactive(
             runtime,
         },
         dynamic_tools: Vec::new(),
+        inherit_dynamic_tools: true,
         metrics_service_name: None,
         user_shell_override: None,
         inherited_environments: Some(parent_environments.clone()),
