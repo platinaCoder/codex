@@ -95,8 +95,8 @@ impl ThreadToolTransport {
             // a fallback surface that cannot execute.
             Self::Disabled => params.dynamic_tools = None,
             // External dynamic tools can retain SIDE's bounded read surface,
-            // but delegation remains MCP-only because direct calls have no
-            // per-call approval layer. `/main` is a private TUI action.
+            // but assignment and ticket mutations remain MCP-only because
+            // direct calls have no per-call approval layer.
             Self::Dynamic => {
                 params.dynamic_tools = Some(dynamic_tools::side_fallback_tool_specs());
             }
@@ -150,6 +150,8 @@ pub(crate) struct DynamicToolMcpServer {
     config: Value,
     namespace: &'static str,
     task_tools: bool,
+    thread_start_params: ThreadStartParams,
+    features: Features,
     task: JoinHandle<()>,
 }
 
@@ -166,6 +168,39 @@ impl DynamicToolMcpServer {
             .connection
             .write()
             .unwrap_or_else(PoisonError::into_inner) = Some((handle, events));
+        self.retry_pending_ticket_notifications();
+    }
+
+    pub(crate) fn retry_pending_ticket_notifications(&self) {
+        if !self.task_tools {
+            return;
+        }
+        let Some((handle, app_event_tx)) = self
+            .connection
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+        else {
+            return;
+        };
+        let mut thread_start_params = self.thread_start_params.clone();
+        thread_start_params.config.get_or_insert_default().insert(
+            format!("mcp_servers.{}", self.namespace),
+            self.config.clone(),
+        );
+        let features = self.features.clone();
+        tokio::spawn(async move {
+            if let Err(error) = dynamic_tools::retry_pending_ticket_notifications(
+                handle,
+                thread_start_params,
+                features,
+                app_event_tx,
+            )
+            .await
+            {
+                tracing::warn!(%error, "pending ticket notification retry pump failed");
+            }
+        });
     }
 
     pub(crate) async fn start(
@@ -187,9 +222,10 @@ impl DynamicToolMcpServer {
             "tools": {
                 "create_thread": {"approval_mode": "prompt"},
                 "send_message_to_thread": {"approval_mode": "prompt"},
-                "send_message_to_main": {"approval_mode": "prompt"},
                 "create_ticket": {"approval_mode": "prompt"},
                 "update_ticket": {"approval_mode": "prompt"},
+                "implement_ticket": {"approval_mode": "prompt"},
+                "append_ticket_comment": {"approval_mode": "prompt"},
                 "fork_thread": {"approval_mode": "prompt"},
                 "create_worktree": {"approval_mode": "approve"}
             }
@@ -216,8 +252,8 @@ impl DynamicToolMcpServer {
         let namespace = services.namespace();
         let handler = DynamicToolMcpHandler {
             connection: Arc::clone(&connection),
-            thread_start_params,
-            features,
+            thread_start_params: thread_start_params.clone(),
+            features: features.clone(),
             status_updates,
             server_config: server_config.clone(),
             services,
@@ -239,13 +275,17 @@ impl DynamicToolMcpServer {
                 tracing::warn!(%error, "TUI task-tools MCP server stopped");
             }
         });
-        Ok(Self {
+        let server = Self {
             connection,
             config: server_config,
             namespace,
             task_tools,
+            thread_start_params,
+            features,
             task,
-        })
+        };
+        server.retry_pending_ticket_notifications();
+        Ok(server)
     }
 }
 
@@ -330,10 +370,8 @@ impl ServerHandler for DynamicToolMcpHandler {
                         | "search_workspace_text"
                         | "list_tickets"
                         | "read_ticket"
-                        // Strict SIDE policy also admits two bounded ticket mutations, but those
-                        // retain read_only=false and always prompt. The paired bridge is marked
-                        // read-only only to keep its non-filesystem advice channel discoverable.
-                        | "send_message_to_main"
+                        // Strict SIDE policy also admits bounded ticket mutations, but those
+                        // retain read_only=false and always prompt.
                         | "list_worktrees"
                         | "get_worktree_creation_status"
                 )));

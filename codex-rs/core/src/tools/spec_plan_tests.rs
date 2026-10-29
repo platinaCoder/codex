@@ -1098,7 +1098,7 @@ async fn dynamic_tools_cannot_reclaim_the_reserved_exec_command_name() {
 }
 
 #[tokio::test]
-async fn strict_side_keeps_reads_main_bridge_and_bounded_ticket_mutations() {
+async fn strict_side_keeps_reads_and_bounded_ticket_workflow() {
     let plan = probe_with(
         |turn| {
             let mut config = (*turn.config).clone();
@@ -1125,11 +1125,11 @@ async fn strict_side_keeps_reads_main_bridge_and_bounded_ticket_mutations() {
         },
         ToolPlanInputs {
             dynamic_tools: vec![
-                dynamic_tool(
-                    Some("codex_tui"),
-                    "send_message_to_main",
-                    /*defer_loading*/ false,
-                ),
+                dynamic_tool(Some("codex_tui"), "implement_ticket", false),
+                dynamic_tool(Some("codex_tui"), "resume_ticket_review", false),
+                dynamic_tool(Some("codex_tui"), "reassign_ticket", false),
+                dynamic_tool(Some("codex_tui"), "retry_ticket_notification", false),
+                dynamic_tool(Some("codex_tui"), "append_ticket_comment", false),
                 dynamic_tool(
                     Some("codex_tui"),
                     "read_workspace_file",
@@ -1157,7 +1157,11 @@ async fn strict_side_keeps_reads_main_bridge_and_bounded_ticket_mutations() {
     .await;
 
     plan.assert_registered_contains(&[
-        &ToolName::namespaced("codex_tui", "send_message_to_main").to_string(),
+        &ToolName::namespaced("codex_tui", "implement_ticket").to_string(),
+        &ToolName::namespaced("codex_tui", "resume_ticket_review").to_string(),
+        &ToolName::namespaced("codex_tui", "reassign_ticket").to_string(),
+        &ToolName::namespaced("codex_tui", "retry_ticket_notification").to_string(),
+        &ToolName::namespaced("codex_tui", "append_ticket_comment").to_string(),
         &ToolName::namespaced("codex_tui", "read_workspace_file").to_string(),
         &ToolName::namespaced("codex_tui", "list_tickets").to_string(),
         &ToolName::namespaced("codex_tui", "read_ticket").to_string(),
@@ -1219,7 +1223,7 @@ async fn report_ticket_ready_is_visible_only_on_a_bound_main_turn() {
                         replacement: None,
                         patch: Some(std::collections::HashMap::from([(
                             super::TICKET_DISPATCH_METADATA_KEY.to_string(),
-                            "v1:7:3".to_string(),
+                            "v2:7:3:stable-notification-id".to_string(),
                         )])),
                     },
                 );
@@ -1282,11 +1286,11 @@ async fn persisted_side_identity_enforces_strict_surface_without_client_override
                 ),
             ],
             dynamic_tools: vec![
-                dynamic_tool(
-                    Some("codex_tui"),
-                    "send_message_to_main",
-                    /*defer_loading*/ false,
-                ),
+                dynamic_tool(Some("codex_tui"), "implement_ticket", false),
+                dynamic_tool(Some("codex_tui"), "resume_ticket_review", false),
+                dynamic_tool(Some("codex_tui"), "reassign_ticket", false),
+                dynamic_tool(Some("codex_tui"), "retry_ticket_notification", false),
+                dynamic_tool(Some("codex_tui"), "append_ticket_comment", false),
                 dynamic_tool(
                     Some("codex_tui"),
                     "read_workspace_file",
@@ -1310,7 +1314,11 @@ async fn persisted_side_identity_enforces_strict_surface_without_client_override
     plan.assert_registered_contains(&[
         "exec",
         &ToolName::namespaced("microscope", "inspect").to_string(),
-        &ToolName::namespaced("codex_tui", "send_message_to_main").to_string(),
+        &ToolName::namespaced("codex_tui", "implement_ticket").to_string(),
+        &ToolName::namespaced("codex_tui", "resume_ticket_review").to_string(),
+        &ToolName::namespaced("codex_tui", "reassign_ticket").to_string(),
+        &ToolName::namespaced("codex_tui", "retry_ticket_notification").to_string(),
+        &ToolName::namespaced("codex_tui", "append_ticket_comment").to_string(),
         &ToolName::namespaced("codex_tui", "read_workspace_file").to_string(),
         &ToolName::namespaced("codex_tui", "list_tickets").to_string(),
         &ToolName::namespaced("codex_tui", "read_ticket").to_string(),
@@ -1380,7 +1388,11 @@ async fn strict_side_keeps_only_paired_codex_tui_mcp_tools_model_visible() {
                 "read_workspace_file",
                 "list_workspace_directory",
                 "search_workspace_text",
-                "send_message_to_main",
+                "implement_ticket",
+                "resume_ticket_review",
+                "reassign_ticket",
+                "retry_ticket_notification",
+                "append_ticket_comment",
                 "list_tickets",
                 "read_ticket",
                 "create_ticket",
@@ -1403,7 +1415,11 @@ async fn strict_side_keeps_only_paired_codex_tui_mcp_tools_model_visible() {
         "read_workspace_file",
         "list_workspace_directory",
         "search_workspace_text",
-        "send_message_to_main",
+        "implement_ticket",
+        "resume_ticket_review",
+        "reassign_ticket",
+        "retry_ticket_notification",
+        "append_ticket_comment",
         "list_tickets",
         "read_ticket",
         "create_ticket",

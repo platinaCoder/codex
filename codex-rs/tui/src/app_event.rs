@@ -431,12 +431,6 @@ pub(crate) enum AppEvent {
         message: String,
     },
 
-    /// Deterministic user-authorized SIDE -> paired MAIN dispatch from `/main`.
-    SendToPairedMain {
-        side_thread_id: ThreadId,
-        message: String,
-    },
-
     /// Rebuild the read-only transcript projection for an unfocused MAIN/SIDE pane.
     RefreshPairedPane {
         thread_id: ThreadId,

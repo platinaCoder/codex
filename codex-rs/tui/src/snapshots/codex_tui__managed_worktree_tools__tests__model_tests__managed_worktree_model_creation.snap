@@ -14,20 +14,22 @@ Settings:
   store: false
   stream: true
   tool_choice: "auto"
-  tools (1; hash=e606f76a184ca35b):
-    - namespace/mcp__codex_tui: Tools in the mcp__codex_tui namespace.; hash=a0e2f003ab386e7f
+  tools (1; hash=e82ad9f36d4aab65):
+    - namespace/mcp__codex_tui: Tools in the mcp__codex_tui namespace.; hash=40fdaf541776f53d
+      - function/append_ticket_comment
       - function/create_thread
       - function/create_worktree
       - function/fork_thread
       - function/get_worktree_creation_status
       - function/list_archived_threads
       - function/list_threads
+      - function/list_tickets
       - function/list_workspace_directory
       - function/list_worktrees
       - function/read_thread
+      - function/read_ticket
       - function/read_workspace_file
       - function/search_workspace_text
-      - function/send_message_to_main
       - function/send_message_to_thread
       - function/set_thread_archived
       - function/set_thread_title

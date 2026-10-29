@@ -8152,7 +8152,11 @@ const names = [
   "mcp__codex_tui__read_workspace_file",
   "mcp__codex_tui__list_workspace_directory",
   "mcp__codex_tui__search_workspace_text",
-  "mcp__codex_tui__send_message_to_main",
+  "mcp__codex_tui__implement_ticket",
+  "mcp__codex_tui__resume_ticket_review",
+  "mcp__codex_tui__reassign_ticket",
+  "mcp__codex_tui__retry_ticket_notification",
+  "mcp__codex_tui__append_ticket_comment",
   "mcp__codex_tui__create_thread",
   "mcp__codex_tui__send_message_to_thread",
   "mcp__codex_tui__set_thread_title",
@@ -8196,7 +8200,11 @@ text(JSON.stringify(Object.fromEntries(names.map(name => [name, {
         "mcp__codex_tui__read_workspace_file",
         "mcp__codex_tui__list_workspace_directory",
         "mcp__codex_tui__search_workspace_text",
-        "mcp__codex_tui__send_message_to_main",
+        "mcp__codex_tui__implement_ticket",
+        "mcp__codex_tui__resume_ticket_review",
+        "mcp__codex_tui__reassign_ticket",
+        "mcp__codex_tui__retry_ticket_notification",
+        "mcp__codex_tui__append_ticket_comment",
     ] {
         assert_eq!(parsed[name]["type"], "function", "{name}: {parsed}");
         assert_eq!(parsed[name]["listed"], true, "{name}: {parsed}");

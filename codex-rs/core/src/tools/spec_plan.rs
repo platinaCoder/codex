@@ -102,7 +102,7 @@ use tracing::instrument;
 
 const IMAGE_GEN_NAMESPACE: &str = "image_gen";
 const IMAGEGEN_TOOL_NAME: &str = "imagegen";
-const TICKET_DISPATCH_METADATA_KEY: &str = "ai_lab_ticket_dispatch";
+const TICKET_DISPATCH_METADATA_KEY: &str = "ai_lab_ticket_assignment";
 
 #[derive(Clone, Copy)]
 struct CoreToolPlanContext<'a> {
@@ -562,8 +562,8 @@ pub(crate) fn finalize_tool_router(
 /// workspace, `/tmp`, git config, subprocesses, and device APIs. Only the
 /// locally controlled lab microscope is retained from MCP discovery; arbitrary
 /// third-party `readOnlyHint` annotations are not a zero-mutation boundary. The
-/// intentional state-changing exceptions are the paired-MAIN message bridge and the two bounded,
-/// approval-gated canonical ticket mutations.
+/// intentional state-changing exceptions are bounded, approval-gated canonical ticket
+/// mutations and their durable assignment notifications.
 fn is_strict_read_only_turn(turn_context: &TurnContext) -> bool {
     turn_context.config.strict_read_only_tools
         || matches!(
@@ -597,13 +597,14 @@ fn enforce_ticket_ownership(turn_context: &TurnContext, registry: &mut ToolRegis
         .responsesapi_client_metadata_value(TICKET_DISPATCH_METADATA_KEY)
         .is_some_and(|binding| {
             let mut parts = binding.split(':');
-            parts.next() == Some("v1")
+            parts.next() == Some("v2")
                 && parts
                     .next()
                     .is_some_and(|id| id.parse::<u64>().is_ok_and(|id| id > 0))
                 && parts
                     .next()
                     .is_some_and(|revision| revision.parse::<u64>().is_ok_and(|value| value > 0))
+                && parts.next().is_some_and(|event_id| !event_id.is_empty())
                 && parts.next().is_none()
         });
     let forbidden = registry
@@ -613,8 +614,15 @@ fn enforce_ticket_ownership(turn_context: &TurnContext, registry: &mut ToolRegis
             let from_tui = name.namespace.as_deref() == Some("codex_tui")
                 || tool.runtime.mcp_server_name() == Some("codex_tui");
             (from_tui
-                && (matches!(name.name.as_str(), "create_ticket" | "update_ticket")
-                    || (name.name == "report_ticket_ready" && !report_is_bound)))
+                && (matches!(
+                    name.name.as_str(),
+                    "create_ticket"
+                        | "update_ticket"
+                        | "implement_ticket"
+                        | "resume_ticket_review"
+                        | "reassign_ticket"
+                        | "retry_ticket_notification"
+                ) || (name.name == "report_ticket_ready" && !report_is_bound)))
                 .then(|| tool.runtime.tool_name())
         })
         .collect::<Vec<_>>();
@@ -633,7 +641,11 @@ fn is_side_codex_tui_tool(name: &str) -> bool {
             | "read_ticket"
             | "create_ticket"
             | "update_ticket"
-            | "send_message_to_main"
+            | "implement_ticket"
+            | "resume_ticket_review"
+            | "reassign_ticket"
+            | "retry_ticket_notification"
+            | "append_ticket_comment"
     )
 }
 

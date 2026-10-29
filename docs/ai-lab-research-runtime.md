@@ -43,29 +43,31 @@ trusted as a zero-mutation boundary. Strictness is re-derived on every turn
 from the server-owned persisted `ai_lab_side:<MAIN_UUID>` source marker, so a
 loaded thread cannot weaken SIDE merely by ignoring client resume overrides.
 Session settings also reject later attempts to raise SIDE's filesystem or
-network permissions. The sole
-state-changing exception is `codex_tui.send_message_to_main`. It takes no target
-UUID: the runtime derives and verifies the paired MAIN UUID from persisted SIDE
-metadata on every dispatch. The MCP transport authenticates the local runtime,
-and the caller thread identifier is supplied by that runtime rather than by the
-model; no client-selected target or separately rotating pair token is trusted.
-Other task-management, patching, permission-escalation, build, and mutating
-external tools are unavailable.
+network permissions. SIDE's only bounded state-changing surface is the
+approval-gated ticket workflow. It may create and revise proposed tickets,
+append immutable ticket comments, and assign an exact approved revision with
+`implement_ticket`. The runtime derives and verifies the paired MAIN UUID from
+persisted SIDE metadata; the model cannot select an assignee. Assignment and a
+stable pending notification are committed before external turn delivery, so
+authority comes from durable ticket state rather than message text. The MCP
+transport authenticates the local runtime, and caller thread and turn
+identifiers are supplied by that runtime rather than by the model. Other
+task-management, patching, permission-escalation, build, and mutating external
+tools are unavailable.
 
 On resume, the TUI reads persisted thread metadata even when the client did not
 set its SIDE flag. A valid `ai_lab_side:<MAIN_UUID>` marker forces strict mode
 back into the resume request. Local daemon and `--no-daemon` sessions both host
 the task surface on an authenticated loopback `codex_tui` MCP service. This
-keeps bounded workspace reads and the paired-MAIN bridge available to fresh,
+keeps bounded workspace reads and the ticket workflow available to fresh,
 reattached, and cold-resumed SIDE threads, including SIDE histories created by
 an older runtime without persisted dynamic tools. If that local MCP cannot be
 started, a fresh embedded SIDE falls back to a read-only app-server dynamic
-tool surface and does not advertise the paired-MAIN bridge to the model because
-that transport has no per-call approval layer. The explicit `/main` UI path
-remains available. After MCP namespace normalization, core still matches the
-authenticated `codex_tui` server identity and applies the same exact four-tool
-allowlist before constructing the model-visible catalog. MAIN does not receive
-the SIDE-only bridge.
+tool surface and does not advertise ticket mutations because that transport
+has no per-call approval layer. Core recognizes the authenticated `codex_tui`
+server identity and applies the strict SIDE allowlist before constructing the
+model-visible catalog. MAIN sees only tickets assigned to its exact
+authenticated thread and cannot invoke SIDE lifecycle controls.
 
 For mathematical explanations, SIDE defines unfamiliar notation and dimensions,
 translates equations into pseudocode when practical, traces information flow,
@@ -92,12 +94,22 @@ being guessed at.
 
 The runtime injects the newest completed MAIN user or assistant message into SIDE as hidden developer context. It also refreshes that context when a persisted SIDE is restored.
 
-SIDE may advise or instruct MAIN through `send_message_to_main`; proactive
-model-initiated delivery remains approval-gated. Natural-language intent is not
-used to waive that approval because it is not a reliable authorization
-boundary. When the user explicitly wants immediate delivery, `/main <message>`
-is the deterministic, no-second-prompt affordance. Both paths are confined to
-the paired MAIN and do not merge the two histories.
+SIDE-to-MAIN implementation work flows only through tickets. In the ticket
+view, SIDE selects a Proposed ticket and uses Implement for the displayed exact
+revision. The runtime atomically records approval, assignee, and a stable
+pending notification before starting MAIN with the short generated assignment
+message. MAIN then reads the complete authoritative specification and comments
+through paginated `read_ticket` calls. Free-form `send_message_to_main` and
+`/main` dispatch do not exist.
+
+Pending assignment and review-resume notifications are retried automatically
+at task-tool startup, after app-server reconnect, and whenever the ticket store
+refreshes. All retries reuse the stable notification ID: an already-started
+MAIN turn is discovered and bound, while concurrent retry pumps cannot create a
+second turn after the first delivery claim. SIDE also has an explicit Retry
+control for inspection and manual recovery. Review feedback is appended as a
+ticket comment, then SIDE resumes the retained assignee through the typed
+review-resume action. Reassignment is a separate approval-gated, audited action.
 
 ## Ephemeral INFER pane
 

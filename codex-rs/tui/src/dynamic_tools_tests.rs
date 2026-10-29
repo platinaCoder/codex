@@ -1118,53 +1118,14 @@ async fn ticket_dispatch_flow_scenario() -> color_eyre::Result<()> {
         .await,
     );
     assert_eq!(created["document"]["ticket"]["status"], "proposed");
-    let approved = response_json(
-        call_ticket_tool(
-            &server,
-            &side.to_string(),
-            "update_ticket",
-            json!({
-                "ticketId": created["document"]["ticket"]["id"],
-                "expectedRevision": created["document"]["ticket"]["revision"],
-                "transition": {"to": "approved", "reason": "user requested approval"}
-            }),
-            lab.path(),
-        )
-        .await,
-    );
-    assert_eq!(approved["document"]["ticket"]["status"], "approved");
-
-    let ordinary = response_json(
-        call_ticket_tool(
-            &server,
-            &side.to_string(),
-            "send_message_to_main",
-            json!({"prompt": "ordinary advice without a ticket binding"}),
-            lab.path(),
-        )
-        .await,
-    );
-    assert_eq!(ordinary["threadId"], main);
-    assert!(ordinary.get("ticketId").is_none());
-    assert_eq!(
-        crate::ticket_store::TicketStore::test(lab.path())
-            .read(1)?
-            .ticket
-            .status,
-        crate::ticket_store::Status::Approved
-    );
-
     let stale = call_ticket_tool(
         &server,
         &side.to_string(),
-        "send_message_to_main",
+        "implement_ticket",
         json!({
-            "prompt": "stale ticket dispatch",
-            "ticketContext": {
-                "ticketId": approved["document"]["ticket"]["id"],
-                "expectedRevision": approved["document"]["ticket"]["revision"].as_u64().unwrap() - 1,
-                "implementation": true
-            }
+            "ticketId": created["document"]["ticket"]["id"],
+            "expectedRevision": created["document"]["ticket"]["revision"].as_u64().unwrap() + 1,
+            "reason": "stale ticket dispatch"
         }),
         lab.path(),
     )
@@ -1175,14 +1136,11 @@ async fn ticket_dispatch_flow_scenario() -> color_eyre::Result<()> {
         call_ticket_tool(
             &server,
             &side.to_string(),
-            "send_message_to_main",
+            "implement_ticket",
             json!({
-                "prompt": "implement and verify the approved ticket",
-                "ticketContext": {
-                    "ticketId": approved["document"]["ticket"]["id"],
-                    "expectedRevision": approved["document"]["ticket"]["revision"],
-                    "implementation": true
-                }
+                "ticketId": created["document"]["ticket"]["id"],
+                "expectedRevision": created["document"]["ticket"]["revision"],
+                "reason": "implement and verify exact proposed revision"
             }),
             lab.path(),
         )
@@ -1195,14 +1153,11 @@ async fn ticket_dispatch_flow_scenario() -> color_eyre::Result<()> {
         call_ticket_tool(
             &server,
             &side.to_string(),
-            "send_message_to_main",
+            "implement_ticket",
             json!({
-                "prompt": "exact retry must not start another turn",
-                "ticketContext": {
-                    "ticketId": approved["document"]["ticket"]["id"],
-                    "expectedRevision": approved["document"]["ticket"]["revision"],
-                    "implementation": true
-                }
+                "ticketId": created["document"]["ticket"]["id"],
+                "expectedRevision": created["document"]["ticket"]["revision"],
+                "reason": "exact retry must not start another turn"
             }),
             lab.path(),
         )
@@ -1228,6 +1183,31 @@ async fn ticket_dispatch_flow_scenario() -> color_eyre::Result<()> {
             .status,
         crate::ticket_store::Status::InProgress
     );
+    for (expected, category, body) in [
+        (
+            0,
+            "implementation_update",
+            "implemented the assigned change",
+        ),
+        (1, "validation", "verified the assigned change"),
+    ] {
+        let comment = call_ticket_tool_at_turn(
+            &server,
+            &main,
+            implementation_turn,
+            "append_ticket_comment",
+            json!({
+                "ticketId": created["document"]["ticket"]["id"],
+                "expectedCommentRevision": expected,
+                "specificationRevision": dispatched["approvedRevision"],
+                "category": category,
+                "body": body,
+            }),
+            lab.path(),
+        )
+        .await;
+        assert!(comment.success, "comment failed: {comment:?}");
+    }
     let ready = response_json(
         call_ticket_tool_at_turn(
             &server,
@@ -1253,265 +1233,231 @@ async fn ticket_dispatch_flow_scenario() -> color_eyre::Result<()> {
         .await,
     );
     assert_eq!(duplicate["idempotent"], true);
+    let _ = server
+        .request_handle()
+        .request_typed::<codex_app_server_protocol::TurnInterruptResponse>(
+            ClientRequest::TurnInterrupt {
+                request_id: RequestId::String("finish-first-ticket-turn".into()),
+                params: codex_app_server_protocol::TurnInterruptParams {
+                    thread_id: main.clone(),
+                    turn_id: implementation_turn.into(),
+                },
+            },
+        )
+        .await;
+
+    let crash_ticket = response_json(
+        call_ticket_tool(
+            &server,
+            &side.to_string(),
+            "create_ticket",
+            json!({
+                "title": "recover TurnStart before store bind",
+                "scope": ["runtime"],
+                "proposal": {"originalIdea": "reconcile stable notification id"}
+            }),
+            lab.path(),
+        )
+        .await,
+    );
+    let store = crate::ticket_store::TicketStore::test(lab.path());
+    let pending = match store.implement(
+        2,
+        crash_ticket["document"]["ticket"]["revision"]
+            .as_u64()
+            .unwrap(),
+        crate::ticket_store::Source {
+            thread_id: side.to_string(),
+            role: crate::ticket_store::ActorRole::Side,
+            turn_id: "crash-window-side-turn".into(),
+        },
+        main.clone(),
+        "persist before external delivery".into(),
+    )? {
+        crate::ticket_store::ImplementCheck::Pending(document) => document,
+        crate::ticket_store::ImplementCheck::Delivered(_) => unreachable!(),
+    };
+    let pending_assignment = pending.ticket.assignment.as_ref().unwrap();
+    let (_, first_attempt) =
+        store.begin_delivery_attempt(2, &pending_assignment.notification_id, &main)?;
+    assert!(first_attempt);
+    let started: TurnStartResponse = server
+        .request_handle()
+        .request_typed(ClientRequest::TurnStart {
+            request_id: RequestId::String("simulate-crash-after-turn-start".into()),
+            params: TurnStartParams {
+                thread_id: main.clone(),
+                client_user_message_id: Some(pending_assignment.notification_id.clone()),
+                input: vec![UserInput::Text {
+                    text: "Ticket #2 is assigned to you and approved for implementation.".into(),
+                    text_elements: Vec::new(),
+                }],
+                ..Default::default()
+            },
+        })
+        .await?;
+    let (pump_events_tx, _pump_events_rx) = tokio::sync::mpsc::unbounded_channel();
+    let recovered = retry_pending_ticket_notifications(
+        server.request_handle(),
+        ThreadStartParams {
+            runtime_workspace_roots: Some(vec![
+                codex_utils_absolute_path::AbsolutePathBuf::try_from(lab.path().to_path_buf())?,
+            ]),
+            ..ThreadStartParams::default()
+        },
+        Features::with_defaults(),
+        AppEventSender::new(pump_events_tx),
+    )
+    .await
+    .map_err(|error| color_eyre::eyre::eyre!(error))?;
+    assert_eq!(recovered, 1);
+    let recovered_document = store.read(2)?;
+    let recovered_assignment = recovered_document.ticket.assignment.unwrap();
+    assert_eq!(
+        recovered_assignment.delivered_main_turn_id.as_deref(),
+        Some(started.turn.id.as_str())
+    );
+    assert_eq!(
+        recovered_assignment.delivery_state,
+        crate::ticket_store::DeliveryState::Delivered
+    );
+    let (second_events_tx, _second_events_rx) = tokio::sync::mpsc::unbounded_channel();
+    let second_recovered = retry_pending_ticket_notifications(
+        server.request_handle(),
+        ThreadStartParams {
+            runtime_workspace_roots: Some(vec![
+                codex_utils_absolute_path::AbsolutePathBuf::try_from(lab.path().to_path_buf())?,
+            ]),
+            ..ThreadStartParams::default()
+        },
+        Features::with_defaults(),
+        AppEventSender::new(second_events_tx),
+    )
+    .await
+    .map_err(|error| color_eyre::eyre::eyre!(error))?;
+    assert_eq!(second_recovered, 0);
     server.shutdown().await?;
     Ok(())
 }
 
 #[test]
-fn paired_main_bridge_confines_target_to_side_metadata() -> color_eyre::Result<()> {
-    std::thread::Builder::new()
-        .name("paired-main-bridge-test".to_string())
-        .stack_size(32 * 1024 * 1024)
-        .spawn(|| {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?
-                .block_on(paired_main_bridge_confines_target_scenario())
-        })?
-        .join()
-        .map_err(|panic| color_eyre::eyre::eyre!("paired bridge test panicked: {panic:?}"))?
-}
-
-async fn paired_main_bridge_confines_target_scenario() -> color_eyre::Result<()> {
-    let (codex_home, mut server, source, target) = test_server(json!({})).await?;
-    let config = ConfigBuilder::default()
-        .codex_home(codex_home.path().to_path_buf())
-        .build()
-        .await?;
-    let (events_tx, _events_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (status_updates, _status_rx) = broadcast::channel(/*capacity*/ 8);
-    server
-        .start_dynamic_tool_mcp(
-            config.clone(),
-            AppEventSender::new(events_tx),
-            status_updates,
-        )
-        .await?;
-    let mut side_config = config.clone();
-    side_config.strict_read_only_tools = true;
-    let main = ThreadId::from_string(&target)?;
-    let side = server
-        .start_side_thread(
-            &crate::local_settings::LocalSettings::from(&side_config),
-            &side_config,
-            main,
-            /*selected_profile*/ None,
-        )
-        .await?
-        .session
-        .thread_id;
-
-    let rejected = call_tool(
-        &server,
-        &source,
-        "send_message_to_main",
-        json!({"prompt": "must not select an arbitrary target"}),
-    )
-    .await;
-    assert!(!rejected.success);
-
-    let sent = response_json(
-        call_tool(
-            &server,
-            &side.to_string(),
-            "send_message_to_main",
-            json!({"prompt": "paired-only advice"}),
-        )
-        .await,
-    );
-    assert_eq!(sent["threadId"], main.to_string());
-    let forged_user_authorization = call_tool(
-        &server,
-        &side.to_string(),
-        "send_message_to_main",
-        json!({
-            "prompt": "attempt to bypass approval",
-            "userAuthorized": true
-        }),
-    )
-    .await;
-    assert!(!forged_user_authorization.success);
-    let explicit_main_send = response_json(
-        call_tool(
-            &server,
-            &side.to_string(),
-            "send_message_to_main",
-            json!({"prompt": "explicit slash-main advice"}),
-        )
-        .await,
-    );
-    assert_eq!(explicit_main_send["threadId"], main.to_string());
-
-    let second_main = ThreadId::from_string(&source)?;
-    let second_side = server
-        .start_side_thread(
-            &crate::local_settings::LocalSettings::from(&side_config),
-            &side_config,
-            second_main,
-            /*selected_profile*/ None,
-        )
-        .await?
-        .session
-        .thread_id;
-    server
-        .thread_inject_items(
-            second_main,
-            vec![serde_json::from_value(json!({
-                "type": "message",
-                "role": "assistant",
-                "content": [{"type": "output_text", "text": "saved second MAIN history"}]
-            }))?],
-        )
-        .await?;
-    let second_sent = response_json(
-        call_tool(
-            &server,
-            &second_side.to_string(),
-            "send_message_to_main",
-            json!({"prompt": "second paired advice"}),
-        )
-        .await,
-    );
-    assert_eq!(second_sent["threadId"], second_main.to_string());
-    // Materialize rollouts for the freshly started MAIN/SIDE threads so the
-    // restart below exercises cold resume from persisted identity.
-    for thread_id in [side, second_side] {
-        server
-            .thread_inject_items(
-                thread_id,
-                vec![serde_json::from_value(json!({
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [{"type": "output_text", "text": "saved pair history"}]
-                }))?],
-            )
-            .await?;
+fn free_form_paired_main_bridge_is_absent_and_implement_target_is_unforgeable() {
+    let specs = tool_specs();
+    let functions = specs.into_iter().flat_map(|spec| match spec {
+        DynamicToolSpec::Function(function) => vec![function],
+        DynamicToolSpec::Namespace(namespace) => namespace
+            .tools
+            .into_iter()
+            .map(|tool| match tool {
+                DynamicToolNamespaceTool::Function(function) => function,
+            })
+            .collect(),
+    });
+    let mut implement = None;
+    for function in functions {
+        assert_ne!(function.name, "send_message_to_main");
+        if function.name == "implement_ticket" {
+            implement = Some(function);
+        }
     }
-
-    server.shutdown().await?;
-    let mut server = crate::start_embedded_app_server_for_picker(&config).await?;
-    let (events_tx, _events_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (status_updates, _status_rx) = broadcast::channel(/*capacity*/ 8);
-    server
-        .start_dynamic_tool_mcp(
-            config.clone(),
-            AppEventSender::new(events_tx),
-            status_updates,
-        )
-        .await?;
-    for thread_id in [main, second_main] {
-        server
-            .resume_thread(
-                &crate::local_settings::LocalSettings::from(&config),
-                config.clone(),
-                thread_id,
-                ResumeModelSettings::RestoreFromThread,
-            )
-            .await?;
-    }
-    for thread_id in [side, second_side] {
-        server
-            .resume_thread(
-                &crate::local_settings::LocalSettings::from(&config),
-                config.clone(),
-                thread_id,
-                ResumeModelSettings::RestoreFromThread,
-            )
-            .await?;
-    }
-    let resumed_sent = response_json(
-        call_tool(
-            &server,
-            &side.to_string(),
-            "send_message_to_main",
-            json!({"prompt": "resumed paired advice"}),
-        )
-        .await,
-    );
-    assert_eq!(resumed_sent["threadId"], main.to_string());
-    let resumed_second_sent = response_json(
-        call_tool(
-            &server,
-            &second_side.to_string(),
-            "send_message_to_main",
-            json!({"prompt": "resumed second paired advice"}),
-        )
-        .await,
-    );
-    assert_eq!(resumed_second_sent["threadId"], second_main.to_string());
-
-    let paired_spec = tool_specs()
-        .into_iter()
-        .find_map(|spec| match spec {
-            DynamicToolSpec::Namespace(namespace) => namespace.tools.into_iter().find_map(|tool| {
-                let DynamicToolNamespaceTool::Function(function) = tool;
-                (function.name == "send_message_to_main").then_some(function)
-            }),
-            DynamicToolSpec::Function(_) => None,
-        })
-        .expect("paired MAIN tool");
-    let properties = paired_spec.input_schema["properties"]
+    let implement = implement.expect("implement_ticket tool");
+    let properties = implement.input_schema["properties"]
         .as_object()
         .expect("properties");
-    assert!(properties.contains_key("prompt"));
-    assert!(properties.contains_key("ticketContext"));
+    assert!(properties.contains_key("ticketId"));
+    assert!(properties.contains_key("expectedRevision"));
+    assert!(properties.contains_key("reason"));
     assert!(!properties.contains_key("threadId"));
-    assert_eq!(
-        properties["ticketContext"]["properties"]["implementation"]["const"],
-        true
-    );
-    let ready_spec = tool_specs()
-        .into_iter()
-        .find_map(|spec| match spec {
-            DynamicToolSpec::Namespace(namespace) => namespace.tools.into_iter().find_map(|tool| {
-                let DynamicToolNamespaceTool::Function(function) = tool;
-                (function.name == "report_ticket_ready").then_some(function)
-            }),
-            DynamicToolSpec::Function(_) => None,
-        })
-        .expect("ticket completion tool");
+    assert!(!properties.contains_key("prompt"));
+    assert!(!properties.contains_key("ticketContext"));
+}
+
+#[test]
+fn large_ticket_sections_are_exactly_recoverable_through_explicit_cursors() {
+    fn recover(content: &str) -> (String, usize) {
+        let mut cursor = 0;
+        let mut recovered = String::new();
+        let mut pages = 0;
+        loop {
+            let page = paginate_text(content, cursor, 7_003).expect("valid page");
+            assert_eq!(page.cursor, cursor);
+            recovered.push_str(&page.content);
+            pages += 1;
+            match page.next_cursor {
+                Some(next) => {
+                    assert!(next > cursor, "continuation cursor must advance");
+                    cursor = next;
+                }
+                None => break,
+            }
+        }
+        (recovered, pages)
+    }
+
+    let segment = "αβγδ—ticket-byte-budget—🙂\n".repeat(900);
+    let proposal = crate::ticket_store::Proposal {
+        original_idea: format!("idea:{segment}"),
+        motivation: format!("motivation:{segment}"),
+        evidence: format!("evidence:{segment}"),
+        reasoning: format!("reasoning:{segment}"),
+        proposed_implementation_experiment: format!("implementation:{segment}"),
+        acceptance_criteria: format!("acceptance:{segment}"),
+        uncertainties: format!("uncertainties:{segment}"),
+        findings: format!("findings:{segment}"),
+    };
+    let specification = serde_json::to_string(&proposal).expect("serialize large specification");
+    assert!(specification.chars().count() > 150_000);
+
+    let (recovered, pages) = recover(&specification);
     assert!(
-        ready_spec.input_schema["properties"]
-            .as_object()
-            .is_some_and(serde_json::Map::is_empty)
+        pages > 20,
+        "test must cross the legacy output ceiling many times"
     );
-    let side_tool_names = side_fallback_tool_specs()
-        .into_iter()
-        .flat_map(|spec| match spec {
-            DynamicToolSpec::Function(function) => vec![function.name],
-            DynamicToolSpec::Namespace(namespace) => namespace
-                .tools
-                .into_iter()
-                .map(|tool| match tool {
-                    DynamicToolNamespaceTool::Function(function) => function.name,
-                })
-                .collect(),
-        })
-        .collect::<Vec<_>>();
-    assert!(
-        side_tool_names
-            .iter()
-            .any(|name| name == "read_workspace_file")
-    );
-    for ticket_tool in TICKET_TOOLS {
+    assert_eq!(recovered, specification);
+    assert_eq!(recovered.as_bytes(), specification.as_bytes());
+
+    let value: serde_json::Value = serde_json::from_str(&recovered).expect("complete JSON");
+    for section in [
+        "originalIdea",
+        "motivation",
+        "evidence",
+        "reasoning",
+        "proposedImplementationExperiment",
+        "acceptanceCriteria",
+        "uncertainties",
+        "findings",
+    ] {
         assert!(
-            side_tool_names.iter().any(|name| name == ticket_tool),
-            "SIDE fallback must retain {ticket_tool}"
+            value[section]
+                .as_str()
+                .is_some_and(|text| text.contains(&segment)),
+            "section {section} was not recovered"
         );
     }
-    for forbidden in [
-        "create_thread",
-        "send_message_to_thread",
-        "send_message_to_main",
-        "fork_thread",
-    ] {
-        assert!(!side_tool_names.iter().any(|name| name == forbidden));
-    }
-    let mut in_process_side = ThreadStartParams::default();
-    crate::dynamic_tools_mcp::ThreadToolTransport::Disabled
-        .configure_paired_side(&mut in_process_side);
-    assert_eq!(in_process_side.dynamic_tools, None);
 
-    server.shutdown().await?;
-    Ok(())
+    let comments = serde_json::to_string(
+        &(0..40)
+            .map(|id| {
+                json!({
+                    "id": id + 1,
+                    "category": "finding",
+                    "body": segment.clone(),
+                    "untrusted": true,
+                })
+            })
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    let (recovered_comments, comment_pages) = recover(&comments);
+    assert!(comment_pages > 100);
+    assert_eq!(recovered_comments.as_bytes(), comments.as_bytes());
+
+    let metadata = serde_json::to_string(&json!({
+        "ticket": {"id": 9, "revision": 6, "status": "in_progress"},
+        "commentRevision": 40,
+    }))
+    .unwrap();
+    let (recovered_metadata, metadata_pages) = recover(&metadata);
+    assert_eq!(metadata_pages, 1);
+    assert_eq!(recovered_metadata.as_bytes(), metadata.as_bytes());
 }

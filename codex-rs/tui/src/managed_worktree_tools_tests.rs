@@ -78,7 +78,7 @@ async fn start_server(
         .collect::<Vec<_>>();
     for tool in [
         "read_workspace_file",
-        "send_message_to_main",
+        "implement_ticket",
         "create_worktree",
         "get_worktree_creation_status",
         "list_worktrees",

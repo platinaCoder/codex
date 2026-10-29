@@ -128,13 +128,18 @@ const MCP_RESULT_TELEMETRY_SERVER_USER_FLOW_SPAN_ATTR: &str =
 const MCP_RESULT_TELEMETRY_TARGET_ID_MAX_CHARS: usize = 256;
 const MCP_TOOL_CALL_EVENT_RESULT_MAX_BYTES: usize = DEFAULT_OUTPUT_BYTES_CAP;
 const TUI_DYNAMIC_TOOLS_SERVER: &str = "codex_tui";
-const TUI_SEND_MESSAGE_TO_MAIN_TOOL: &str = "send_message_to_main";
-const TUI_APPROVAL_GATED_TICKET_TOOLS: [&str; 2] = ["create_ticket", "update_ticket"];
+const TUI_APPROVAL_GATED_TICKET_TOOLS: [&str; 7] = [
+    "create_ticket",
+    "update_ticket",
+    "implement_ticket",
+    "resume_ticket_review",
+    "reassign_ticket",
+    "retry_ticket_notification",
+    "append_ticket_comment",
+];
 
 fn is_tui_always_prompt_tool(server: &str, tool_name: &str) -> bool {
-    server == TUI_DYNAMIC_TOOLS_SERVER
-        && (tool_name == TUI_SEND_MESSAGE_TO_MAIN_TOOL
-            || TUI_APPROVAL_GATED_TICKET_TOOLS.contains(&tool_name))
+    server == TUI_DYNAMIC_TOOLS_SERVER && TUI_APPROVAL_GATED_TICKET_TOOLS.contains(&tool_name)
 }
 
 /// Handles the specified tool call and dispatches the appropriate MCP tool-call

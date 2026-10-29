@@ -1,14 +1,28 @@
 //! Compact ticket navigation above the paired research panes.
 
 use super::*;
-use crate::ticket_store::{ActorRole, Document, Status, Summary, TicketStore};
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
+use crate::ticket_store::ActorRole;
+use crate::ticket_store::Document;
+use crate::ticket_store::Status;
+use crate::ticket_store::Summary;
+use crate::ticket_store::TicketStore;
+use crossterm::event::KeyCode;
+use crossterm::event::KeyEvent;
+use crossterm::event::KeyEventKind;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Widget};
-use std::time::{Duration, Instant};
+use ratatui::style::Modifier;
+use ratatui::style::Style;
+use ratatui::text::Line;
+use ratatui::text::Span;
+use ratatui::widgets::Block;
+use ratatui::widgets::BorderType;
+use ratatui::widgets::Borders;
+use ratatui::widgets::Paragraph;
+use ratatui::widgets::Widget;
+use std::collections::BTreeMap;
+use std::time::Duration;
+use std::time::Instant;
 
 const REFRESH_INTERVAL: Duration = Duration::from_millis(750);
 const CARD_TITLE_CHARS: usize = 24;
@@ -23,6 +37,8 @@ pub(super) struct TicketUiState {
     last_refresh: Option<Instant>,
     error: Option<String>,
     modal: Option<TicketModalState>,
+    viewer_thread_id: Option<String>,
+    seen_comment_revisions: BTreeMap<(String, u64), u64>,
 }
 
 #[derive(Clone)]
@@ -32,6 +48,8 @@ struct TicketModalState {
     status: Status,
     role: ActorRole,
     review_required: bool,
+    comment_revision: u64,
+    approved_revision: Option<u64>,
 }
 
 enum ModalKeyResult {
@@ -157,11 +175,56 @@ impl TicketUiState {
         let KeyCode::Char(key) = key.code else {
             return ModalKeyResult::Ignored;
         };
-        let Some(update) = modal_action(modal, key.to_ascii_lowercase()) else {
-            return if matches!(
-                key.to_ascii_lowercase(),
-                'a' | 'b' | 'c' | 'p' | 'r' | 's' | 'v'
-            ) {
+        let key = key.to_ascii_lowercase();
+        if modal.role == ActorRole::Side
+            && key == 'i'
+            && matches!(modal.status, Status::Proposed | Status::Approved)
+        {
+            let prompt = format!(
+                "Call codex_tui.implement_ticket exactly once with ticketId {}, expectedRevision {}, and reason exactly equal to the text after `Reason:`. The runtime must derive the paired MAIN assignee. Reason: ",
+                modal.id, modal.revision
+            );
+            self.modal = None;
+            return ModalKeyResult::Compose(prompt);
+        }
+        if key == 'm' {
+            let specification_revision = modal.approved_revision.unwrap_or(modal.revision);
+            let prompt = format!(
+                "Call codex_tui.append_ticket_comment exactly once with ticketId {}, expectedCommentRevision {}, specificationRevision {}, category selected from question/finding/hypothesis/implementation_update/validation/review/blocker, and body exactly equal to the text after `Body:`. Body: ",
+                modal.id, modal.comment_revision, specification_revision
+            );
+            self.modal = None;
+            return ModalKeyResult::Compose(prompt);
+        }
+        if modal.role == ActorRole::Side && key == 'b' && modal.status == Status::AwaitingReview {
+            let prompt = format!(
+                "Call codex_tui.resume_ticket_review exactly once with ticketId {}, expectedRevision {}, and reason exactly equal to the text after `Reason:`. The runtime must retain the assigned MAIN. Reason: ",
+                modal.id, modal.revision
+            );
+            self.modal = None;
+            return ModalKeyResult::Compose(prompt);
+        }
+        if modal.role == ActorRole::Side
+            && key == 'r'
+            && matches!(modal.status, Status::InProgress | Status::AwaitingReview)
+        {
+            let prompt = format!(
+                "Call codex_tui.reassign_ticket exactly once with ticketId {}, expectedRevision {}, and reason exactly equal to the text after `Reason:`. The runtime must derive the current paired MAIN and enforce recovery-state constraints. Reason: ",
+                modal.id, modal.revision
+            );
+            self.modal = None;
+            return ModalKeyResult::Compose(prompt);
+        }
+        if modal.role == ActorRole::Side && key == 'y' && modal.status == Status::InProgress {
+            let prompt = format!(
+                "Call codex_tui.retry_ticket_notification exactly once with ticketId {}, expectedRevision {}, and reason exactly equal to the text after `Reason:`. The runtime must reuse the durable notification and assigned MAIN. Reason: ",
+                modal.id, modal.revision
+            );
+            self.modal = None;
+            return ModalKeyResult::Compose(prompt);
+        }
+        let Some(update) = modal_action(modal, key) else {
+            return if matches!(key, 'a' | 'b' | 'c' | 'i' | 'm' | 'p' | 'r' | 'v' | 'y') {
                 ModalKeyResult::Consumed
             } else {
                 ModalKeyResult::Ignored
@@ -240,10 +303,33 @@ impl TicketUiState {
                     if ticket.title.chars().count() > CARD_TITLE_CHARS {
                         title.push('…');
                     }
+                    let unread = self.viewer_thread_id.as_ref().is_some_and(|viewer| {
+                        self.seen_comment_revisions
+                            .get(&(viewer.to_string(), ticket.id))
+                            .copied()
+                            .unwrap_or(0)
+                            < ticket.comment_revision
+                    });
+                    let assignment = ticket.assigned_to.as_deref().map_or_else(
+                        || "unassigned".to_string(),
+                        |assignee| {
+                            format!(
+                                "{}@r{}:{:?}",
+                                assignee.chars().take(10).collect::<String>(),
+                                ticket.approved_revision.unwrap_or(0),
+                                ticket.delivery_state
+                            )
+                        },
+                    );
+                    let category = ticket.scope.first().map_or("uncategorized", String::as_str);
                     let text = format!(
-                        " #{} {} {}{} ",
+                        " #{}{} {} [{}] {} c{} {}{} ",
                         ticket.id,
+                        if unread { "*" } else { "" },
                         ticket.status.label(),
+                        category,
+                        assignment,
+                        ticket.comment_revision,
                         title,
                         if ticket.review_required { " !" } else { "" }
                     );
@@ -286,6 +372,9 @@ impl App {
             return false;
         }
         let paired = self.paired_main_and_side();
+        self.ticket_ui.viewer_thread_id = self
+            .current_displayed_thread_id()
+            .map(|thread_id| thread_id.to_string());
         if !self.ticket_ui.available {
             self.ticket_ui.focused = false;
         }
@@ -323,12 +412,23 @@ impl App {
                     .and_then(|store| store.read(id));
                 let lines = match document {
                     Ok(document) => {
+                        if let Some(viewer) = self.ticket_ui.viewer_thread_id.clone() {
+                            self.ticket_ui
+                                .seen_comment_revisions
+                                .insert((viewer, id), document.comment_revision);
+                        }
                         self.ticket_ui.modal = Some(TicketModalState {
                             id,
                             revision: document.ticket.revision,
                             status: document.ticket.status.clone(),
                             role,
                             review_required: document.ticket.review_required,
+                            comment_revision: document.comment_revision,
+                            approved_revision: document
+                                .ticket
+                                .assignment
+                                .as_ref()
+                                .map(|assignment| assignment.approved_revision),
                         });
                         modal_lines(&document, role)
                     }
@@ -377,6 +477,27 @@ fn modal_lines(document: &Document, role: ActorRole) -> Vec<Line<'static>> {
                 .as_deref()
                 .map_or_else(String::new, |reason| format!(" ({reason})"))
         )),
+        Line::from(format!(
+            "Category: {} · comments: {} · assignee: {} · approved revision: {} · delivery: {}",
+            ticket.scope.first().map_or("uncategorized", String::as_str),
+            document.comment_revision,
+            ticket
+                .assignment
+                .as_ref()
+                .map_or("unassigned", |assignment| assignment.assigned_to.as_str()),
+            ticket.assignment.as_ref().map_or_else(
+                || "none".into(),
+                |assignment| assignment.approved_revision.to_string()
+            ),
+            ticket.assignment.as_ref().map_or("none", |assignment| {
+                match assignment.delivery_state {
+                    crate::ticket_store::DeliveryState::Pending => "pending",
+                    crate::ticket_store::DeliveryState::Delivered => "delivered",
+                }
+            }),
+        )),
+        Line::default(),
+        Line::from("Authoritative specification").bold(),
         Line::default(),
     ];
     for (heading, text) in [
@@ -399,6 +520,36 @@ fn modal_lines(document: &Document, role: ActorRole) -> Vec<Line<'static>> {
         lines.extend(text.lines().map(|line| Line::from(line.to_string())));
         lines.push(Line::default());
     }
+    lines.push(Line::from("Comments").bold());
+    if document.comments.is_empty() {
+        lines.push(Line::from("No comments."));
+    } else {
+        for comment in &document.comments {
+            lines.push(
+                Line::from(format!(
+                    "┌ #{} · {:?} · {:?} · {} · spec r{}",
+                    comment.id,
+                    comment.category,
+                    comment.author_role,
+                    comment.timestamp.to_rfc3339(),
+                    comment.specification_revision,
+                ))
+                .bold(),
+            );
+            lines.push(Line::from(format!(
+                "│ {} · turn {}",
+                comment.author_thread_id, comment.author_turn_id
+            )));
+            lines.extend(
+                comment
+                    .body
+                    .lines()
+                    .map(|line| Line::from(format!("│ {line}"))),
+            );
+            lines.push(Line::from("└"));
+        }
+    }
+    lines.push(Line::default());
     lines.push(Line::from("Valid actions").bold());
     lines.push(Line::from(actions(
         &ticket.status,
@@ -411,13 +562,25 @@ fn modal_lines(document: &Document, role: ActorRole) -> Vec<Line<'static>> {
 
 fn actions(status: &Status, role: ActorRole, review_required: bool) -> String {
     if role == ActorRole::Main {
-        return "Read only. MAIN has no ticket mutation or lifecycle controls.".into();
+        return "[m] Comment. MAIN has no lifecycle controls; only the assigned MAIN may append."
+            .into();
     }
     let mut actions = match status {
-        Status::Proposed => vec!["[p] Approve", "[c] Cancel"],
-        Status::Approved => vec!["[s] Start implementation", "[c] Cancel"],
-        Status::InProgress => vec!["[r] Mark Awaiting Review", "[c] Cancel"],
-        Status::AwaitingReview => vec!["[b] Return to In Progress", "[a] Accept", "[c] Cancel"],
+        Status::Proposed => vec!["[i] Implement", "[m] Comment", "[c] Cancel"],
+        Status::Approved => vec!["[i] Implement (compatibility)", "[m] Comment", "[c] Cancel"],
+        Status::InProgress => vec![
+            "[m] Comment",
+            "[y] Retry pending delivery",
+            "[r] Reassign pending",
+            "[c] Cancel",
+        ],
+        Status::AwaitingReview => vec![
+            "[m] Comment",
+            "[b] Resume assigned MAIN",
+            "[r] Reassign",
+            "[a] Accept",
+            "[c] Cancel",
+        ],
         Status::Accepted | Status::Cancelled => Vec::new(),
     };
     if review_required && *status != Status::Cancelled {
@@ -438,14 +601,10 @@ fn modal_action(modal: &TicketModalState, key: char) -> Option<&'static str> {
         return Some("resolveReview.reason set from the text below");
     }
     match (&modal.status, key) {
-        (Status::Proposed, 'p') => Some("transition.to = `approved`"),
         (
             Status::Proposed | Status::Approved | Status::InProgress | Status::AwaitingReview,
             'c',
         ) => Some("transition.to = `cancelled`"),
-        (Status::Approved, 's') => Some("transition.to = `in_progress`"),
-        (Status::InProgress, 'r') => Some("transition.to = `awaiting_review`"),
-        (Status::AwaitingReview, 'b') => Some("transition.to = `in_progress`"),
         (Status::AwaitingReview, 'a') => Some("transition.to = `accepted`"),
         _ => None,
     }
@@ -486,6 +645,10 @@ mod tests {
             status,
             scope: vec!["runtime".into()],
             review_required,
+            assigned_to: None,
+            approved_revision: None,
+            delivery_state: None,
+            comment_revision: 0,
         }
     }
 
@@ -507,6 +670,10 @@ mod tests {
                 status: Status::Proposed,
                 scope: vec!["runtime".into()],
                 review_required: false,
+                assigned_to: None,
+                approved_revision: None,
+                delivery_state: None,
+                comment_revision: 0,
             }],
             ..Default::default()
         };
@@ -618,6 +785,8 @@ mod tests {
                 status: Status::AwaitingReview,
                 role: ActorRole::Side,
                 review_required: true,
+                comment_revision: 0,
+                approved_revision: Some(2),
             }),
             ..Default::default()
         };
@@ -640,6 +809,8 @@ mod tests {
             status: Status::AwaitingReview,
             role: ActorRole::Main,
             review_required: true,
+            comment_revision: 0,
+            approved_revision: Some(2),
         });
         assert!(matches!(
             state.modal_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),

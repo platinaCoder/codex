@@ -910,28 +910,15 @@ text(JSON.stringify(result));
                 ]
             } else if tail.contains("Hi! Say Hi to MAIN") {
                 let code = r#"
-const mainTool = ALL_TOOLS.find(({ name }) => name.endsWith("__send_message_to_main"));
-if (!mainTool) throw new Error("send_message_to_main missing from SIDE catalog");
-const result = await tools[mainTool.name]({ prompt: "PROACTIVE_SIDE_MESSAGE" });
-text(JSON.stringify(result));
+const legacy = ALL_TOOLS.find(({ name }) => name.endsWith("__send_message_to_main"));
+const implement = ALL_TOOLS.find(({ name }) => name.endsWith("__implement_ticket"));
+if (legacy || !implement) throw new Error(JSON.stringify({ legacy, implement }));
+text("SIDE_BRIDGE_REMOVED_OK");
 "#;
                 vec![
                     responses::ev_response_created("side-proactive-response"),
                     responses::ev_custom_tool_call("side-proactive", "exec", code),
                     responses::ev_completed("side-proactive-response"),
-                ]
-            } else if tail.contains("PROACTIVE_SIDE_MESSAGE") {
-                vec![
-                    responses::ev_assistant_message(
-                        "main-proactive-done",
-                        "MAIN_PROACTIVE_DISPATCH_OK",
-                    ),
-                    responses::ev_completed("main-proactive-done-response"),
-                ]
-            } else if tail.contains("verify deterministic dispatch") {
-                vec![
-                    responses::ev_assistant_message("main-slash-done", "MAIN_SLASH_DISPATCH_OK"),
-                    responses::ev_completed("main-slash-done-response"),
                 ]
             } else if tail.contains("COLD_RESUME_READ") {
                 let code = r#"
@@ -1153,17 +1140,7 @@ text(JSON.stringify({ catalogSafe: true, read }));
     );
 
     submit(&mut terminal, "Hi! Say Hi to MAIN")?;
-    terminal.wait_for_screen("Allow the codex_tui MCP server")?;
-    ensure!(
-        !terminal.screen_contains("MAIN_PROACTIVE_DISPATCH_OK"),
-        "proactive SIDE dispatch bypassed approval"
-    );
-    terminal.write_input(b"\r")?;
-    terminal.wait_for_screen("MAIN_PROACTIVE_DISPATCH_OK")?;
-    terminal.wait_for_screen("SIDE_PROACTIVE_SEND_OK")?;
-
-    submit_typed(&mut terminal, "/main verify deterministic dispatch")?;
-    terminal.wait_for_screen("MAIN_SLASH_DISPATCH_OK")?;
+    terminal.wait_for_screen("SIDE_BRIDGE_REMOVED_OK")?;
 
     let registry =
         std::fs::read_to_string(terminal._codex_home.path().join("ai_lab_side_pairs.json"))?;
@@ -1181,8 +1158,7 @@ text(JSON.stringify({ catalogSafe: true, read }));
     };
     terminal.restart_binary(&codex, &workspace_path, &resume_args)?;
     terminal.wait_for_startup()?;
-    terminal.wait_for_screen("MAIN_SLASH_DISPATCH_OK")?;
-    terminal.wait_for_screen("SIDE_PROACTIVE_SEND_OK")?;
+    terminal.wait_for_screen("SIDE_BRIDGE_REMOVED_OK")?;
     submit(&mut terminal, "/side")?;
     terminal.wait_for_screen("SIDE • focused")?;
     submit(&mut terminal, "COLD_RESUME_READ")?;

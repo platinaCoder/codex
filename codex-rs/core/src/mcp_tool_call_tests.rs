@@ -3495,8 +3495,8 @@ async fn narrow_tui_mutations_prompt_when_global_approval_policy_is_never() {
 
     for (tool, arguments) in [
         (
-            TUI_SEND_MESSAGE_TO_MAIN_TOOL,
-            serde_json::json!({"prompt": "Review this result"}),
+            "implement_ticket",
+            serde_json::json!({"ticketId": 1, "expectedRevision": 1, "reason": "approved"}),
         ),
         (
             "create_ticket",
@@ -3505,6 +3505,22 @@ async fn narrow_tui_mutations_prompt_when_global_approval_policy_is_never() {
         (
             "update_ticket",
             serde_json::json!({"ticketId": 1, "expectedRevision": 1}),
+        ),
+        (
+            "resume_ticket_review",
+            serde_json::json!({"ticketId": 1, "expectedRevision": 2, "reason": "review"}),
+        ),
+        (
+            "reassign_ticket",
+            serde_json::json!({"ticketId": 1, "expectedRevision": 2, "reason": "recovery"}),
+        ),
+        (
+            "retry_ticket_notification",
+            serde_json::json!({"ticketId": 1, "expectedRevision": 2, "reason": "retry"}),
+        ),
+        (
+            "append_ticket_comment",
+            serde_json::json!({"ticketId": 1, "body": "finding"}),
         ),
     ] {
         let call_id = format!("call-{tool}");
