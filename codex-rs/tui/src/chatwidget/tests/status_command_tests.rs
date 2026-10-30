@@ -89,6 +89,36 @@ async fn status_command_renders_immediately_without_rate_limit_refresh() {
 }
 
 #[tokio::test]
+async fn status_command_reports_standard_and_side_role_provenance() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    chat.dispatch_command(SlashCommand::Status);
+    let standard = match rx.try_recv() {
+        Ok(AppEvent::InsertHistoryCell(cell)) => {
+            lines_to_single_string(&cell.display_lines(/*width*/ 120))
+        }
+        other => panic!("expected standard status output, got {other:?}"),
+    };
+    assert!(standard.contains("Conversation role"));
+    assert!(standard.contains("Standard"));
+
+    let parent = ThreadId::new();
+    chat.set_side_conversation_active(/*active*/ true);
+    chat.set_side_parent_thread_id(parent);
+    chat.dispatch_command(SlashCommand::Status);
+    let side = match rx.try_recv() {
+        Ok(AppEvent::InsertHistoryCell(cell)) => {
+            lines_to_single_string(&cell.display_lines(/*width*/ 160))
+        }
+        other => panic!("expected SIDE status output, got {other:?}"),
+    };
+    assert!(side.contains("Side"));
+    assert!(side.contains(&parent.to_string()));
+    assert!(side.contains("read-only/no-network ceiling"));
+    assert!(side.contains("preflight"));
+}
+
+#[tokio::test]
 async fn status_command_uses_catalog_default_reasoning_when_config_empty() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.5")).await;
     chat.config.model_reasoning_effort = None;

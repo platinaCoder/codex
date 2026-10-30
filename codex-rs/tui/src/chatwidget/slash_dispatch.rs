@@ -56,15 +56,6 @@ impl ChatWidget {
 
     pub(super) fn handle_service_tier_command_dispatch(&mut self, command: ServiceTierCommand) {
         self.transcript.last_status_copy_targets = None;
-        if self.active_side_conversation {
-            self.add_error_message(format!(
-                "'/{}' is unavailable in side conversations. {SIDE_SLASH_COMMAND_UNAVAILABLE_HINT}",
-                command.name
-            ));
-            self.bottom_pane.drain_pending_submission_state();
-            self.bottom_pane.record_pending_slash_command_history();
-            return;
-        }
         self.toggle_service_tier_from_ui(command);
         self.bottom_pane.record_pending_slash_command_history();
     }

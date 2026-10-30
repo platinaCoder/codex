@@ -233,6 +233,9 @@ impl SessionState {
         root_turn_id: String,
         response_id: String,
         usage: &TokenUsage,
+        effective_model: String,
+        effective_reasoning_effort: Option<codex_protocol::openai_models::ReasoningEffort>,
+        effective_service_tier: Option<String>,
     ) -> TokenUsageRecord {
         let mut turn_token_usage = self
             .latest_token_usage_record
@@ -258,6 +261,9 @@ impl SessionState {
             usage: usage.clone(),
             turn_token_usage,
             thread_token_usage,
+            effective_model: Some(effective_model),
+            effective_reasoning_effort,
+            effective_service_tier,
         };
         self.latest_token_usage_record = Some(record.clone());
         record

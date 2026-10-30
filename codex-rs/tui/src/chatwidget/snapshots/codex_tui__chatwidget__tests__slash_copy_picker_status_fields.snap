@@ -5,10 +5,11 @@ expression: "render_bottom_popup(&chat,\n100).replace(&directory,\n\"[[workspace
   Copy to clipboard
 
 
-› 1. Whole status  >_ OpenAI Codex (vVERSION)
-  2. Model         gpt-5.5
-  3. Directory     [[workspace]]
-  4. Thread name   Clipboard example
-  5. Session ID    00000000-0000-0000-0000-000000000123
+› 1. Whole status       >_ OpenAI Codex (vVERSION)
+  2. Model              gpt-5.5
+  3. Conversation role  Standard
+  4. Directory          [[workspace]]
+  5. Thread name        Clipboard example
+  6. Session ID         00000000-0000-0000-0000-000000000123
 
   enter select · esc back

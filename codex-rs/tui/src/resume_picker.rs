@@ -6981,7 +6981,10 @@ session_picker_view = "dense"
 
         thread.thread_source = None;
         thread.name = Some(format!("AI Lab SIDE · parent {thread_id}"));
-        assert!(row_from_app_server_thread(thread).is_none());
+        assert!(
+            row_from_app_server_thread(thread).is_some(),
+            "a display name alone must not confer SIDE identity"
+        );
     }
 
     #[test]

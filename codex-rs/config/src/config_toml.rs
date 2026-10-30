@@ -162,12 +162,35 @@ pub struct FeatureToggleToml {
     pub enabled: Option<bool>,
 }
 
+/// Role-scoped defaults for new conversations.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct ConversationRolesToml {
+    pub side: Option<SideConversationRoleToml>,
+}
+
+/// Model-only defaults for newly created SIDE conversations.
+///
+/// Permission fields intentionally do not exist here: role permissions are server-owned and
+/// intersected independently from user configuration.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
+pub struct SideConversationRoleToml {
+    pub model: Option<String>,
+    pub model_reasoning_effort: Option<ReasoningEffort>,
+    pub service_tier: Option<String>,
+}
+
 /// Base config deserialized from ~/.codex/config.toml.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct ConfigToml {
     /// Optional override of model selection.
     pub model: Option<String>,
+    /// Model-only defaults for newly created role-scoped conversations.
+    pub conversation_roles: Option<ConversationRolesToml>,
     /// Default Daybreak preference for new threads and non-interactive turns.
     pub daybreak: Option<bool>,
     /// Review model override used by the `/review` feature.
@@ -1077,6 +1100,41 @@ mod tests {
                     .expect_err("idle timeout must be a nonnegative integer");
             assert!(error.to_string().contains("thread_unload_delay_secs"));
         }
+    }
+
+    #[test]
+    fn side_conversation_role_accepts_only_model_defaults() {
+        let config = toml::from_str::<ConfigToml>(
+            r#"
+[conversation_roles.side]
+model = "gpt-side"
+model_reasoning_effort = "high"
+service_tier = "priority"
+"#,
+        )
+        .expect("SIDE model defaults should deserialize");
+
+        let side = config
+            .conversation_roles
+            .and_then(|roles| roles.side)
+            .expect("SIDE defaults");
+        assert_eq!(side.model.as_deref(), Some("gpt-side"));
+        assert_eq!(side.model_reasoning_effort, Some(ReasoningEffort::High));
+        assert_eq!(side.service_tier.as_deref(), Some("priority"));
+    }
+
+    #[test]
+    fn side_conversation_role_rejects_permission_fields() {
+        let error = toml::from_str::<ConfigToml>(
+            r#"
+[conversation_roles.side]
+model = "gpt-side"
+sandbox_mode = "workspace-write"
+"#,
+        )
+        .expect_err("SIDE role settings must reject permission fields");
+
+        assert!(error.to_string().contains("unknown field `sandbox_mode`"));
     }
 
     #[test]

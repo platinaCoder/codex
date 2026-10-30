@@ -76,8 +76,6 @@ use tokio::time::Instant;
 use uuid::Uuid;
 use walkdir::WalkDir;
 
-use crate::app_server_session::PERSISTENT_SIDE_THREAD_SOURCE_PREFIX;
-
 #[path = "dynamic_tools_response.rs"]
 mod response;
 
@@ -118,7 +116,7 @@ pub(crate) const TICKET_TOOLS: [&str; 9] = [
     "retry_ticket_notification",
     "append_ticket_comment",
 ];
-const TICKET_MUTATION_TOOLS: [&str; 7] = [
+pub(crate) const TICKET_MUTATION_TOOLS: [&str; 7] = [
     "create_ticket",
     "update_ticket",
     "implement_ticket",
@@ -627,7 +625,9 @@ pub(crate) fn non_delegation_tool_specs() -> Vec<DynamicToolSpec> {
 /// Ticket handlers and the store independently verify durable SIDE identity;
 /// arbitrary delegation and filesystem mutation remain unavailable.
 pub(crate) fn side_fallback_tool_specs() -> Vec<DynamicToolSpec> {
-    filtered_tool_specs(|name| !DELEGATION_TOOLS.contains(&name))
+    filtered_tool_specs(|name| {
+        !DELEGATION_TOOLS.contains(&name) && !TICKET_MUTATION_TOOLS.contains(&name)
+    })
 }
 
 fn filtered_tool_specs(mut retain: impl FnMut(&str) -> bool) -> Vec<DynamicToolSpec> {
@@ -2124,12 +2124,24 @@ fn same_thread_id(first: &str, second: &str) -> bool {
 }
 
 fn is_side_thread(thread: &Thread) -> bool {
+    let thread_id = ThreadId::from_string(&thread.id).ok();
+    let control_parent = thread
+        .parent_thread_id
+        .as_deref()
+        .and_then(|parent| ThreadId::from_string(parent).ok());
     matches!(
-        thread.thread_source.as_ref(),
-        Some(ThreadSource::Feature(source))
-            if source
-                .strip_prefix(PERSISTENT_SIDE_THREAD_SOURCE_PREFIX)
-                .is_some_and(|suffix| suffix.starts_with(':'))
+        codex_protocol::resolve_conversation_role_feature(
+            thread
+                .thread_source
+                .as_ref()
+                .and_then(|source| match source {
+                    ThreadSource::Feature(feature) => Some(feature.as_str()),
+                    _ => None,
+                }),
+            thread_id,
+            control_parent,
+        ),
+        codex_protocol::ConversationRole::Side { .. }
     )
 }
 
@@ -2206,16 +2218,23 @@ async fn paired_main_thread_id(
     side_thread_id: &str,
 ) -> Result<String, String> {
     let side = read_thread(handle, side_thread_id).await?;
-    let Some(ThreadSource::Feature(source)) = side.thread_source.as_ref() else {
-        return Err("only a durable SIDE thread can message a paired MAIN thread".to_string());
-    };
-    let prefix = format!("{PERSISTENT_SIDE_THREAD_SOURCE_PREFIX}:");
-    let Some(parent) = source.strip_prefix(&prefix) else {
-        return Err("calling thread is not a durable SIDE thread".to_string());
-    };
-    let parent = ThreadId::from_string(parent)
-        .map_err(|_| "SIDE pairing metadata contains an invalid MAIN thread id".to_string())?
-        .to_string();
+    let side_id =
+        ThreadId::from_string(&side.id).map_err(|_| "SIDE thread id is malformed".to_string())?;
+    let control_parent = side
+        .parent_thread_id
+        .as_deref()
+        .and_then(|parent| ThreadId::from_string(parent).ok());
+    let parent = codex_protocol::resolve_conversation_role_feature(
+        side.thread_source.as_ref().and_then(|source| match source {
+            ThreadSource::Feature(feature) => Some(feature.as_str()),
+            _ => None,
+        }),
+        Some(side_id),
+        control_parent,
+    )
+    .paired_main_id()
+    .ok_or_else(|| "calling thread is not a valid durable SIDE thread".to_string())?
+    .to_string();
     let main = read_thread(handle, &parent).await?;
     if !same_thread_id(&main.id, &parent) {
         return Err("paired MAIN thread could not be verified".to_string());

@@ -3,6 +3,7 @@
 use super::*;
 use crate::permission_discovery::PermissionDiscovery;
 use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS;
+use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_READ_ONLY;
 use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_WORKSPACE;
 
 pub(super) fn permission_preset_description(preset: &ApprovalPreset) -> &'static str {
@@ -72,6 +73,13 @@ impl ChatWidget {
             ":ask-for-approval" | ":approve-for-me" => BUILT_IN_PERMISSION_PROFILE_WORKSPACE,
             id => id,
         };
+        if self.active_side_conversation && profile_id != BUILT_IN_PERMISSION_PROFILE_READ_ONLY {
+            self.add_error_message(
+                "SIDE has an immutable read-only permission ceiling; this profile cannot be selected."
+                    .to_string(),
+            );
+            return false;
+        }
         let Some(profile) = discovery
             .profiles
             .iter()
@@ -170,6 +178,26 @@ impl ChatWidget {
             );
             return;
         };
+        if self.active_side_conversation {
+            let items = vec![self.builtin_permission_mode_selection_item(
+                &discovery,
+                read_only,
+                BUILT_IN_PERMISSION_PROFILE_READ_ONLY,
+                "SIDE's immutable read-only filesystem and no-network ceiling".to_string(),
+                AskForApproval::from(read_only.approval),
+                ApprovalsReviewer::User,
+            )];
+            self.bottom_pane.show_selection_view(SelectionViewParams {
+                view_id: Some(super::permission_discovery::VIEW_ID),
+                items,
+                title: Some("SIDE Permissions".to_string()),
+                subtitle: Some(
+                    "Only profiles within the server-owned SIDE ceiling are available.".to_string(),
+                ),
+                ..SelectionViewParams::picker()
+            });
+            return;
+        }
         let mut items = vec![self.builtin_permission_mode_selection_item(
             &discovery,
             default,

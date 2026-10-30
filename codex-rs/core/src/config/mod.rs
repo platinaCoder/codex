@@ -640,6 +640,9 @@ pub struct Config {
     /// Optional override of model selection.
     pub model: Option<String>,
 
+    /// Model-only defaults for newly created role-scoped conversations.
+    pub conversation_roles: codex_config::ConversationRolesToml,
+
     /// Default Daybreak preference for new threads and non-interactive turns.
     pub daybreak_enabled: bool,
 
@@ -4482,6 +4485,7 @@ impl Config {
             plugins: cfg.plugins,
             prefer_mxc,
             model,
+            conversation_roles: cfg.conversation_roles.unwrap_or_default(),
             daybreak_enabled: cfg.daybreak.unwrap_or(false),
             service_tier,
             review_model,

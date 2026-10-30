@@ -1913,10 +1913,10 @@ async fn slash_copy_status_omits_missing_fields_and_copies_full_directory() {
     chat.dispatch_command(SlashCommand::Copy);
     let popup = render_bottom_popup(&chat, /*width*/ 80);
     assert!(popup.contains("2. Model"));
-    assert!(popup.contains("3. Directory"));
+    assert!(popup.contains("4. Directory"));
     assert!(!popup.contains("Thread name"));
     assert!(!popup.contains("Session ID"));
-    chat.handle_key_event(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE));
+    chat.handle_key_event(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE));
     assert_eq!(
         next_copy_selection(&mut rx),
         (directory, "Directory".to_string())
@@ -3556,6 +3556,26 @@ async fn fast_slash_command_updates_and_persists_local_service_tier() {
         "expected fast-mode persistence app event; events: {events:?}"
     );
 
+    assert_matches!(op_rx.try_recv(), Err(TryRecvError::Empty));
+}
+
+#[tokio::test]
+async fn fast_slash_command_remains_available_in_side() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
+    set_fast_mode_test_catalog(&mut chat);
+    chat.set_feature_enabled(Feature::FastMode, /*enabled*/ true);
+    chat.set_side_conversation_active(/*active*/ true);
+
+    submit_composer_text(&mut chat, "/fast");
+
+    let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AppEvent::CodexOp(Op::OverrideTurnContext {
+            service_tier: Some(Some(service_tier)),
+            ..
+        }) if service_tier == ServiceTier::Fast.request_value()
+    )));
     assert_matches!(op_rx.try_recv(), Err(TryRecvError::Empty));
 }
 

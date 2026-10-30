@@ -22,6 +22,7 @@ use crate::agents_md_manager::SessionInstructions;
 use crate::attestation::AttestationProvider;
 use crate::compact;
 use crate::compact::CompactedHistoryMetadata;
+use crate::config::ConstraintError;
 use crate::config::ManagedFeatures;
 use crate::context::ContextualUserFragment;
 use crate::context::DeveloperInstructions;
@@ -174,6 +175,7 @@ use codex_protocol::request_permissions::RequestPermissionsEvent;
 use codex_protocol::request_permissions::RequestPermissionsResponse;
 use codex_protocol::request_user_input::RequestUserInputArgs;
 use codex_protocol::request_user_input::RequestUserInputResponse;
+use codex_protocol::resolve_conversation_role;
 use codex_rmcp_client::ElicitationResponse;
 use codex_rollout::should_persist_response_item;
 use codex_rollout::state_db;
@@ -296,10 +298,12 @@ pub(crate) use self::input_queue::TurnInputQueue;
 pub(crate) use self::input_queue::UserInputMetadata;
 use self::review::spawn_review_thread;
 use self::session::AppServerClientMetadata;
+use self::session::ConversationRoleConstraints;
 use self::session::Session;
 use self::session::SessionConfiguration;
 use self::session::SessionSettingsCommit;
 pub(crate) use self::session::SessionSettingsUpdate;
+use self::session::validate_conversation_role_model;
 #[cfg(test)]
 use self::turn::AssistantMessageStreamParsers;
 use self::turn::RealtimeEventText;
@@ -918,6 +922,13 @@ impl Session {
             &model_info,
         );
         let storage_originator = AuthStorageOriginator::from_client_name(&originator);
+        let role_constraints = ConversationRoleConstraints::new(resolve_conversation_role(
+            thread_source.as_ref(),
+            reserved_thread_id,
+            parent_thread_id,
+        ));
+        let developer_instructions =
+            role_constraints.apply_developer_instructions(config.developer_instructions.as_deref());
         let session_configuration = SessionConfiguration {
             turn_extension_init,
             provider: create_model_provider(
@@ -934,7 +945,7 @@ impl Session {
             }),
             environments: environment_selections.clone(),
             model_info_overrides: config.to_models_manager_config().into(),
-            developer_instructions: config.developer_instructions.clone(),
+            developer_instructions,
             base_instructions,
             permission_profile_state: session_permission_profile_state_from_config(&config)?,
             allow_login_shell: config.permissions.allow_login_shell,
@@ -956,6 +967,7 @@ impl Session {
             history_mode,
             forked_from_thread_id,
             parent_thread_id,
+            role_constraints,
             thread_source,
             originator,
             dynamic_tools: Arc::from(dynamic_tools),
@@ -2041,6 +2053,10 @@ impl Session {
         updates: SessionSettingsUpdate,
         should_commit: impl FnOnce(&SessionConfiguration, &SessionConfiguration) -> bool + Send,
     ) -> ConstraintResult<Option<SessionSettingsCommit>> {
+        let changes_model_settings = updates.step_settings.model.is_some()
+            || updates.step_settings.effort.is_some()
+            || updates.step_settings.service_tier.is_some()
+            || updates.step_settings.collaboration_mode.is_some();
         let notify_config_contributors = !self.services.extensions.config_contributors().is_empty();
         let windows_sandbox_changed;
         let (
@@ -2060,6 +2076,27 @@ impl Session {
                     return Err(err);
                 }
             };
+
+            if changes_model_settings && updated.role_constraints.requires_strict_read_only() {
+                let model_info = updated
+                    .step_settings
+                    .resolve_model_info(
+                        self.services.models_manager.as_ref(),
+                        &updated.model_info_overrides,
+                    )
+                    .await;
+                validate_conversation_role_model(
+                    updated.role_constraints,
+                    &updated.step_settings,
+                    &model_info,
+                )
+                .map_err(|error| ConstraintError::InvalidValue {
+                    field_name: "conversation_role_model",
+                    candidate: updated.step_settings.collaboration_mode.model().to_string(),
+                    allowed: error,
+                    requirement_source: codex_config::RequirementSource::Unknown,
+                })?;
+            }
 
             if !should_commit(&state.session_configuration, &updated) {
                 return Ok(None);
@@ -5220,6 +5257,9 @@ impl Session {
                 .unwrap_or_else(|| turn_context.sub_id.clone()),
             response_id.to_string(),
             usage,
+            turn_context.initial_settings.model_info.slug.clone(),
+            turn_context.initial_settings.effective_reasoning_effort(),
+            turn_context.initial_settings.service_tier.clone(),
         );
         self.persist_rollout_items(&[RolloutItem::TokenUsageRecord(record)])
             .await;

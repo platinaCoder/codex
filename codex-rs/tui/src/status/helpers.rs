@@ -31,6 +31,9 @@ pub(crate) fn compose_model_display(
             details.push(format!("summaries {}", summary.to_ascii_lowercase()));
         }
     }
+    if let Some((_, tier)) = entries.iter().find(|(k, _)| *k == "service tier") {
+        details.push(format!("service tier {}", tier.to_ascii_lowercase()));
+    }
 
     (model_name.to_string(), details)
 }

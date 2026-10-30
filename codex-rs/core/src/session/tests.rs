@@ -3468,6 +3468,9 @@ fn latest_token_usage_record_stops_at_compaction_checkpoint() {
         usage: TokenUsage::default(),
         turn_token_usage: TokenUsage::default(),
         thread_token_usage: TokenUsage::default(),
+        effective_model: None,
+        effective_reasoning_effort: None,
+        effective_service_tier: None,
     };
     let checkpoint = |latest_token_usage_record| {
         RolloutItem::Compacted(Box::new(CompactedItem {
@@ -4105,6 +4108,9 @@ async fn start_new_context_window_persists_checkpoint_state() {
         usage: TokenUsage::default(),
         turn_token_usage: TokenUsage::default(),
         thread_token_usage: TokenUsage::default(),
+        effective_model: None,
+        effective_reasoning_effort: None,
+        effective_service_tier: None,
     };
     session.state.lock().await.latest_token_usage_record = Some(token_usage_record.clone());
     let step_context = session
@@ -4549,6 +4555,7 @@ async fn set_rate_limits_retains_previous_credits() {
         forked_from_thread_id: None,
         parent_thread_id: None,
         thread_source: None,
+        role_constraints: ConversationRoleConstraints::standard(),
         originator: "test_originator".to_string(),
         dynamic_tools: Arc::default(),
         user_shell_override: None,
@@ -4672,6 +4679,7 @@ async fn set_rate_limits_updates_plan_type_when_present() {
         forked_from_thread_id: None,
         parent_thread_id: None,
         thread_source: None,
+        role_constraints: ConversationRoleConstraints::standard(),
         originator: "test_originator".to_string(),
         dynamic_tools: Arc::default(),
         user_shell_override: None,
@@ -5297,6 +5305,7 @@ pub(crate) async fn make_session_configuration_for_tests() -> SessionConfigurati
         forked_from_thread_id: None,
         parent_thread_id: None,
         thread_source: None,
+        role_constraints: ConversationRoleConstraints::standard(),
         originator: "test_originator".to_string(),
         dynamic_tools: Arc::default(),
         user_shell_override: None,
@@ -6871,6 +6880,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         forked_from_thread_id: None,
         parent_thread_id: None,
         thread_source: None,
+        role_constraints: ConversationRoleConstraints::standard(),
         originator: "test_originator".to_string(),
         dynamic_tools: Arc::default(),
         user_shell_override: None,
@@ -7192,6 +7202,7 @@ async fn make_session_with_config_and_rx(
         forked_from_thread_id: None,
         parent_thread_id: None,
         thread_source: None,
+        role_constraints: ConversationRoleConstraints::standard(),
         originator: "test_originator".to_string(),
         dynamic_tools: Arc::default(),
         user_shell_override: None,
@@ -7329,6 +7340,7 @@ async fn make_session_with_history_source_and_agent_control_and_rx(
         forked_from_thread_id: None,
         parent_thread_id: None,
         thread_source: None,
+        role_constraints: ConversationRoleConstraints::standard(),
         originator: "test_originator".to_string(),
         dynamic_tools: Arc::default(),
         user_shell_override: None,
@@ -9157,6 +9169,7 @@ where
         forked_from_thread_id: None,
         parent_thread_id: None,
         thread_source: None,
+        role_constraints: ConversationRoleConstraints::standard(),
         originator: "test_originator".to_string(),
         dynamic_tools: Arc::from(dynamic_tools),
         user_shell_override: None,

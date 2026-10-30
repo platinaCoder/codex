@@ -168,7 +168,7 @@ const JSONRPC_INVALID_REQUEST: i64 = -32600;
 const JSONRPC_METHOD_NOT_FOUND: i64 = -32601;
 const JSONRPC_INVALID_PARAMS: i64 = -32602;
 pub(crate) const EXTERNAL_AGENT_CONFIG_IMPORT_IN_PROGRESS_MESSAGE: &str = "A previous external agent import is still running. Wait for it to finish before importing again.";
-pub(crate) const PERSISTENT_SIDE_THREAD_SOURCE_PREFIX: &str = "ai_lab_side";
+pub(crate) use codex_protocol::AI_LAB_SIDE_THREAD_SOURCE_PREFIX as PERSISTENT_SIDE_THREAD_SOURCE_PREFIX;
 const THREAD_SETTINGS_UPDATE_METHOD: &str = "thread/settings/update";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -955,12 +955,15 @@ impl AppServerSession {
         thread_source: ThreadSource,
     ) -> Result<AppServerStartedThread> {
         let request_id = self.next_request_id();
-        let persistent_side_main = match &thread_source {
-            ThreadSource::Feature(source) => source
-                .strip_prefix(&format!("{PERSISTENT_SIDE_THREAD_SOURCE_PREFIX}:"))
-                .and_then(|main_id| ThreadId::from_string(main_id).ok()),
-            _ => None,
-        };
+        let persistent_side_main = codex_protocol::resolve_conversation_role_feature(
+            match &thread_source {
+                ThreadSource::Feature(feature) => Some(feature.as_str()),
+                _ => None,
+            },
+            None,
+            None,
+        )
+        .paired_main_id();
         let is_persistent_side = persistent_side_main.is_some();
         let session_config = self.session_config_with_effective_service_tier(config);
         let mut params = thread_start_params_from_config(
@@ -971,6 +974,7 @@ impl AppServerSession {
         );
         params.thread_source = Some(thread_source);
         if is_persistent_side {
+            params.allow_provider_model_fallback = false;
             params.developer_instructions = with_terminal_visualization_instructions(
                 config,
                 config.developer_instructions.clone(),
@@ -999,6 +1003,7 @@ impl AppServerSession {
         } else {
             self.thread_tool_transport().configure(&mut params);
         }
+        let requested_side_model = is_persistent_side.then(|| params.model.clone()).flatten();
         let request_handle = self.request_handle();
         let (response, history_support, task_tools_available) =
             request_thread_start_with_history_fallback(&request_handle, request_id, params)
@@ -1006,6 +1011,14 @@ impl AppServerSession {
                 .map_err(|err| {
                     bootstrap_request_error("thread/start failed during TUI bootstrap", err)
                 })?;
+        if let Some(requested_model) = requested_side_model
+            && response.model != requested_model
+        {
+            return Err(color_eyre::eyre::eyre!(
+                "SIDE requested model {requested_model:?}, but the server resolved {:?}; provider fallback is disabled",
+                response.model
+            ));
+        }
         if history_support == ThreadHistorySupport::LegacyOnly {
             self.history_support = ThreadHistorySupport::LegacyOnly;
         }
@@ -1210,6 +1223,17 @@ impl AppServerSession {
             params.sandbox = None;
             params.approval_policy = selected_profile.approval_policy;
             params.approvals_reviewer = selected_profile.approvals_reviewer.map(Into::into);
+            remove_permission_config_overrides(&mut params.config);
+        }
+        if presentation == ForkPresentation::SideConversation {
+            // Legacy SIDE forks are still accepted for migration tests and old rollouts. Their
+            // client config is not authority for permissions: clamp the fork before it reaches
+            // core while preserving the server-owned runtime roots carried by the session.
+            params.permissions =
+                Some(codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_READ_ONLY.to_string());
+            params.sandbox = None;
+            params.approval_policy = Some(AskForApproval::Never);
+            params.approvals_reviewer = Some(codex_app_server_protocol::ApprovalsReviewer::User);
             remove_permission_config_overrides(&mut params.config);
         }
         self.thread_tool_transport()

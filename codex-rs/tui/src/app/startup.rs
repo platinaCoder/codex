@@ -969,6 +969,7 @@ See the Codex keymap documentation for supported actions and examples."
             app_event_tx,
             chat_widget,
             workspace_command_runner: Some(workspace_command_runner),
+            role_startup_config: config.clone(),
             config,
             local_settings,
             launch_cwd,

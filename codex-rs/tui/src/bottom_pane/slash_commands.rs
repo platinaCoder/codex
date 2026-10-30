@@ -41,7 +41,7 @@ impl SlashCommandItem {
     pub(crate) fn available_in_side_conversation(&self) -> bool {
         match self {
             Self::Builtin(cmd) => cmd.available_in_side_conversation(),
-            Self::ServiceTier(_) => false,
+            Self::ServiceTier(_) => true,
         }
     }
 
@@ -338,8 +338,14 @@ mod tests {
         assert_eq!(
             commands,
             vec![
+                SlashCommand::Model,
+                SlashCommand::Presets,
                 SlashCommand::Ide,
+                SlashCommand::Permissions,
+                SlashCommand::Compact,
                 SlashCommand::Agents,
+                SlashCommand::Infer,
+                SlashCommand::Close,
                 SlashCommand::Copy,
                 SlashCommand::Export,
                 SlashCommand::Raw,
@@ -369,7 +375,7 @@ mod tests {
     }
 
     #[test]
-    fn side_conversation_exact_lookup_still_resolves_service_tier_commands_for_dispatch_error() {
+    fn side_conversation_exposes_service_tier_commands() {
         let command = ServiceTierCommand {
             id: "priority".to_string(),
             name: "fast".to_string(),
@@ -382,7 +388,11 @@ mod tests {
 
         assert_eq!(
             find_slash_command("fast", flags, from_ref(&command)),
-            Some(SlashCommandItem::ServiceTier(command))
+            Some(SlashCommandItem::ServiceTier(command.clone()))
+        );
+        assert!(
+            commands_for_input(flags, from_ref(&command))
+                .contains(&SlashCommandItem::ServiceTier(command))
         );
     }
 }

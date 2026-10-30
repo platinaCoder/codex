@@ -28,6 +28,9 @@ async fn record_token_usage_continues_restored_totals() {
         usage: usage(30),
         turn_token_usage: usage(30),
         thread_token_usage: usage(230),
+        effective_model: Some("gpt-test".to_string()),
+        effective_reasoning_effort: None,
+        effective_service_tier: None,
     });
     let after_resume = restored.record_token_usage(
         thread_id,
@@ -36,6 +39,9 @@ async fn record_token_usage_continues_restored_totals() {
         "root-turn".to_string(),
         "response-d".to_string(),
         &usage(20),
+        "gpt-test".to_string(),
+        None,
+        None,
     );
     assert_eq!(
         after_resume,
@@ -48,6 +54,9 @@ async fn record_token_usage_continues_restored_totals() {
             usage: usage(20),
             turn_token_usage: usage(50),
             thread_token_usage: usage(250),
+            effective_model: Some("gpt-test".to_string()),
+            effective_reasoning_effort: None,
+            effective_service_tier: None,
         }
     );
 }

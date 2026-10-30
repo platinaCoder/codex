@@ -1235,7 +1235,7 @@ async fn external_transport_registers_dynamic_tools_and_finds_task_mentions() ->
         assert_eq!(params["dynamicTools"][0]["name"], "codex_tui");
         assert_eq!(
             params["dynamicTools"][0]["tools"].as_array().map(Vec::len),
-            Some(11)
+            Some(12)
         );
         assert!(
             params["dynamicTools"][0]["tools"]
@@ -1264,9 +1264,13 @@ async fn external_transport_registers_dynamic_tools_and_finds_task_mentions() ->
     let side_tools = side_start["dynamicTools"][0]["tools"]
         .as_array()
         .expect("SIDE dynamic tool namespace");
-    assert_eq!(side_tools.len(), 13);
+    assert_eq!(side_tools.len(), 12);
     for ticket_tool in crate::dynamic_tools::TICKET_TOOLS {
-        assert!(side_tools.iter().any(|tool| tool["name"] == ticket_tool));
+        assert_eq!(
+            side_tools.iter().any(|tool| tool["name"] == ticket_tool),
+            !crate::dynamic_tools::TICKET_MUTATION_TOOLS.contains(&ticket_tool),
+            "external SIDE fallback must keep ticket mutation on authenticated MCP"
+        );
     }
     for forbidden in crate::dynamic_tools::DELEGATION_TOOLS {
         assert!(!side_tools.iter().any(|tool| tool["name"] == forbidden));
@@ -1917,7 +1921,7 @@ async fn local_mcp_respects_configured_servers_and_managed_requirements() -> Res
         } else {
             assert_eq!(
                 start["dynamicTools"][0]["tools"].as_array().map(Vec::len),
-                Some(11)
+                Some(12)
             );
             assert!(start["config"]["mcp_servers.codex_tui"].is_null());
         }

@@ -246,6 +246,16 @@ impl ChatWidget {
             .collect();
         let agents_summary =
             crate::status::compose_agents_summary(&self.config, &self.instruction_source_paths);
+        let role_summary = if self.active_side_conversation {
+            let parent = self
+                .side_parent_thread_id
+                .map_or_else(|| "unavailable".to_string(), |parent| parent.to_string());
+            format!(
+                "Side · paired MAIN {parent} · server-owned read-only/no-network ceiling · model startup preflight passed; tool preflight enforced per turn"
+            )
+        } else {
+            "Standard · managed, role, and user permission policy applied".to_string()
+        };
         let (cell, handle) = crate::status::new_status_output_with_rate_limits_handle(
             &self.config,
             self.requires_openai_auth,
@@ -265,6 +275,7 @@ impl ChatWidget {
             collaboration_mode,
             reasoning_effort_override,
             agents_summary,
+            Some(role_summary),
             refreshing_rate_limits,
         );
         if let Some(request_id) = request_id {
@@ -282,6 +293,14 @@ impl ChatWidget {
         // Capture the displayed status inputs before later configuration or thread changes.
         let mut copy_targets = vec![
             ("Model".to_string(), Arc::<str>::from(model)),
+            (
+                "Conversation role".to_string(),
+                Arc::<str>::from(if self.active_side_conversation {
+                    "Side"
+                } else {
+                    "Standard"
+                }),
+            ),
             (
                 "Directory".to_string(),
                 Arc::from(self.config.cwd.display().to_string()),
