@@ -5425,6 +5425,35 @@ async fn side_thread_config_uses_immutable_startup_runtime_settings() {
 }
 
 #[tokio::test]
+async fn side_thread_config_supports_a_distinct_catalog_backed_model() {
+    let mut app = make_test_app().await;
+    let parent_thread_id = ThreadId::new();
+    app.chat_widget.set_model("gpt-6-astra");
+    app.role_startup_config.conversation_roles.side =
+        Some(codex_config::SideConversationRoleToml {
+            model: Some("gpt-5.6-luna".to_string()),
+            model_reasoning_effort: Some(ReasoningEffortConfig::Low),
+            service_tier: None,
+        });
+
+    let side_config = app
+        .side_thread_config(parent_thread_id)
+        .expect("configured SIDE model should pass catalog validation");
+
+    assert_eq!(app.chat_widget.current_model(), "gpt-6-astra");
+    assert_eq!(side_config.model.as_deref(), Some("gpt-5.6-luna"));
+    assert_eq!(
+        side_config.model_reasoning_effort,
+        Some(ReasoningEffortConfig::Low)
+    );
+    assert!(side_config.strict_read_only_tools);
+    assert_eq!(
+        side_config.permissions.permission_profile(),
+        &PermissionProfile::read_only()
+    );
+}
+
+#[tokio::test]
 async fn side_start_block_message_allows_replacing_open_side_conversation() {
     let mut app = make_test_app().await;
     assert_eq!(
@@ -7835,6 +7864,7 @@ fn token_usage_notification(
                 reasoning_output_tokens: 0,
             },
             model_context_window,
+            ..Default::default()
         },
     })
 }

@@ -360,7 +360,15 @@ impl SessionState {
     }
 
     pub(crate) fn token_info(&self) -> Option<TokenUsageInfo> {
-        self.history.token_info()
+        let mut info = self.history.token_info()?;
+        if let Some(record) = self.latest_token_usage_record.as_ref() {
+            info.latest_turn_token_usage = record.turn_token_usage.clone();
+            info.effective_model.clone_from(&record.effective_model);
+            info.effective_reasoning_effort = record.effective_reasoning_effort.clone();
+            info.effective_service_tier
+                .clone_from(&record.effective_service_tier);
+        }
+        Some(info)
     }
 
     pub(crate) fn set_rate_limits(&mut self, snapshot: RateLimitSnapshot) {

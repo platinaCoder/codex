@@ -5293,6 +5293,10 @@ impl Session {
                         let mut info = state.token_info().unwrap_or(TokenUsageInfo {
                             total_token_usage: TokenUsage::default(),
                             last_token_usage: TokenUsage::default(),
+                            latest_turn_token_usage: TokenUsage::default(),
+                            effective_model: None,
+                            effective_reasoning_effort: None,
+                            effective_service_tier: None,
                             model_context_window: turn_context.model_context_window(),
                         });
                         info.total_token_usage.add_assign(token_usage);
@@ -5349,6 +5353,10 @@ impl Session {
             let mut info = state.token_info().unwrap_or(TokenUsageInfo {
                 total_token_usage: TokenUsage::default(),
                 last_token_usage: TokenUsage::default(),
+                latest_turn_token_usage: TokenUsage::default(),
+                effective_model: None,
+                effective_reasoning_effort: None,
+                effective_service_tier: None,
                 model_context_window: None,
             });
 

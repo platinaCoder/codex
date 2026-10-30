@@ -3764,6 +3764,18 @@ mod tests {
                 total_tokens: 23,
                 codex_rollout_budget_units: None,
             },
+            latest_turn_token_usage: TokenUsage {
+                input_tokens: 40,
+                cached_input_tokens: 8,
+                cache_write_input_tokens: 0,
+                output_tokens: 12,
+                reasoning_output_tokens: 3,
+                total_tokens: 52,
+                codex_rollout_budget_units: None,
+            },
+            effective_model: Some("gpt-side-test".to_string()),
+            effective_reasoning_effort: Some(codex_protocol::openai_models::ReasoningEffort::Low),
+            effective_service_tier: Some("flex".to_string()),
             model_context_window: Some(4096),
         };
         let rate_limits = RateLimitSnapshot {
@@ -3807,6 +3819,17 @@ mod tests {
                 assert_eq!(usage.total.total_tokens, 200);
                 assert_eq!(usage.total.cached_input_tokens, 25);
                 assert_eq!(usage.last.output_tokens, 7);
+                assert_eq!(usage.latest_turn.input_tokens, 40);
+                assert_eq!(usage.latest_turn.cached_input_tokens, 8);
+                assert_eq!(usage.latest_turn.output_tokens, 12);
+                assert_eq!(usage.latest_turn.reasoning_output_tokens, 3);
+                assert_eq!(usage.latest_turn.total_tokens, 52);
+                assert_eq!(usage.effective_model.as_deref(), Some("gpt-side-test"));
+                assert_eq!(
+                    usage.effective_reasoning_effort,
+                    Some(codex_protocol::openai_models::ReasoningEffort::Low)
+                );
+                assert_eq!(usage.effective_service_tier.as_deref(), Some("flex"));
                 assert_eq!(usage.model_context_window, Some(4096));
             }
             other => bail!("unexpected notification: {other:?}"),

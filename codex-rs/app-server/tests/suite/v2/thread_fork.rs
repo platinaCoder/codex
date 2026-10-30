@@ -1374,6 +1374,26 @@ async fn thread_fork_emits_restored_token_usage_before_next_turn() -> Result<()>
     assert_eq!(notification.token_usage.total.output_tokens, 30);
     assert_eq!(notification.token_usage.total.reasoning_output_tokens, 10);
     assert_eq!(notification.token_usage.last.total_tokens, 90);
+    assert_eq!(notification.token_usage.latest_turn.total_tokens, 102);
+    assert_eq!(notification.token_usage.latest_turn.input_tokens, 80);
+    assert_eq!(notification.token_usage.latest_turn.cached_input_tokens, 12);
+    assert_eq!(notification.token_usage.latest_turn.output_tokens, 22);
+    assert_eq!(
+        notification.token_usage.latest_turn.reasoning_output_tokens,
+        6
+    );
+    assert_eq!(
+        notification.token_usage.effective_model.as_deref(),
+        Some("gpt-side-test")
+    );
+    assert_eq!(
+        notification.token_usage.effective_reasoning_effort,
+        Some(codex_protocol::openai_models::ReasoningEffort::Low)
+    );
+    assert_eq!(
+        notification.token_usage.effective_service_tier.as_deref(),
+        Some("flex")
+    );
     assert_eq!(notification.token_usage.model_context_window, Some(200_000));
 
     Ok(())

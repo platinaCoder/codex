@@ -10458,9 +10458,43 @@ class ThreadTokenUsage(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
     )
-    last: TokenUsageBreakdown
+    effective_model: Annotated[
+        str | None,
+        Field(
+            alias="effectiveModel",
+            description="Effective request settings for the latest accounted response.",
+        ),
+    ] = None
+    effective_reasoning_effort: Annotated[
+        ReasoningEffort | None, Field(alias="effectiveReasoningEffort")
+    ] = None
+    effective_service_tier: Annotated[str | None, Field(alias="effectiveServiceTier")] = None
+    last: Annotated[
+        TokenUsageBreakdown,
+        Field(description="Latest provider/context-window sample retained for compatibility."),
+    ]
+    latest_turn: Annotated[
+        TokenUsageBreakdown | None,
+        Field(
+            alias="latestTurn",
+            description="Cumulative usage for the latest logical turn.",
+            validate_default=True,
+        ),
+    ] = {
+        "cacheWriteInputTokens": 0,
+        "cachedInputTokens": 0,
+        "inputTokens": 0,
+        "outputTokens": 0,
+        "reasoningOutputTokens": 0,
+        "totalTokens": 0,
+    }
     model_context_window: Annotated[int | None, Field(alias="modelContextWindow")] = None
-    total: TokenUsageBreakdown
+    total: Annotated[
+        TokenUsageBreakdown,
+        Field(
+            description="Cumulative usage for the canonical thread across all completed responses."
+        ),
+    ]
 
 
 class ThreadTokenUsageUpdatedNotification(BaseModel):

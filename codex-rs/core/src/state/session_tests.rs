@@ -7,6 +7,7 @@ use codex_protocol::protocol::CreditsSnapshot;
 use codex_protocol::protocol::RateLimitWindow;
 use codex_protocol::protocol::SpendControlLimitSnapshot;
 use codex_protocol::protocol::TokenUsage;
+use codex_protocol::protocol::TokenUsageInfo;
 use codex_protocol::protocol::TokenUsageRecord;
 use pretty_assertions::assert_eq;
 
@@ -19,6 +20,12 @@ async fn record_token_usage_continues_restored_totals() {
         ..TokenUsage::default()
     };
     let mut restored = SessionState::new(make_session_configuration_for_tests().await);
+    restored.set_token_info(Some(TokenUsageInfo {
+        total_token_usage: usage(230),
+        last_token_usage: usage(30),
+        model_context_window: Some(200_000),
+        ..Default::default()
+    }));
     restored.latest_token_usage_record = Some(TokenUsageRecord {
         thread_id,
         turn_id: "turn-b".to_string(),
@@ -59,6 +66,11 @@ async fn record_token_usage_continues_restored_totals() {
             effective_service_tier: None,
         }
     );
+    restored.update_token_info_from_usage(&usage(20), Some(200_000));
+    let exposed = restored.token_info().expect("restored token accounting");
+    assert_eq!(exposed.total_token_usage, usage(250));
+    assert_eq!(exposed.latest_turn_token_usage, usage(50));
+    assert_eq!(exposed.effective_model.as_deref(), Some("gpt-test"));
 }
 
 #[tokio::test]

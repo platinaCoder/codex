@@ -53,7 +53,7 @@ impl TokenUsage {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct TokenUsageInfo {
     pub(crate) total_token_usage: TokenUsage,
     pub(crate) last_token_usage: TokenUsage,
