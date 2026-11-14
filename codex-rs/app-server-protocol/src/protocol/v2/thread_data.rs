@@ -7,6 +7,10 @@ use crate::JsonSchema;
 use crate::TS;
 use codex_experimental_api_macros::ExperimentalApi;
 use codex_protocol::openai_models::ReasoningEffort;
+use codex_protocol::permissions::FileSystemAccessMode;
+use codex_protocol::permissions::FileSystemPath;
+use codex_protocol::permissions::FileSystemSandboxEntry;
+use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::protocol::MisalignmentErrorDetails as CoreMisalignmentErrorDetails;
 use codex_protocol::protocol::MisalignmentSteer as CoreMisalignmentSteer;
 use codex_protocol::protocol::SessionSource as CoreSessionSource;
@@ -21,6 +25,7 @@ use schemars::schema::Schema;
 use serde::Deserialize;
 use serde::Serialize;
 use std::fmt;
+use std::path::Path;
 use std::path::PathBuf;
 use thiserror::Error;
 
@@ -161,10 +166,70 @@ impl From<ThreadSource> for CoreThreadSource {
 }
 
 /// Extra app-server data for a thread.
+#[derive(Default, Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase", export_to = "v2/")]
+pub struct ThreadExtra {
+    /// Server-owned effective read policy for a loaded thread. Clients must
+    /// not use this field to request or widen permissions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub effective_read_policy: Option<ThreadEffectiveReadPolicy>,
+}
+
+/// Local-path projection of the effective filesystem read policy. The server
+/// resolves special roots before publishing this snapshot; write and network
+/// authority are intentionally absent.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(rename_all = "camelCase", export_to = "v2/")]
-pub struct ThreadExtra {}
+pub struct ThreadEffectiveReadPolicy {
+    pub full_disk_read_access: bool,
+    pub readable_roots: Vec<AbsolutePathBuf>,
+    pub unreadable_roots: Vec<AbsolutePathBuf>,
+    pub unreadable_globs: Vec<String>,
+}
+
+impl ThreadEffectiveReadPolicy {
+    pub fn from_file_system_policy(policy: &FileSystemSandboxPolicy, cwd: &Path) -> Self {
+        Self {
+            full_disk_read_access: policy.has_full_disk_read_access(),
+            readable_roots: policy.get_readable_roots_with_cwd(cwd),
+            unreadable_roots: policy.get_unreadable_roots_with_cwd(cwd),
+            unreadable_globs: policy.get_unreadable_globs_with_cwd(cwd),
+        }
+    }
+
+    pub fn to_file_system_policy(&self) -> FileSystemSandboxPolicy {
+        let mut entries = self
+            .readable_roots
+            .iter()
+            .cloned()
+            .map(|path| FileSystemSandboxEntry::new(path.into(), FileSystemAccessMode::Read))
+            .collect::<Vec<_>>();
+        if self.full_disk_read_access && entries.is_empty() {
+            entries.push(FileSystemSandboxEntry::new(
+                FileSystemPath::Special {
+                    value: codex_protocol::permissions::FileSystemSpecialPath::Root,
+                },
+                FileSystemAccessMode::Read,
+            ));
+        }
+        entries.extend(
+            self.unreadable_roots
+                .iter()
+                .cloned()
+                .map(|path| FileSystemSandboxEntry::new(path.into(), FileSystemAccessMode::Deny)),
+        );
+        entries.extend(self.unreadable_globs.iter().cloned().map(|pattern| {
+            FileSystemSandboxEntry::new(
+                FileSystemPath::GlobPattern { pattern },
+                FileSystemAccessMode::Deny,
+            )
+        }));
+        FileSystemSandboxPolicy::restricted(entries)
+    }
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]

@@ -632,6 +632,16 @@ pub(crate) fn apply_live_thread_settings(
             .map(Into::into)
             .collect(),
     );
+    thread.extra = Some(codex_app_server_protocol::ThreadExtra {
+        effective_read_policy: Some(
+            codex_app_server_protocol::ThreadEffectiveReadPolicy::from_file_system_policy(
+                &config_snapshot
+                    .permission_profile
+                    .file_system_sandbox_policy(),
+                config_snapshot.cwd().as_path(),
+            ),
+        ),
+    });
 }
 
 fn resolve_request_cwd(cwd: Option<PathBuf>) -> Result<Option<AbsolutePathBuf>, JSONRPCErrorError> {
