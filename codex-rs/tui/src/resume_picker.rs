@@ -997,16 +997,47 @@ async fn load_app_server_page(
         .await
         .map_err(std::io::Error::other)?;
     let num_scanned_files = response.data.len();
-    let (rows, history_modes): (Vec<_>, HashMap<_, _>) = response
-        .data
-        .into_iter()
-        .filter_map(|thread| {
-            let history_mode = thread.history_mode;
-            let row = row_from_app_server_thread(thread)?;
-            let thread_id = row.thread_id?;
-            Some((row, (thread_id, history_mode)))
-        })
-        .unzip();
+    let mut rows = Vec::new();
+    let mut history_modes = HashMap::new();
+    for listed_thread in response.data {
+        let listed_id = match ThreadId::from_string(&listed_thread.id) {
+            Ok(thread_id) => thread_id,
+            Err(err) => {
+                warn!(thread_id = listed_thread.id, %err, "Skipping unverifiable app-server picker row");
+                continue;
+            }
+        };
+        // State-DB catalog rows can lag source/parent metadata. Verify every selectable row by its
+        // stable server identity so recent SIDE activity can never surface as an independent MAIN.
+        let verified_thread = match app_server.thread_read(listed_id, false).await {
+            Ok(thread) => thread,
+            Err(err) => {
+                warn!(thread_id = %listed_id, %err, "Skipping app-server picker row that could not be verified");
+                continue;
+            }
+        };
+        match super::persisted_app_server_conversation_role(&verified_thread) {
+            Ok(codex_protocol::ConversationRole::Standard) => {}
+            Ok(codex_protocol::ConversationRole::Side { .. }) => continue,
+            Ok(codex_protocol::ConversationRole::RestrictedSide { reason }) => {
+                warn!(thread_id = %listed_id, ?reason, "Skipping app-server picker row with invalid SIDE identity");
+                continue;
+            }
+            Err(err) => {
+                warn!(thread_id = %listed_id, %err, "Skipping app-server picker row with malformed role metadata");
+                continue;
+            }
+        }
+        let history_mode = verified_thread.history_mode;
+        let Some(row) = row_from_app_server_thread(verified_thread) else {
+            continue;
+        };
+        let Some(thread_id) = row.thread_id else {
+            continue;
+        };
+        history_modes.insert(thread_id, history_mode);
+        rows.push(row);
+    }
 
     Ok(PickerPage {
         rows,

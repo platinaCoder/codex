@@ -3354,13 +3354,42 @@ async fn blank_primary_thread_gets_an_independent_persistent_side() -> Result<()
         stored_side.forked_from_id, None,
         "SIDE must own an independent rollout instead of inheriting MAIN history"
     );
-
-    crate::init_state_db_for_app_server_target(&app.config, &crate::AppServerTarget::Embedded)
-        .await?
-        .expect("state database")
-        .set_thread_preview_if_empty(side_thread_id, "Persistent SIDE history")
+    let direct_resume = crate::lookup_session_target_with_app_server(
+        &mut app_server,
+        &config,
+        &side_thread_id.to_string(),
+    )
+    .await?
+    .expect("direct SIDE resume reference should resolve to its canonical MAIN");
+    assert_eq!(direct_resume.thread_id, parent_thread_id);
+    assert_ne!(direct_resume.thread_id, side_thread_id);
+    let state_db =
+        crate::init_state_db_for_app_server_target(&app.config, &crate::AppServerTarget::Embedded)
+            .await?
+            .expect("state database");
+    state_db
+        .set_thread_preview_if_empty(side_thread_id, "Most recently focused SIDE history")
         .await
-        .expect("seed persistent SIDE preview");
+        .expect("seed SIDE preview");
+    let latest_resume = crate::lookup_latest_session_target_with_app_server(
+        &mut app_server,
+        &config,
+        Some(config.cwd.as_path()),
+        /*include_non_interactive*/ true,
+    )
+    .await?
+    .expect("the newest paired session should remain resumable through MAIN");
+    assert_eq!(latest_resume.thread_id, parent_thread_id);
+
+    let mut conflicting_side = stored_side.clone();
+    conflicting_side.parent_thread_id = Some(ThreadId::new().to_string());
+    assert!(
+        matches!(
+            crate::persisted_app_server_conversation_role(&conflicting_side)?,
+            codex_protocol::ConversationRole::RestrictedSide { .. }
+        ),
+        "conflicting persisted pair identity must fail closed"
+    );
 
     super::side_pair_registry::forget_pair_if_matches(
         app.local_settings.codex_home.as_path(),
