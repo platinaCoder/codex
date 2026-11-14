@@ -1249,6 +1249,7 @@ async fn external_transport_registers_dynamic_tools_and_finds_task_mentions() ->
     }
     let target_id = started.session.thread_id;
     let mut side_config = app.config.clone();
+    side_config.cwd = app.config.codex_home.clone();
     side_config.strict_read_only_tools = true;
     app_server
         .start_side_thread(
@@ -1618,6 +1619,43 @@ async fn local_daemon_registers_approval_gated_mcp_tools_for_both_start_paths_sc
     app.config
         .web_search_mode
         .set(codex_protocol::config_types::WebSearchMode::Disabled)?;
+    let mut side_config = app.config.clone();
+    side_config.strict_read_only_tools = true;
+    side_config
+        .set_legacy_sandbox_policy(codex_protocol::protocol::SandboxPolicy::ReadOnly {
+            network_access: false,
+        })
+        .map_err(color_eyre::eyre::Report::msg)?;
+    let side = Box::pin(app_server.start_side_thread(
+        &app.local_settings,
+        &side_config,
+        thread_id,
+        /*selected_profile*/ None,
+    ))
+    .await?;
+    let side_source = side.session.thread_id;
+    let side_view = app_server
+        .thread_read(side_source, /*include_turns*/ false)
+        .await?;
+    assert!(crate::app::side::is_persistent_side_thread(&side_view));
+    assert!(
+        side_view
+            .extra
+            .as_ref()
+            .and_then(|extra| extra.effective_read_policy.as_ref())
+            .is_some(),
+        "the actual SIDE task bridge requires a server-owned read-policy projection"
+    );
+    let mut incompatible_view = side_view.clone();
+    incompatible_view.extra = None;
+    let incompatibility = crate::app_server_session::validate_task_read_policy(&incompatible_view)
+        .expect_err("an older app-server must fail before task tools are enabled");
+    assert!(
+        incompatibility
+            .to_string()
+            .contains("matching --no-daemon runtime"),
+        "{incompatibility}"
+    );
     let delegation_source = create_history_rollout(
         &app.config,
         ThreadHistoryMode::Legacy,
@@ -1690,6 +1728,74 @@ async fn local_daemon_registers_approval_gated_mcp_tools_for_both_start_paths_sc
                 }
             }))
     };
+    let call_side_tool = |id: u32, tool: &'static str, arguments: serde_json::Value| {
+        client
+            .post(mcp_url)
+            .header("Authorization", authorization)
+            .header("Accept", "application/json, text/event-stream")
+            .header("MCP-Protocol-Version", "2026-07-28")
+            .header("MCP-Method", "tools/call")
+            .header("MCP-Name", tool)
+            .json(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": {
+                    "name": tool,
+                    "arguments": arguments,
+                    "_meta": {
+                        "threadId": side_source,
+                        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                        "io.modelcontextprotocol/clientCapabilities": {}
+                    }
+                }
+            }))
+    };
+    let external = tempdir()?;
+    let external_note = external.path().join("bridge-receipt.txt");
+    std::fs::write(&external_note, "SIDE bridge external read receipt\n")?;
+    let read_receipt = call_side_tool(
+        10,
+        "read_workspace_file",
+        serde_json::json!({"path": external_note}),
+    )
+    .send()
+    .await?
+    .text()
+    .await?;
+    assert!(
+        read_receipt.contains("SIDE bridge external read receipt"),
+        "{read_receipt}"
+    );
+    let list_receipt = call_side_tool(
+        11,
+        "list_workspace_directory",
+        serde_json::json!({"path": external.path()}),
+    )
+    .send()
+    .await?
+    .text()
+    .await?;
+    assert!(
+        list_receipt.contains("bridge-receipt.txt"),
+        "{list_receipt}"
+    );
+    let search_receipt = call_side_tool(
+        12,
+        "search_workspace_text",
+        serde_json::json!({
+            "path": external.path(),
+            "query": "external read receipt"
+        }),
+    )
+    .send()
+    .await?
+    .text()
+    .await?;
+    assert!(
+        search_receipt.contains("bridge-receipt.txt"),
+        "{search_receipt}"
+    );
     let transport = app_server.thread_tool_transport();
     let crate::dynamic_tools_mcp::ThreadToolTransport::Mcp(tool_server) = &transport else {
         panic!("expected the daemon task-tool bridge");
@@ -1822,6 +1928,78 @@ async fn local_daemon_registers_approval_gated_mcp_tools_for_both_start_paths_sc
 
     app_server.shutdown().await?;
     proxy.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn embedded_no_daemon_side_mcp_bridge_receives_server_read_policy() -> Result<()> {
+    let (mut app, _events, _ops) = Box::pin(make_test_app_with_channels()).await;
+    let codex_home = tempdir()?;
+    app.config.codex_home = codex_home.path().to_path_buf().abs();
+    app.config.cwd = app.config.codex_home.clone();
+    app.config.sqlite = SqliteConfig::new_for_testing(codex_home.path().abs());
+    let mut app_server = crate::start_embedded_app_server_for_picker(&app.config).await?;
+    Box::pin(app_server.start_dynamic_tool_mcp(
+        app.config.clone(),
+        app.app_event_tx.clone(),
+        app.dynamic_tool_status_updates.clone(),
+    ))
+    .await?;
+    let main = Box::pin(app_server.start_thread(&app.config)).await?;
+    let mut side_config = app.config.clone();
+    side_config.strict_read_only_tools = true;
+    side_config
+        .set_legacy_sandbox_policy(codex_protocol::protocol::SandboxPolicy::ReadOnly {
+            network_access: false,
+        })
+        .map_err(color_eyre::eyre::Report::msg)?;
+    let side = Box::pin(app_server.start_side_thread(
+        &app.local_settings,
+        &side_config,
+        main.session.thread_id,
+        /*selected_profile*/ None,
+    ))
+    .await?;
+    let transport = app_server.thread_tool_transport();
+    let crate::dynamic_tools_mcp::ThreadToolTransport::Mcp(tool_server) = &transport else {
+        panic!("expected embedded no-daemon MCP task bridge")
+    };
+    let mcp = tool_server.test_server_config();
+    let mcp_url = mcp["url"].as_str().expect("MCP URL");
+    let authorization = mcp["http_headers"]["Authorization"]
+        .as_str()
+        .expect("MCP bearer token");
+    let external = tempdir()?;
+    let note = external.path().join("no-daemon-receipt.txt");
+    std::fs::write(&note, "no-daemon SIDE receipt\n")?;
+    let response = codex_http_client::HttpClientBuilder::new()
+        .build_direct()?
+        .post(mcp_url)
+        .header("Authorization", authorization)
+        .header("Accept", "application/json, text/event-stream")
+        .header("MCP-Protocol-Version", "2026-07-28")
+        .header("MCP-Method", "tools/call")
+        .header("MCP-Name", "read_workspace_file")
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "read_workspace_file",
+                "arguments": {"path": note},
+                "_meta": {
+                    "threadId": side.session.thread_id,
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {}
+                }
+            }
+        }))
+        .send()
+        .await?
+        .text()
+        .await?;
+    assert!(response.contains("no-daemon SIDE receipt"), "{response}");
+    app_server.shutdown().await?;
     Ok(())
 }
 

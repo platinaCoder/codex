@@ -1627,6 +1627,7 @@ impl ThreadRequestProcessor {
             &config_snapshot,
             session_configured.rollout_path.clone(),
         );
+        apply_live_thread_settings(&mut thread, &config_snapshot);
         thread.project_id = project_id.clone();
         thread.daybreak_enabled = daybreak_enabled;
 

@@ -5225,6 +5225,16 @@ class ThreadDeletedNotification(BaseModel):
     thread_id: Annotated[str, Field(alias="threadId")]
 
 
+class ThreadEffectiveReadPolicy(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    full_disk_read_access: Annotated[bool, Field(alias="fullDiskReadAccess")]
+    readable_roots: Annotated[list[AbsolutePathBuf], Field(alias="readableRoots")]
+    unreadable_globs: Annotated[list[str], Field(alias="unreadableGlobs")]
+    unreadable_roots: Annotated[list[AbsolutePathBuf], Field(alias="unreadableRoots")]
+
+
 class ThreadEnvironment(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -5240,6 +5250,13 @@ class ThreadExtra(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
     )
+    effective_read_policy: Annotated[
+        ThreadEffectiveReadPolicy | None,
+        Field(
+            alias="effectiveReadPolicy",
+            description="Server-owned effective read policy for a loaded thread. Clients must not use this field to request or widen permissions.",
+        ),
+    ] = None
 
 
 class ThreadGoalClearResponse(BaseModel):

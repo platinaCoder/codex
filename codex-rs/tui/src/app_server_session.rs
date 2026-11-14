@@ -384,6 +384,21 @@ pub(crate) struct AppServerStartedThread {
     pub(crate) task_tools_available: bool,
 }
 
+const TASK_READ_POLICY_INCOMPATIBLE: &str = "the app-server runtime did not provide the calling thread's effective filesystem read policy; this Codex client cannot safely enable task read tools across the current runtime version boundary. Start with the matching --no-daemon runtime or promote a matching daemon package before using this task";
+
+pub(crate) fn validate_task_read_policy(thread: &Thread) -> Result<()> {
+    if thread
+        .extra
+        .as_ref()
+        .and_then(|extra| extra.effective_read_policy.as_ref())
+        .is_some()
+    {
+        Ok(())
+    } else {
+        Err(color_eyre::eyre::eyre!(TASK_READ_POLICY_INCOMPATIBLE))
+    }
+}
+
 pub(crate) fn is_active_writer_error(err: &color_eyre::eyre::Report) -> bool {
     err.chain()
         .any(|cause| cause.to_string().contains("already has an active writer"))
@@ -1011,6 +1026,9 @@ impl AppServerSession {
                 .map_err(|err| {
                     bootstrap_request_error("thread/start failed during TUI bootstrap", err)
                 })?;
+        if task_tools_available {
+            validate_task_read_policy(&response.thread)?;
+        }
         if let Some(requested_model) = requested_side_model
             && response.model != requested_model
         {
@@ -1268,6 +1286,12 @@ impl AppServerSession {
             }
         };
         let mut response = response;
+        let fork_has_task_tools = self.task_tools_available(thread_id)
+            || (presentation == ForkPresentation::SideConversation
+                && self.thread_tool_transport().provides_paired_side_tools());
+        if fork_has_task_tools {
+            validate_task_read_policy(&response.thread)?;
+        }
         if presentation == ForkPresentation::Regular
             && !response.thread.ephemeral
             && let Err(error) = self
@@ -1308,7 +1332,7 @@ impl AppServerSession {
             started.session.daybreak_enabled = false;
         }
         started.session.fork_parent_title = fork_parent.and_then(|thread| thread.name);
-        if self.task_tools_available(thread_id) {
+        if fork_has_task_tools {
             started.task_tools_available = true;
             self.remember_task_tool_thread(started.session.thread_id);
         }
@@ -1983,6 +2007,9 @@ pub(crate) async fn start_thread_with_request_handle(
             .map_err(|err| {
                 bootstrap_request_error("thread/start failed during TUI bootstrap", err)
             })?;
+    if task_tools_available {
+        validate_task_read_policy(&response.thread)?;
+    }
     let mut started =
         started_thread_from_start_response(response, local_settings, &config, thread_params_mode)
             .await?;

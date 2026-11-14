@@ -10,6 +10,7 @@ use super::is_history_pagination_unsupported;
 use super::started_thread_from_resume_response;
 use super::thread_resume_params_from_config;
 use super::thread_session_state_from_thread_response;
+use super::validate_task_read_policy;
 use crate::legacy_core::config::Config;
 use codex_app_server_client::TypedRequestError;
 use codex_app_server_protocol::AskForApproval;
@@ -266,6 +267,9 @@ impl AppServerSession {
             return Err(color_eyre::eyre::eyre!(
                 "SIDE tools are unavailable because the authenticated local MCP server did not start; resolve the startup warning and retry"
             ));
+        }
+        if transport_provides_task_tools || self.task_tools_available(thread_id) {
+            validate_task_read_policy(&response.thread)?;
         }
         self.hydrate_initial_thread_history(
             &mut response.thread,

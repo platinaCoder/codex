@@ -1387,6 +1387,10 @@ async fn execute_inner(
                 .map_err(|error| error.to_string())?;
             let thread_id = started.thread.id.clone();
             let daybreak_enabled = started.thread.daybreak_enabled.unwrap_or(false);
+            if task_tools_available {
+                crate::app_server_session::validate_task_read_policy(&started.thread)
+                    .map_err(|error| error.to_string())?;
+            }
             register_background_thread(app_event_tx, started.thread, task_tools_available).await?;
             let cyber_access_program = background_turn_program(
                 &features,
@@ -1497,6 +1501,8 @@ async fn execute_inner(
             )
             .await?;
             let forked_thread_id = response.thread.id.clone();
+            crate::app_server_session::validate_task_read_policy(&response.thread)
+                .map_err(|error| error.to_string())?;
             register_background_thread(
                 app_event_tx,
                 response.thread,
@@ -2113,14 +2119,16 @@ struct OpenedReadPath {
 
 impl EffectiveReadPolicy {
     fn from_thread(thread: &Thread) -> Result<Self, String> {
-        let cwd = std::fs::canonicalize(thread.cwd.as_path())
-            .map_err(|error| format!("failed to resolve the calling task workspace: {error}"))?;
+        // App-server owns this absolute cwd and has already resolved the projected policy
+        // against it. Do not require the cwd to remain materialized before an absolute read;
+        // relative requests still fail safely when their joined target cannot be canonicalized.
+        let cwd = thread.cwd.as_path().to_path_buf();
         let read_policy = thread
             .extra
             .as_ref()
             .and_then(|extra| extra.effective_read_policy.as_ref())
             .ok_or_else(|| {
-                "the calling task's effective server-owned filesystem read policy is unavailable"
+                "the calling task's effective server-owned filesystem read policy is unavailable; the task was created or resumed through an incompatible app-server runtime"
                     .to_string()
             })?;
         Ok(Self {
