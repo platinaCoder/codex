@@ -1319,15 +1319,19 @@ impl App {
                         /*is_closed*/ false,
                     );
                     let latest_main_message = self.latest_main_message(parent_thread_id).await;
-                    if let Err(err) = app_server
-                        .thread_inject_items(
-                            side_thread_id,
-                            vec![Self::side_main_context_item(
-                                parent_thread_id,
-                                latest_main_message.as_deref(),
-                            )],
-                        )
-                        .await
+                    // Navigation alone must not append conversation messages. MAIN changes
+                    // already propagate through SyncSideFromMain; refresh here only when the
+                    // caller is actually submitting a SIDE message.
+                    if user_message.is_some()
+                        && let Err(err) = app_server
+                            .thread_inject_items(
+                                side_thread_id,
+                                vec![Self::side_main_context_item(
+                                    parent_thread_id,
+                                    latest_main_message.as_deref(),
+                                )],
+                            )
+                            .await
                     {
                         tracing::warn!(%err, %side_thread_id, "failed to refresh MAIN context in persistent SIDE");
                     }

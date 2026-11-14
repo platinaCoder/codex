@@ -1194,7 +1194,13 @@ async fn load_app_server_page(
                 canonical_thread.preview = activity_preview;
             }
             canonical_thread.updated_at = canonical_thread.updated_at.max(activity_updated_at);
-            if canonical.legacy_recovery.is_none() {
+            if canonical.legacy_recovery.is_none()
+                && canonical_thread.path.as_ref().is_some_and(|path| {
+                    path.components().any(|component| {
+                        component.as_os_str() == codex_rollout::ARCHIVED_SESSIONS_SUBDIR
+                    })
+                })
+            {
                 canonical_roots_requiring_restore.insert(canonical_id);
             }
         }
@@ -1589,7 +1595,9 @@ impl PickerState {
             _ if self.keymap.list.accept.is_pressed(key)
                 && !matches!(self.archive_state, archive::ArchiveState::Idle) => {}
             _ if self.keymap.list.accept.is_pressed(key) => {
+                tracing::info!(selected = self.selected, rows = self.filtered_rows.len(), "resume picker activation received");
                 if let Some(row) = self.filtered_rows.get(self.selected) {
+                    tracing::info!(thread_id = ?row.thread_id, "resume picker selected canonical target");
                     let path = row.path.clone();
                     if let Some(thread_id) = row.thread_id {
                         if self.status == SessionStatus::Archived {
@@ -7514,6 +7522,29 @@ session_picker_view = "dense"
         let mut resumed_server = crate::start_embedded_app_server_for_picker(&config).await?;
         let cold_main = resumed_server.thread_read(orphan_main, false).await?;
         let cold_side = resumed_server.thread_read(orphan_side, false).await?;
+        let active_page = load_app_server_page(
+            &mut resumed_server,
+            thread_list_params(
+                None,
+                None,
+                SessionStatus::Active,
+                ProviderFilter::Any,
+                ThreadSortKey::UpdatedAt,
+                false,
+                false,
+            ),
+        )
+        .await?;
+        assert!(
+            !active_page
+                .canonical_roots_requiring_restore
+                .contains(&orphan_main)
+        );
+        assert!(
+            !active_page
+                .legacy_side_main_recoveries
+                .contains_key(&orphan_main)
+        );
         assert_eq!(cold_main.id, orphan_main.to_string());
         assert_eq!(cold_side.id, orphan_side.to_string());
         assert_eq!(
