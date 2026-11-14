@@ -2474,7 +2474,9 @@ fn thread_list_params(
         ancestor_thread_id: None,
         cwd: cwd_filter,
         use_state_db_only,
-        search_term: None,
+        // Include durable pre-content identities. Role resolution below collapses paired SIDE
+        // records and exposes a missing legacy MAIN only when its exact SIDE provenance is valid.
+        search_term: Some(String::new()),
     }
 }
 
@@ -7399,7 +7401,7 @@ session_picker_view = "dense"
                 "{}:{orphan_main}",
                 crate::app_server_session::PERSISTENT_SIDE_THREAD_SOURCE_PREFIX
             ))),
-            "orphaned SIDE",
+            "",
             provider,
             &cwd,
         )?;
@@ -7547,7 +7549,7 @@ session_picker_view = "dense"
                     "{}:{missing_main}",
                     crate::app_server_session::PERSISTENT_SIDE_THREAD_SOURCE_PREFIX
                 ))),
-                "legacy SIDE activity",
+                "",
                 provider,
                 &cwd,
             )?;

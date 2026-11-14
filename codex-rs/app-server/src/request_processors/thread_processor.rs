@@ -191,7 +191,10 @@ async fn validate_legacy_side_main_recovery(
                     section: None,
                     project_id: None,
                     archived,
-                    search_term: None,
+                    // Legacy SIDE records can predate their first user-visible preview. An
+                    // explicit empty substring asks the store to include those durable identities
+                    // so ambiguity checks cover the complete catalog.
+                    search_term: Some(String::new()),
                     relation_filter: None,
                     use_state_db_only: false,
                 })

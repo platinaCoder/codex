@@ -1467,7 +1467,14 @@ fn push_thread_filters_with_preview<'a>(
     } else {
         builder.push(" AND threads.archived = 0");
     }
-    if !archived_only && !include_empty_preview && !matches!(section, Some(Some(_))) {
+    // An explicit empty substring means "match every preview", including an empty one. This gives
+    // callers a bounded opt-in to enumerate pre-content durable identities without changing the
+    // ordinary listing contract that hides empty active threads.
+    if !archived_only
+        && !include_empty_preview
+        && !matches!(section, Some(Some(_)))
+        && search_term != Some("")
+    {
         builder.push(" AND threads.preview <> ''");
     }
     match section {
