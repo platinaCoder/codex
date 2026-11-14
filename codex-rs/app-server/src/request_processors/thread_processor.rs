@@ -1729,6 +1729,13 @@ impl ThreadRequestProcessor {
             thread_extension_init.insert(selected_capability_roots);
         }
         let mut start_options = StartThreadOptions::new(config);
+        // MAIN may never receive a turn when the user works in SIDE first. Its
+        // identity must survive shutdown before SIDE can refer to it durably.
+        let persist_main_at_start = !start_options.config.ephemeral
+            && matches!(
+                thread_source.as_ref(),
+                None | Some(codex_protocol::protocol::ThreadSource::User)
+            );
         let validated_legacy_recovery = match legacy_side_main_recovery {
             Some(recovery) => Some(
                 validate_legacy_side_main_recovery(
@@ -1843,6 +1850,16 @@ impl ThreadRequestProcessor {
                     recovery.main_thread_id, recovery.side_thread_id
                 ))
             })?;
+        }
+        if persist_main_at_start {
+            thread_store
+                .persist_thread(thread_id, PersistContext::Standard)
+                .await
+                .map_err(|error| {
+                    internal_error(format!(
+                        "failed to persist MAIN identity at session creation: {error}"
+                    ))
+                })?;
         }
         let session_telemetry = thread.session_telemetry();
         session_telemetry.record_startup_phase(

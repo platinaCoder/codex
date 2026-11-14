@@ -2550,6 +2550,14 @@ fn search_line(state: &PickerState, width: u16) -> Line<'_> {
     if let Some(error) = state.inline_error.as_deref() {
         return Line::from(truncate_text(error, usize::from(width)).red());
     }
+    if let archive::ArchiveState::Restoring { thread_id } = state.archive_state {
+        let message = if state.legacy_side_main_recoveries.contains_key(&thread_id) {
+            "Opening session: recovering unused MAIN; checking saved sessions…"
+        } else {
+            "Opening session…"
+        };
+        return Line::from(truncate_text(message, usize::from(width)));
+    }
     if state.query.is_empty() {
         "Type to search".set_style(secondary_text_style()).into()
     } else {

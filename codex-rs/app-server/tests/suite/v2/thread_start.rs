@@ -26,6 +26,8 @@ use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::TextPosition;
 use codex_app_server_protocol::TextRange;
 use codex_app_server_protocol::ThreadHistoryMode;
+use codex_app_server_protocol::ThreadResumeParams;
+use codex_app_server_protocol::ThreadResumeResponse;
 use codex_app_server_protocol::ThreadSource;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
@@ -409,8 +411,8 @@ async fn thread_start_creates_thread_and_emits_started() -> Result<()> {
     let thread_path = thread.path.clone().expect("thread path should be present");
     assert!(thread_path.is_absolute(), "thread path should be absolute");
     assert!(
-        !thread_path.exists(),
-        "fresh thread rollout should not be materialized until first user message"
+        thread_path.exists(),
+        "MAIN identity must be durable before its first user message"
     );
 
     // Wire contract: thread title field is `name`, serialized as null when unset.
@@ -499,6 +501,30 @@ async fn thread_start_creates_thread_and_emits_started() -> Result<()> {
     let started: ThreadStartedNotification =
         serde_json::from_value(notif.params.expect("params must be present"))?;
     assert_eq!(started.thread, thread);
+
+    // No turn or synthetic message is needed to make MAIN resumable. Restart
+    // the server so the assertion cannot be satisfied by its live thread map.
+    mcp.shutdown_gracefully().await?;
+    let mut reopened = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized()
+        .await?;
+    let req_id = reopened
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: thread.id.clone(),
+            ..Default::default()
+        })
+        .await?;
+    let response = timeout(
+        DEFAULT_READ_TIMEOUT,
+        reopened.read_stream_until_response_message(RequestId::Integer(req_id)),
+    )
+    .await??;
+    let resumed = to_response::<ThreadResumeResponse>(response)?;
+    assert_eq!(resumed.thread.id, thread.id);
+    assert_eq!(resumed.thread.thread_source, Some(ThreadSource::User));
+    assert!(resumed.thread.turns.is_empty());
+    assert_eq!(resumed.thread.name, None);
 
     Ok(())
 }

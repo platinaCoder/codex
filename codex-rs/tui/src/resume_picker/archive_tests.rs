@@ -285,6 +285,10 @@ async fn archived_session_restore_resumes_after_completion() {
             .is_none()
     );
     assert_eq!(state.archive_state, ArchiveState::Restoring { thread_id });
+    assert_eq!(
+        super::super::search_line(&state, 100).to_string(),
+        "Opening session…"
+    );
     assert_eq!(*requests.lock().unwrap(), vec![thread_id]);
 
     assert!(
