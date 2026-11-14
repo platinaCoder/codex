@@ -47,6 +47,8 @@ async fn later_page_error_preserves_loaded_sessions() {
                             git_branch: None,
                         }],
                         history_modes: HashMap::new(),
+                        canonical_roots_requiring_restore: HashSet::new(),
+                        quarantined_rows: 0,
                         next_cursor: Some(PageCursor::AppServer("next-page".to_string())),
                         num_scanned_files: 1,
                         reached_scan_cap: false,

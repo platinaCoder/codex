@@ -28,7 +28,8 @@ fn archive_picker_state() -> (PickerState, Arc<Mutex<Vec<ThreadId>>>) {
     let request_sink = Arc::clone(&requests);
     let picker_loader: PickerLoader = Arc::new(move |request| {
         if let PickerLoadRequest::Archive { thread_id }
-        | PickerLoadRequest::Unarchive { thread_id } = request
+        | PickerLoadRequest::Unarchive { thread_id }
+        | PickerLoadRequest::RestoreCanonicalRoot { thread_id } = request
         {
             request_sink
                 .lock()
@@ -46,6 +47,44 @@ fn archive_picker_state() -> (PickerState, Arc<Mutex<Vec<ThreadId>>>) {
         SessionPickerAction::Resume,
     );
     (state, requests)
+}
+
+#[tokio::test]
+async fn canonical_root_restore_targets_main_and_preserves_fork_action() {
+    let (mut state, requests) = archive_picker_state();
+    let main_thread_id = ThreadId::new();
+    state.action = SessionPickerAction::Fork;
+    set_selected_session(&mut state, main_thread_id);
+    state
+        .canonical_roots_requiring_restore
+        .insert(main_thread_id);
+
+    assert!(
+        state
+            .handle_key(KeyEvent::from(KeyCode::Enter))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(*requests.lock().unwrap(), vec![main_thread_id]);
+
+    let selection = state.handle_unarchive_result(
+        main_thread_id,
+        Ok(SessionTarget {
+            backend_id: state.backend_id,
+            path: None,
+            thread_id: main_thread_id,
+            cwd: None,
+            history_mode: None,
+        }),
+    );
+    assert!(matches!(
+        selection,
+        Some(SessionSelection::Fork(SessionTarget {
+            thread_id,
+            ..
+        })) if thread_id == main_thread_id
+    ));
 }
 
 fn set_selected_session(state: &mut PickerState, thread_id: ThreadId) {

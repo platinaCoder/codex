@@ -904,11 +904,27 @@ async fn canonical_resume_target_from_app_server_thread(
         .wrap_err_with(|| {
             format!("resume candidate {candidate_id} could not be verified by stable identity")
         })?;
+    let canonical = canonical_resume_thread_from_verified(app_server, thread).await?;
+    Ok(session_target_from_app_server_thread(
+        app_server.backend_id(),
+        canonical.thread,
+    ))
+}
+
+struct CanonicalResumeThread {
+    thread: AppServerThread,
+    selected_from_side: bool,
+}
+
+async fn canonical_resume_thread_from_verified(
+    app_server: &mut AppServerSession,
+    thread: AppServerThread,
+) -> color_eyre::Result<CanonicalResumeThread> {
     match persisted_app_server_conversation_role(&thread)? {
-        ConversationRole::Standard => Ok(session_target_from_app_server_thread(
-            app_server.backend_id(),
+        ConversationRole::Standard => Ok(CanonicalResumeThread {
             thread,
-        )),
+            selected_from_side: false,
+        }),
         ConversationRole::RestrictedSide { reason } => Err(color_eyre::eyre::eyre!(
             "refusing to resume persisted SIDE thread {} because its canonical role metadata is invalid: {reason:?}",
             thread.id
@@ -941,13 +957,10 @@ async fn canonical_resume_target_from_app_server_thread(
                     thread.id
                 ));
             }
-            session_target_from_app_server_thread(app_server.backend_id(), main)
-                .ok_or_else(|| {
-                    color_eyre::eyre::eyre!(
-                        "canonical MAIN {parent_main_id} could not be restored by stable identity"
-                    )
-                })
-                .map(Some)
+            Ok(CanonicalResumeThread {
+                thread: main,
+                selected_from_side: true,
+            })
         }
     }
 }

@@ -147,6 +147,16 @@ impl PickerState {
         (self.picker_loader)(PickerLoadRequest::Unarchive { thread_id });
     }
 
+    pub(super) fn request_canonical_root_restore(&mut self, thread_id: ThreadId) {
+        if !matches!(self.archive_state, ArchiveState::Idle) {
+            return;
+        }
+
+        self.archive_state = ArchiveState::Restoring { thread_id };
+        self.request_frame();
+        (self.picker_loader)(PickerLoadRequest::RestoreCanonicalRoot { thread_id });
+    }
+
     pub(super) fn handle_unarchive_result(
         &mut self,
         thread_id: ThreadId,
@@ -159,7 +169,7 @@ impl PickerState {
         self.archive_state = ArchiveState::Idle;
 
         match result {
-            Ok(target) => Some(SessionSelection::Resume(target)),
+            Ok(target) => Some(self.action.selection(target)),
             Err(error) => {
                 self.inline_error = Some(format!("Failed to restore archived session: {error}"));
                 self.request_frame();
