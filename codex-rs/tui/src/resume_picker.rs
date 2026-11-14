@@ -205,6 +205,7 @@ enum PickerLoadRequest {
     },
     Archive {
         thread_id: ThreadId,
+        recovery: Option<super::LegacySideMainRecoveryContext>,
     },
     Unarchive {
         thread_id: ThreadId,
@@ -837,20 +838,40 @@ fn spawn_app_server_page_loader(
                         _ = cancellation => {}
                     }
                 }
-                PickerLoadRequest::Archive { thread_id } => {
-                    let result = archive_request_handle
-                        .request_typed::<ThreadArchiveResponse>(ClientRequest::ThreadArchive {
-                            request_id: RequestId::String(format!(
-                                "resume-picker-archive-{}",
-                                Uuid::new_v4()
-                            )),
-                            params: ThreadArchiveParams {
-                                thread_id: thread_id.to_string(),
-                            },
-                        })
-                        .await
-                        .map(|_| ())
-                        .map_err(std::io::Error::other);
+                PickerLoadRequest::Archive {
+                    thread_id,
+                    recovery,
+                } => {
+                    let result = async {
+                        if let Some(recovery) = recovery {
+                            let config = config.as_ref().ok_or_else(|| {
+                                color_eyre::eyre::eyre!(
+                                    "legacy SIDE recovery requires the local startup configuration"
+                                )
+                            })?;
+                            super::materialize_legacy_side_main_recovery(
+                                &mut app_server,
+                                config,
+                                recovery,
+                            )
+                            .await?;
+                        }
+                        archive_request_handle
+                            .request_typed::<ThreadArchiveResponse>(ClientRequest::ThreadArchive {
+                                request_id: RequestId::String(format!(
+                                    "resume-picker-archive-{}",
+                                    Uuid::new_v4()
+                                )),
+                                params: ThreadArchiveParams {
+                                    thread_id: thread_id.to_string(),
+                                },
+                            })
+                            .await
+                            .map(|_| ())
+                            .map_err(color_eyre::eyre::Report::from)
+                    }
+                    .await
+                    .map_err(std::io::Error::other);
                     let _ = bg_tx.send(BackgroundEvent::Archive { thread_id, result });
                 }
                 PickerLoadRequest::Unarchive { thread_id } => {
@@ -2053,7 +2074,16 @@ impl PickerState {
             .iter()
             .filter(|row| self.row_matches_filter(row));
         if self.query.is_empty() {
-            self.filtered_rows = base_iter.cloned().collect();
+            self.filtered_rows = base_iter
+                .filter(|row| {
+                    row.preview != "(no message yet)"
+                        || row
+                            .thread_name
+                            .as_ref()
+                            .is_some_and(|name| !name.trim().is_empty())
+                })
+                .cloned()
+                .collect();
         } else {
             let q = self.query.to_lowercase();
             self.filtered_rows = base_iter.filter(|r| r.matches_query(&q)).cloned().collect();
@@ -2572,6 +2602,14 @@ fn list_viewport_width(width: u16) -> u16 {
 fn search_line(state: &PickerState, width: u16) -> Line<'_> {
     if let Some(error) = state.inline_error.as_deref() {
         return Line::from(truncate_text(error, usize::from(width)).red());
+    }
+    if let archive::ArchiveState::Pending { thread_id } = state.archive_state {
+        let message = if state.legacy_side_main_recoveries.contains_key(&thread_id) {
+            "Archiving session: recovering unused MAIN; checking saved sessions…"
+        } else {
+            "Archiving session…"
+        };
+        return Line::from(truncate_text(message, usize::from(width)));
     }
     if let archive::ArchiveState::Restoring { thread_id } = state.archive_state {
         let message = if state.legacy_side_main_recoveries.contains_key(&thread_id) {
@@ -7370,6 +7408,145 @@ session_picker_view = "dense"
             row_from_app_server_thread(thread).is_some(),
             "a display name alone must not confer SIDE identity"
         );
+    }
+
+    #[test]
+    fn default_picker_hides_unnamed_empty_sessions_but_uuid_search_keeps_them() {
+        let mut state = PickerState::new(
+            crate::backend_id::BackendId::new(),
+            FrameRequester::test_dummy(),
+            page_only_loader(|_| {}),
+            ProviderFilter::Any,
+            true,
+            None,
+            SessionPickerAction::Resume,
+        );
+        let id = ThreadId::new();
+        let mut empty = make_row(
+            "/tmp/empty.jsonl",
+            "2025-01-01T00:00:00Z",
+            "(no message yet)",
+        );
+        empty.thread_id = Some(id);
+        let mut named = empty.clone();
+        named.thread_id = Some(ThreadId::new());
+        named.thread_name = Some("Saved workspace".to_string());
+        let meaningful = make_row(
+            "/tmp/meaningful.jsonl",
+            "2025-01-01T00:00:00Z",
+            "SIDE has a real question",
+        );
+        state.all_rows = vec![empty, named, meaningful];
+        state.apply_filter();
+        assert_eq!(state.filtered_rows.len(), 2);
+        assert!(
+            state
+                .filtered_rows
+                .iter()
+                .all(|row| row.thread_id != Some(id))
+        );
+        state.query = id.to_string();
+        state.apply_filter();
+        assert_eq!(state.filtered_rows.len(), 1);
+        assert_eq!(state.filtered_rows[0].thread_id, Some(id));
+    }
+
+    #[tokio::test]
+    async fn picker_archives_missing_main_without_a_user_turn() -> color_eyre::Result<()> {
+        let home = tempdir()?;
+        let cwd = home.path().join("workspace");
+        std::fs::create_dir_all(&cwd)?;
+        let mut config = crate::legacy_core::config::ConfigBuilder::default()
+            .codex_home(home.path().to_path_buf())
+            .build()
+            .await?;
+        config.cwd = cwd.clone().abs();
+        let main_id = ThreadId::new();
+        let side_id = ThreadId::new();
+        let side_path = write_role_rollout(
+            home.path(),
+            "2025-01-01T12-00-00",
+            "2025-01-01T12:00:00Z",
+            side_id,
+            Some(main_id),
+            Some(codex_protocol::protocol::ThreadSource::Feature(format!(
+                "{}:{main_id}",
+                crate::app_server_session::PERSISTENT_SIDE_THREAD_SOURCE_PREFIX
+            ))),
+            "Saved SIDE conversation",
+            &config.model_provider_id,
+            &cwd,
+        )?;
+        let original_side = std::fs::read(&side_path)?;
+        let mut server = crate::start_embedded_app_server_for_picker(&config).await?;
+        let params = || {
+            thread_list_params(
+                None,
+                None,
+                SessionStatus::Active,
+                ProviderFilter::Any,
+                ThreadSortKey::UpdatedAt,
+                false,
+                false,
+            )
+        };
+        let page = load_app_server_page(&mut server, params()).await?;
+        assert!(page.legacy_side_main_recoveries.contains_key(&main_id));
+        let handle = server.request_handle();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let loader = spawn_app_server_page_loader(
+            false,
+            server,
+            handle,
+            false,
+            RawReasoningVisibility::Hidden,
+            Some(config.clone()),
+            tx,
+        );
+        let mut picker = PickerState::new(
+            crate::backend_id::BackendId::new(),
+            FrameRequester::test_dummy(),
+            loader,
+            ProviderFilter::Any,
+            true,
+            None,
+            SessionPickerAction::Resume,
+        );
+        picker.ingest_page(page);
+        assert_eq!(picker.filtered_rows[0].thread_id, Some(main_id));
+        picker
+            .handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL))
+            .await?;
+        assert!(
+            search_line(&picker, 100)
+                .to_string()
+                .contains("Archiving session")
+        );
+        let event = tokio::time::timeout(std::time::Duration::from_secs(20), rx.recv())
+            .await?
+            .expect("archive response");
+        picker.handle_background_event(event).await?;
+        assert!(picker.inline_error.is_none(), "{:?}", picker.inline_error);
+        assert!(picker.filtered_rows.is_empty());
+        let mut reopened = crate::start_embedded_app_server_for_picker(&config).await?;
+        let saved = reopened.thread_read(main_id, false).await?;
+        assert!(
+            saved
+                .path
+                .as_ref()
+                .unwrap()
+                .components()
+                .any(|part| part.as_os_str() == codex_rollout::ARCHIVED_SESSIONS_SUBDIR)
+        );
+        assert!(
+            load_app_server_page(&mut reopened, params())
+                .await?
+                .rows
+                .is_empty()
+        );
+        assert_eq!(std::fs::read(&side_path)?, original_side);
+        reopened.shutdown().await?;
+        Ok(())
     }
 
     #[tokio::test]

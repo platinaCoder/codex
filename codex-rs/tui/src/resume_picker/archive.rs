@@ -72,7 +72,11 @@ impl PickerState {
 
         self.archive_state = ArchiveState::Pending { thread_id };
         self.request_frame();
-        (self.picker_loader)(PickerLoadRequest::Archive { thread_id });
+        let recovery = self.legacy_side_main_recoveries.get(&thread_id).cloned();
+        (self.picker_loader)(PickerLoadRequest::Archive {
+            thread_id,
+            recovery,
+        });
     }
 
     pub(super) fn handle_archive_result(
@@ -87,7 +91,7 @@ impl PickerState {
         self.archive_state = ArchiveState::Idle;
 
         if let Err(error) = result {
-            self.inline_error = Some(format!("Failed to archive session: {error}"));
+            self.inline_error = Some(format!("Failed to archive session: {error:#}"));
             self.request_frame();
             return;
         }

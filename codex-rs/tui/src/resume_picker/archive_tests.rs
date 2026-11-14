@@ -27,7 +27,7 @@ fn archive_picker_state() -> (PickerState, Arc<Mutex<Vec<ThreadId>>>) {
     let requests = Arc::new(Mutex::new(Vec::new()));
     let request_sink = Arc::clone(&requests);
     let picker_loader: PickerLoader = Arc::new(move |request| {
-        if let PickerLoadRequest::Archive { thread_id }
+        if let PickerLoadRequest::Archive { thread_id, .. }
         | PickerLoadRequest::Unarchive { thread_id }
         | PickerLoadRequest::RestoreCanonicalRoot { thread_id } = request
         {
