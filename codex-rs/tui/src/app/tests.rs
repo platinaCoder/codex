@@ -3396,6 +3396,9 @@ async fn blank_primary_thread_gets_an_independent_persistent_side() -> Result<()
         parent_thread_id,
         side_thread_id,
     )?;
+    app_server
+        .thread_set_name(side_thread_id, "legacy unnamed SIDE".to_string())
+        .await?;
     assert_eq!(
         super::side_pair_registry::paired_side(
             app.local_settings.codex_home.as_path(),
@@ -3407,7 +3410,7 @@ async fn blank_primary_thread_gets_an_independent_persistent_side() -> Result<()
         app.find_persisted_side_thread(&mut app_server, parent_thread_id)
             .await,
         Some(side_thread_id),
-        "legacy reverse-only SIDE metadata should migrate to the MAIN lookup registry"
+        "legacy reverse-only SIDE metadata should migrate by stable role hydration even without the canonical discovery name"
     );
     assert_eq!(
         super::side_pair_registry::paired_side(

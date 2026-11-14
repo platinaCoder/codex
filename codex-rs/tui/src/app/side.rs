@@ -605,6 +605,7 @@ impl App {
 
         let mut cursor = None;
         let mut oldest_match: Option<(i64, ThreadId)> = None;
+        let mut unhinted_candidates = Vec::new();
         loop {
             let response = app_server
                 .thread_list(ThreadListParams {
@@ -640,15 +641,25 @@ impl App {
                     Some(ThreadSource::Feature(source)) if source == &source_marker
                 );
                 let discovery_name = thread.name.as_deref() == Some(name.as_str());
-                if thread.ephemeral || (!exact_source && !discovery_name) {
+                let discovery_parent = thread
+                    .parent_thread_id
+                    .as_deref()
+                    .and_then(|parent| ThreadId::from_string(parent).ok())
+                    == Some(parent_thread_id);
+                if thread.ephemeral {
                     continue;
                 }
                 let Ok(side_thread_id) = ThreadId::from_string(&thread.id) else {
                     continue;
                 };
-                // Older catalog rows can omit thread_source. The deterministic name is only a
-                // discovery hint: authority still comes from thread/read returning the exact
-                // persisted ai_lab_side:<MAIN_UUID> source marker.
+                if !exact_source && !discovery_name && !discovery_parent {
+                    unhinted_candidates.push((thread.created_at, side_thread_id));
+                    continue;
+                }
+                // Older catalog rows can omit thread_source and predate the deterministic SIDE
+                // name. Name and control-parent metadata are discovery hints only: authority still
+                // comes from thread/read returning the exact persisted
+                // ai_lab_side:<MAIN_UUID> source marker.
                 if !exact_source
                     && !app_server
                         .thread_read(side_thread_id, /*include_turns*/ false)
@@ -667,6 +678,24 @@ impl App {
             cursor = response.next_cursor;
             if cursor.is_none() {
                 break;
+            }
+        }
+        // Old legacy list summaries can omit source, control parent, and the later deterministic
+        // SIDE name together. Only when the cheap indexed hints found no pair, hydrate the bounded
+        // active catalog by stable ID and require the exact server-owned source marker. This is a
+        // compatibility discovery pass, never authority inferred from ordering or preview text.
+        if oldest_match.is_none() {
+            for (created_at, candidate_id) in unhinted_candidates {
+                if app_server
+                    .thread_read(candidate_id, /*include_turns*/ false)
+                    .await
+                    .is_ok_and(|thread| matches_parent(&thread))
+                    && oldest_match
+                        .as_ref()
+                        .is_none_or(|(oldest_created_at, _)| created_at < *oldest_created_at)
+                {
+                    oldest_match = Some((created_at, candidate_id));
+                }
             }
         }
         let side_thread_id = oldest_match.map(|(_, thread_id)| thread_id)?;
