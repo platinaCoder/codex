@@ -882,8 +882,7 @@ fn spawn_app_server_page_loader(
                     let result = match app_server.thread_unarchive(thread_id).await {
                         Ok(thread) => Ok(thread),
                         Err(error)
-                            if error
-                                .to_string()
+                            if format!("{error:#}")
                                 .contains("no archived rollout found for thread id") =>
                         {
                             app_server.thread_read(thread_id, false).await
@@ -1176,6 +1175,16 @@ async fn load_app_server_page(
             legacy_side_main_recoveries.insert(canonical_id, recovery);
         }
         if !seen_roots.insert(canonical_id) {
+            if canonical.selected_from_side && !activity_preview.trim().is_empty() {
+                for row in rows
+                    .iter_mut()
+                    .filter(|row| row.thread_id == Some(canonical_id))
+                {
+                    if row.preview == "(no message yet)" {
+                        row.preview = activity_preview.clone();
+                    }
+                }
+            }
             continue;
         }
         if canonical.selected_from_side {
@@ -1973,6 +1982,9 @@ impl PickerState {
                 }) {
                     // Preserve the pre-catalog behavior where metadata from a later page wins.
                     existing.history_mode = row.history_mode;
+                    if existing.preview == "(no message yet)" && row.preview != "(no message yet)" {
+                        existing.preview = row.preview;
+                    }
                 }
             } else {
                 self.all_rows.push(row);
@@ -7474,9 +7486,16 @@ session_picker_view = "dense"
             .filter_map(Result::ok)
             .filter(|entry| entry.file_type().is_file())
             .count();
-        let recovered =
+        let recovered = crate::materialize_legacy_side_main_recovery(
+            &mut app_server,
+            &config,
+            recovery.clone(),
+        )
+        .await?;
+        let retried =
             crate::materialize_legacy_side_main_recovery(&mut app_server, &config, recovery)
                 .await?;
+        assert_eq!(retried.id, recovered.id);
         assert_eq!(recovered.id, orphan_main.to_string());
         assert_eq!(
             crate::persisted_app_server_conversation_role(&recovered)?,

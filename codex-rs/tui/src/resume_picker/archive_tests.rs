@@ -335,7 +335,7 @@ fn archived_session_restore_failure_preserves_session_and_allows_retry() {
     assert_eq!(state.archive_state, ArchiveState::Idle);
     assert_eq!(
         state.inline_error.as_deref(),
-        Some("Failed to restore archived session: restore denied")
+        Some("[session_open_failed] Could not open session; retry Enter: restore denied")
     );
     assert_eq!(state.filtered_rows.len(), 1);
 

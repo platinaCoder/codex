@@ -185,7 +185,9 @@ impl PickerState {
         match result {
             Ok(target) => Some(self.action.selection(target)),
             Err(error) => {
-                self.inline_error = Some(format!("Failed to restore archived session: {error}"));
+                self.inline_error = Some(format!(
+                    "[session_open_failed] Could not open session; retry Enter: {error:#}"
+                ));
                 self.request_frame();
                 None
             }

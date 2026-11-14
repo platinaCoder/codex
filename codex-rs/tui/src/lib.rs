@@ -936,6 +936,30 @@ async fn materialize_legacy_side_main_recovery(
     config: &Config,
     recovery: LegacySideMainRecoveryContext,
 ) -> color_eyre::Result<AppServerThread> {
+    // A previous selection may have persisted MAIN before the picker transitioned.
+    // Re-read both identities before reusing it; stale picker state is not authority.
+    let side = app_server
+        .thread_read(recovery.side_thread_id, false)
+        .await?;
+    color_eyre::eyre::ensure!(
+        persisted_app_server_conversation_role(&side)?
+            == (ConversationRole::Side {
+                parent_main_id: recovery.main_thread_id
+            }),
+        "[recovery_topology_conflict] SIDE no longer identifies the selected MAIN"
+    );
+    if let Some(main) = app_server
+        .thread_read_if_exists(recovery.main_thread_id)
+        .await?
+    {
+        color_eyre::eyre::ensure!(
+            !main.ephemeral
+                && main.parent_thread_id.is_none()
+                && persisted_app_server_conversation_role(&main)? == ConversationRole::Standard,
+            "[recovery_identity_collision] existing MAIN has conflicting topology"
+        );
+        return Ok(main);
+    }
     app_server
         .recover_legacy_side_main_thread(
             config,
