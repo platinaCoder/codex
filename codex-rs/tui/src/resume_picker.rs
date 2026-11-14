@@ -1069,6 +1069,8 @@ async fn load_app_server_page(
     app_server: &mut AppServerSession,
     params: ThreadListParams,
 ) -> std::io::Result<PickerPage> {
+    let requested_archived = params.archived.unwrap_or(false);
+    let requested_cwd = params.cwd.clone();
     let response = app_server
         .thread_list(params)
         .await
@@ -1138,6 +1140,27 @@ async fn load_app_server_page(
             }
         };
         let mut canonical_thread = canonical.thread;
+        // Apply filters to the session Enter opens, not just its discovery SIDE.
+        if let Some(path) = canonical_thread.path.as_ref() {
+            let archived = path
+                .components()
+                .any(|component| component.as_os_str() == codex_rollout::ARCHIVED_SESSIONS_SUBDIR);
+            if archived != requested_archived {
+                continue;
+            }
+        }
+        let cwd_matches = match requested_cwd.as_ref() {
+            None => true,
+            Some(ThreadListCwdFilter::One(cwd)) => {
+                paths_match(canonical_thread.cwd.as_path(), Path::new(cwd))
+            }
+            Some(ThreadListCwdFilter::Many(cwds)) => cwds
+                .iter()
+                .any(|cwd| paths_match(canonical_thread.cwd.as_path(), Path::new(cwd))),
+        };
+        if !cwd_matches {
+            continue;
+        }
         let canonical_id = match ThreadId::from_string(&canonical_thread.id) {
             Ok(thread_id) => thread_id,
             Err(err) => {
@@ -7350,6 +7373,84 @@ session_picker_view = "dense"
     }
 
     #[tokio::test]
+    async fn paired_picker_filters_use_canonical_main_directory() -> color_eyre::Result<()> {
+        let home = tempdir()?;
+        let main_cwd = home.path().join("main-workspace");
+        let side_cwd = home.path().join("side-workspace");
+        std::fs::create_dir_all(&main_cwd)?;
+        std::fs::create_dir_all(&side_cwd)?;
+        let mut config = crate::legacy_core::config::ConfigBuilder::default()
+            .codex_home(home.path().to_path_buf())
+            .build()
+            .await?;
+        config.cwd = side_cwd.clone().abs();
+        let main_id = ThreadId::new();
+        let side_id = ThreadId::new();
+        write_role_rollout(
+            home.path(),
+            "2025-01-01T11-00-00",
+            "2025-01-01T11:00:00Z",
+            main_id,
+            None,
+            Some(codex_protocol::protocol::ThreadSource::User),
+            "MAIN in another directory",
+            &config.model_provider_id,
+            &main_cwd,
+        )?;
+        write_role_rollout(
+            home.path(),
+            "2025-01-01T12-00-00",
+            "2025-01-01T12:00:00Z",
+            side_id,
+            Some(main_id),
+            Some(codex_protocol::protocol::ThreadSource::Feature(format!(
+                "{}:{main_id}",
+                crate::app_server_session::PERSISTENT_SIDE_THREAD_SOURCE_PREFIX
+            ))),
+            "SIDE in current directory",
+            &config.model_provider_id,
+            &side_cwd,
+        )?;
+        let mut server = crate::start_embedded_app_server_for_picker(&config).await?;
+        let params = |cwd| {
+            thread_list_params(
+                None,
+                cwd,
+                SessionStatus::Active,
+                ProviderFilter::Any,
+                ThreadSortKey::UpdatedAt,
+                false,
+                false,
+            )
+        };
+        let all = load_app_server_page(&mut server, params(None)).await?;
+        assert_eq!(all.rows.len(), 1);
+        assert_eq!(all.rows[0].thread_id, Some(main_id));
+        let current = load_app_server_page(
+            &mut server,
+            params(Some(ThreadListCwdFilter::One(
+                side_cwd.to_string_lossy().into_owned(),
+            ))),
+        )
+        .await?;
+        assert!(
+            current.rows.is_empty(),
+            "SIDE must not pull another directory's MAIN into Cwd"
+        );
+        let own = load_app_server_page(
+            &mut server,
+            params(Some(ThreadListCwdFilter::One(
+                main_cwd.to_string_lossy().into_owned(),
+            ))),
+        )
+        .await?;
+        assert_eq!(own.rows.len(), 1);
+        assert_eq!(own.rows[0].thread_id, Some(main_id));
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn mixed_legacy_catalog_keeps_standard_and_collapses_side_activity_to_main()
     -> color_eyre::Result<()> {
         let home = tempdir()?;
@@ -7467,21 +7568,30 @@ session_picker_view = "dense"
             .iter()
             .filter_map(|row| row.thread_id)
             .collect::<HashSet<_>>();
-        assert_eq!(
-            listed_ids,
-            HashSet::from([legacy_standard, canonical_main, orphan_main])
-        );
+        assert_eq!(listed_ids, HashSet::from([legacy_standard, orphan_main]));
         assert!(!listed_ids.contains(&side));
         assert!(!listed_ids.contains(&duplicate_side));
-        let main_row = page
-            .rows
-            .iter()
-            .find(|row| row.thread_id == Some(canonical_main))
-            .expect("blank canonical MAIN should be synthesized from SIDE activity");
-        assert_eq!(main_row.preview, "newest SIDE activity");
+        assert!(page.canonical_roots_requiring_restore.is_empty());
+        let archived_page = load_app_server_page(
+            &mut app_server,
+            thread_list_params(
+                None,
+                None,
+                SessionStatus::Archived,
+                ProviderFilter::Any,
+                ThreadSortKey::UpdatedAt,
+                false,
+                false,
+            ),
+        )
+        .await?;
         assert_eq!(
-            page.canonical_roots_requiring_restore,
-            HashSet::from([canonical_main])
+            archived_page
+                .rows
+                .iter()
+                .filter_map(|row| row.thread_id)
+                .collect::<Vec<_>>(),
+            vec![canonical_main]
         );
         let recovery = page
             .legacy_side_main_recoveries
