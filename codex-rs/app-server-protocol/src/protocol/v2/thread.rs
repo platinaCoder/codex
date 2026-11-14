@@ -122,6 +122,13 @@ pub struct ThreadStartParams {
     /// Optional client-supplied analytics source classification for this thread.
     #[ts(optional = nullable)]
     pub thread_source: Option<ThreadSource>,
+    /// Recovery-only identity for a legacy paired conversation whose durable SIDE
+    /// rollout predates materialization of its blank MAIN. The server validates the
+    /// exact persisted SIDE provenance and rejects collisions or multiple claims
+    /// before creating the missing Standard thread at `mainThreadId`.
+    #[experimental("thread/start.legacySideMainRecovery")]
+    #[ts(optional = nullable)]
+    pub legacy_side_main_recovery: Option<LegacySideMainRecovery>,
     /// Optional project identity for this new thread. Durable threads persist
     /// the assignment; ephemeral threads expose it only in live responses.
     #[experimental("thread/start.projectId")]
@@ -163,6 +170,14 @@ pub struct ThreadStartParams {
     #[experimental("thread/start.experimentalRawEvents")]
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub experimental_raw_events: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct LegacySideMainRecovery {
+    pub main_thread_id: String,
+    pub side_thread_id: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq, JsonSchema, TS)]

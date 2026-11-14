@@ -157,6 +157,20 @@ impl PickerState {
         (self.picker_loader)(PickerLoadRequest::RestoreCanonicalRoot { thread_id });
     }
 
+    pub(super) fn request_legacy_side_main_recovery(
+        &mut self,
+        recovery: super::super::LegacySideMainRecoveryContext,
+    ) {
+        if !matches!(self.archive_state, ArchiveState::Idle) {
+            return;
+        }
+
+        let thread_id = recovery.main_thread_id;
+        self.archive_state = ArchiveState::Restoring { thread_id };
+        self.request_frame();
+        (self.picker_loader)(PickerLoadRequest::RecoverLegacySideMain { recovery });
+    }
+
     pub(super) fn handle_unarchive_result(
         &mut self,
         thread_id: ThreadId,

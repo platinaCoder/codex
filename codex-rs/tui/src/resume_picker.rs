@@ -212,6 +212,9 @@ enum PickerLoadRequest {
     RestoreCanonicalRoot {
         thread_id: ThreadId,
     },
+    RecoverLegacySideMain {
+        recovery: super::LegacySideMainRecoveryContext,
+    },
 }
 
 #[derive(Clone)]
@@ -358,10 +361,17 @@ struct PickerPage {
     rows: Vec<Row>,
     history_modes: HashMap<ThreadId, ThreadHistoryMode>,
     canonical_roots_requiring_restore: HashSet<ThreadId>,
-    quarantined_rows: usize,
+    legacy_side_main_recoveries: HashMap<ThreadId, super::LegacySideMainRecoveryContext>,
+    quarantined_rows: Vec<QuarantinedSessionRow>,
     next_cursor: Option<PageCursor>,
     num_scanned_files: usize,
     reached_scan_cap: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct QuarantinedSessionRow {
+    thread_id: String,
+    reason_code: &'static str,
 }
 
 #[derive(Clone)]
@@ -897,6 +907,33 @@ fn spawn_app_server_page_loader(
                     .map_err(std::io::Error::other);
                     let _ = bg_tx.send(BackgroundEvent::Unarchive { thread_id, result });
                 }
+                PickerLoadRequest::RecoverLegacySideMain { recovery } => {
+                    let thread_id = recovery.main_thread_id;
+                    let result = match config.as_ref() {
+                        Some(config) => super::materialize_legacy_side_main_recovery(
+                            &mut app_server,
+                            config,
+                            recovery,
+                        )
+                        .await
+                        .and_then(|thread| {
+                            super::session_target_from_app_server_thread(
+                                app_server.backend_id(),
+                                thread,
+                            )
+                            .ok_or_else(|| {
+                                color_eyre::eyre::eyre!(
+                                    "recovered canonical MAIN has an invalid stable identity"
+                                )
+                            })
+                        }),
+                        None => Err(color_eyre::eyre::eyre!(
+                            "legacy SIDE recovery requires the local startup configuration"
+                        )),
+                    }
+                    .map_err(std::io::Error::other);
+                    let _ = bg_tx.send(BackgroundEvent::Unarchive { thread_id, result });
+                }
             }
         }
         if let Err(err) = app_server.shutdown().await {
@@ -953,6 +990,9 @@ struct PickerState {
     filtered_rows: Vec<Row>,
     seen_rows: HashSet<SeenRowKey>,
     canonical_roots_requiring_restore: HashSet<ThreadId>,
+    legacy_side_main_recoveries: HashMap<ThreadId, super::LegacySideMainRecoveryContext>,
+    conflicted_legacy_roots: HashSet<ThreadId>,
+    quarantined_rows: Vec<QuarantinedSessionRow>,
     selected: usize,
     scroll_top: usize,
     pending_page_down_target: Option<usize>,
@@ -1035,17 +1075,23 @@ async fn load_app_server_page(
         .await
         .map_err(std::io::Error::other)?;
     let num_scanned_files = response.data.len();
-    let mut rows = Vec::new();
+    let mut rows: Vec<Row> = Vec::new();
     let mut history_modes = HashMap::new();
     let mut canonical_roots_requiring_restore = HashSet::new();
+    let mut legacy_side_main_recoveries: HashMap<ThreadId, super::LegacySideMainRecoveryContext> =
+        HashMap::new();
+    let mut conflicted_legacy_roots = HashSet::new();
     let mut seen_roots = HashSet::new();
-    let mut quarantined_rows = 0usize;
+    let mut quarantined_rows = Vec::new();
     for listed_thread in response.data {
         let listed_id = match ThreadId::from_string(&listed_thread.id) {
             Ok(thread_id) => thread_id,
             Err(err) => {
                 warn!(thread_id = listed_thread.id, %err, "Skipping unverifiable app-server picker row");
-                quarantined_rows = quarantined_rows.saturating_add(1);
+                quarantined_rows.push(QuarantinedSessionRow {
+                    thread_id: listed_thread.id,
+                    reason_code: "invalid_stable_id",
+                });
                 continue;
             }
         };
@@ -1065,7 +1111,10 @@ async fn load_app_server_page(
                     // A control parent without the matching SIDE source is an incomplete role
                     // record, not a legacy standard session. Fail closed if hydration cannot
                     // recover the authoritative source marker.
-                    quarantined_rows = quarantined_rows.saturating_add(1);
+                    quarantined_rows.push(QuarantinedSessionRow {
+                        thread_id: listed_id.to_string(),
+                        reason_code: "missing_side_provenance_for_parented_record",
+                    });
                     continue;
                 }
                 listed_thread
@@ -1082,7 +1131,10 @@ async fn load_app_server_page(
             Ok(canonical) => canonical,
             Err(err) => {
                 warn!(thread_id = %listed_id, %err, "Quarantining app-server picker row with invalid role topology");
-                quarantined_rows = quarantined_rows.saturating_add(1);
+                quarantined_rows.push(QuarantinedSessionRow {
+                    thread_id: listed_id.to_string(),
+                    reason_code: "invalid_or_conflicting_role_topology",
+                });
                 continue;
             }
         };
@@ -1091,10 +1143,38 @@ async fn load_app_server_page(
             Ok(thread_id) => thread_id,
             Err(err) => {
                 warn!(thread_id = canonical_thread.id, %err, "Quarantining canonical picker root with invalid identity");
-                quarantined_rows = quarantined_rows.saturating_add(1);
+                quarantined_rows.push(QuarantinedSessionRow {
+                    thread_id: canonical_thread.id,
+                    reason_code: "invalid_canonical_root_id",
+                });
                 continue;
             }
         };
+        if let Some(recovery) = canonical.legacy_recovery.clone() {
+            if conflicted_legacy_roots.contains(&canonical_id) {
+                quarantined_rows.push(QuarantinedSessionRow {
+                    thread_id: recovery.side_thread_id.to_string(),
+                    reason_code: "multiple_side_claims_for_missing_main",
+                });
+                continue;
+            }
+            if let Some(previous) = legacy_side_main_recoveries.remove(&canonical_id) {
+                conflicted_legacy_roots.insert(canonical_id);
+                seen_roots.remove(&canonical_id);
+                rows.retain(|row| row.thread_id != Some(canonical_id));
+                history_modes.remove(&canonical_id);
+                quarantined_rows.push(QuarantinedSessionRow {
+                    thread_id: previous.side_thread_id.to_string(),
+                    reason_code: "multiple_side_claims_for_missing_main",
+                });
+                quarantined_rows.push(QuarantinedSessionRow {
+                    thread_id: recovery.side_thread_id.to_string(),
+                    reason_code: "multiple_side_claims_for_missing_main",
+                });
+                continue;
+            }
+            legacy_side_main_recoveries.insert(canonical_id, recovery);
+        }
         if !seen_roots.insert(canonical_id) {
             continue;
         }
@@ -1105,7 +1185,9 @@ async fn load_app_server_page(
                 canonical_thread.preview = activity_preview;
             }
             canonical_thread.updated_at = canonical_thread.updated_at.max(activity_updated_at);
-            canonical_roots_requiring_restore.insert(canonical_id);
+            if canonical.legacy_recovery.is_none() {
+                canonical_roots_requiring_restore.insert(canonical_id);
+            }
         }
         let history_mode = canonical_thread.history_mode;
         let Some(row) = row_from_app_server_thread(canonical_thread) else {
@@ -1122,6 +1204,7 @@ async fn load_app_server_page(
         rows,
         history_modes,
         canonical_roots_requiring_restore,
+        legacy_side_main_recoveries,
         quarantined_rows,
         next_cursor: response.next_cursor.map(PageCursor::AppServer),
         num_scanned_files,
@@ -1232,6 +1315,9 @@ impl PickerState {
             filtered_rows: Vec::new(),
             seen_rows: HashSet::new(),
             canonical_roots_requiring_restore: HashSet::new(),
+            legacy_side_main_recoveries: HashMap::new(),
+            conflicted_legacy_roots: HashSet::new(),
+            quarantined_rows: Vec::new(),
             selected: 0,
             scroll_top: 0,
             pending_page_down_target: None,
@@ -1501,6 +1587,14 @@ impl PickerState {
                             self.request_unarchive(thread_id);
                             return Ok(None);
                         }
+                        if let Some(recovery) = self
+                            .legacy_side_main_recoveries
+                            .get(&thread_id)
+                            .cloned()
+                        {
+                            self.request_legacy_side_main_recovery(recovery);
+                            return Ok(None);
+                        }
                         if self
                             .canonical_roots_requiring_restore
                             .contains(&thread_id)
@@ -1652,6 +1746,9 @@ impl PickerState {
         self.filtered_rows.clear();
         self.seen_rows.clear();
         self.canonical_roots_requiring_restore.clear();
+        self.legacy_side_main_recoveries.clear();
+        self.conflicted_legacy_roots.clear();
+        self.quarantined_rows.clear();
         self.local_cwd_matches.clear();
         self.selected = 0;
         self.pending_page_down_target = None;
@@ -1798,9 +1895,10 @@ impl PickerState {
 
     fn ingest_page(&mut self, page: PickerPage) {
         let PickerPage {
-            rows,
+            mut rows,
             history_modes,
             canonical_roots_requiring_restore,
+            legacy_side_main_recoveries,
             quarantined_rows,
             next_cursor,
             num_scanned_files,
@@ -1808,10 +1906,50 @@ impl PickerState {
         } = page;
         self.canonical_roots_requiring_restore
             .extend(canonical_roots_requiring_restore);
-        if quarantined_rows > 0 {
-            self.inline_error = Some(format!(
-                "{quarantined_rows} unsafe or orphaned session record(s) were quarantined"
-            ));
+        self.quarantined_rows.extend(quarantined_rows);
+        for (main_thread_id, recovery) in legacy_side_main_recoveries {
+            if self.conflicted_legacy_roots.contains(&main_thread_id) {
+                rows.retain(|row| row.thread_id != Some(main_thread_id));
+                self.quarantined_rows.push(QuarantinedSessionRow {
+                    thread_id: recovery.side_thread_id.to_string(),
+                    reason_code: "multiple_side_claims_for_missing_main",
+                });
+                continue;
+            }
+            if let Some(previous) = self
+                .legacy_side_main_recoveries
+                .insert(main_thread_id, recovery.clone())
+                && previous.side_thread_id != recovery.side_thread_id
+            {
+                self.legacy_side_main_recoveries.remove(&main_thread_id);
+                self.conflicted_legacy_roots.insert(main_thread_id);
+                self.canonical_roots_requiring_restore
+                    .remove(&main_thread_id);
+                self.all_rows
+                    .retain(|row| row.thread_id != Some(main_thread_id));
+                rows.retain(|row| row.thread_id != Some(main_thread_id));
+                self.seen_rows.retain(|seen| match seen {
+                    SeenRowKey::Thread(thread_id) => *thread_id != main_thread_id,
+                    _ => true,
+                });
+                self.quarantined_rows.push(QuarantinedSessionRow {
+                    thread_id: previous.side_thread_id.to_string(),
+                    reason_code: "multiple_side_claims_for_missing_main",
+                });
+                self.quarantined_rows.push(QuarantinedSessionRow {
+                    thread_id: recovery.side_thread_id.to_string(),
+                    reason_code: "multiple_side_claims_for_missing_main",
+                });
+            }
+        }
+        if !self.quarantined_rows.is_empty() {
+            self.inline_error = Some(
+                self.quarantined_rows
+                    .iter()
+                    .map(|row| format!("{} [{}]", row.thread_id, row.reason_code))
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            );
         }
         self.pagination
             .complete_page(next_cursor, num_scanned_files, reached_scan_cap);
@@ -3866,7 +4004,7 @@ mod tests {
         preview: &str,
         model_provider: &str,
         cwd: &Path,
-    ) -> color_eyre::Result<()> {
+    ) -> color_eyre::Result<PathBuf> {
         let rollout_path = codex_home
             .join("sessions")
             .join(&filename_ts[0..4])
@@ -3913,8 +4051,8 @@ mod tests {
                 .to_string(),
             );
         }
-        std::fs::write(rollout_path, lines.join("\n") + "\n")?;
-        Ok(())
+        std::fs::write(&rollout_path, lines.join("\n") + "\n")?;
+        Ok(rollout_path)
     }
 
     pub(super) fn page(
@@ -3927,7 +4065,8 @@ mod tests {
             rows,
             history_modes: HashMap::new(),
             canonical_roots_requiring_restore: HashSet::new(),
-            quarantined_rows: 0,
+            legacy_side_main_recoveries: HashMap::new(),
+            quarantined_rows: Vec::new(),
             next_cursor: next_cursor.map(|cursor| PageCursor::AppServer(cursor.to_string())),
             num_scanned_files,
             reached_scan_cap,
@@ -7250,7 +7389,7 @@ session_picker_view = "dense"
                 &cwd,
             )?;
         }
-        write_role_rollout(
+        let orphan_side_rollout = write_role_rollout(
             home.path(),
             "2025-01-01T13-00-00",
             "2025-01-01T13:00:00Z",
@@ -7298,7 +7437,10 @@ session_picker_view = "dense"
             .iter()
             .filter_map(|row| row.thread_id)
             .collect::<HashSet<_>>();
-        assert_eq!(listed_ids, HashSet::from([legacy_standard, canonical_main]));
+        assert_eq!(
+            listed_ids,
+            HashSet::from([legacy_standard, canonical_main, orphan_main])
+        );
         assert!(!listed_ids.contains(&side));
         assert!(!listed_ids.contains(&duplicate_side));
         let main_row = page
@@ -7311,7 +7453,145 @@ session_picker_view = "dense"
             page.canonical_roots_requiring_restore,
             HashSet::from([canonical_main])
         );
-        assert_eq!(page.quarantined_rows, 2);
+        let recovery = page
+            .legacy_side_main_recoveries
+            .get(&orphan_main)
+            .expect("missing legacy MAIN should be recoverable from persisted SIDE provenance")
+            .clone();
+        assert_eq!(recovery.side_thread_id, orphan_side);
+        assert_eq!(
+            page.quarantined_rows,
+            vec![QuarantinedSessionRow {
+                thread_id: malformed_side.to_string(),
+                reason_code: "invalid_or_conflicting_role_topology",
+            }]
+        );
+        let original_side_bytes = std::fs::read(&orphan_side_rollout)?;
+        let rollout_count_before = walkdir::WalkDir::new(home.path().join("sessions"))
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_file())
+            .count();
+        let recovered =
+            crate::materialize_legacy_side_main_recovery(&mut app_server, &config, recovery)
+                .await?;
+        assert_eq!(recovered.id, orphan_main.to_string());
+        assert_eq!(
+            crate::persisted_app_server_conversation_role(&recovered)?,
+            codex_protocol::ConversationRole::Standard
+        );
+        assert_eq!(std::fs::read(&orphan_side_rollout)?, original_side_bytes);
+        app_server.shutdown().await?;
+
+        let rollout_count_after = walkdir::WalkDir::new(home.path().join("sessions"))
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_file())
+            .count();
+        assert_eq!(rollout_count_after, rollout_count_before + 1);
+
+        let mut resumed_server = crate::start_embedded_app_server_for_picker(&config).await?;
+        let cold_main = resumed_server.thread_read(orphan_main, false).await?;
+        let cold_side = resumed_server.thread_read(orphan_side, false).await?;
+        assert_eq!(cold_main.id, orphan_main.to_string());
+        assert_eq!(cold_side.id, orphan_side.to_string());
+        assert_eq!(
+            crate::persisted_app_server_conversation_role(&cold_side)?,
+            codex_protocol::ConversationRole::Side {
+                parent_main_id: orphan_main,
+            }
+        );
+        assert_eq!(std::fs::read(&orphan_side_rollout)?, original_side_bytes);
+        resumed_server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn multiple_legacy_sides_for_missing_main_fail_closed_without_hiding_standard_rows()
+    -> color_eyre::Result<()> {
+        let home = tempdir()?;
+        let cwd = home.path().join("workspace");
+        std::fs::create_dir_all(&cwd)?;
+        let mut config = crate::legacy_core::config::ConfigBuilder::default()
+            .codex_home(home.path().to_path_buf())
+            .build()
+            .await?;
+        config.cwd = cwd.clone().abs();
+        let provider = config.model_provider_id.as_str();
+        let standard = ThreadId::new();
+        let missing_main = ThreadId::new();
+        let first_side = ThreadId::new();
+        let second_side = ThreadId::new();
+        write_role_rollout(
+            home.path(),
+            "2025-01-01T10-00-00",
+            "2025-01-01T10:00:00Z",
+            standard,
+            None,
+            None,
+            "ordinary conversation",
+            provider,
+            &cwd,
+        )?;
+        for (thread_id, filename_ts, timestamp) in [
+            (first_side, "2025-01-01T11-00-00", "2025-01-01T11:00:00Z"),
+            (second_side, "2025-01-01T12-00-00", "2025-01-01T12:00:00Z"),
+        ] {
+            write_role_rollout(
+                home.path(),
+                filename_ts,
+                timestamp,
+                thread_id,
+                Some(missing_main),
+                Some(codex_protocol::protocol::ThreadSource::Feature(format!(
+                    "{}:{missing_main}",
+                    crate::app_server_session::PERSISTENT_SIDE_THREAD_SOURCE_PREFIX
+                ))),
+                "legacy SIDE activity",
+                provider,
+                &cwd,
+            )?;
+        }
+
+        let mut app_server = crate::start_embedded_app_server_for_picker(&config).await?;
+        let page = load_app_server_page(
+            &mut app_server,
+            thread_list_params(
+                None,
+                None,
+                SessionStatus::Active,
+                ProviderFilter::Any,
+                ThreadSortKey::UpdatedAt,
+                false,
+                false,
+            ),
+        )
+        .await?;
+        let listed_ids = page
+            .rows
+            .iter()
+            .filter_map(|row| row.thread_id)
+            .collect::<HashSet<_>>();
+        assert_eq!(listed_ids, HashSet::from([standard]));
+        assert!(page.legacy_side_main_recoveries.is_empty());
+        let quarantined = page
+            .quarantined_rows
+            .iter()
+            .map(|row| (row.thread_id.clone(), row.reason_code))
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            quarantined,
+            HashSet::from([
+                (
+                    first_side.to_string(),
+                    "multiple_side_claims_for_missing_main"
+                ),
+                (
+                    second_side.to_string(),
+                    "multiple_side_claims_for_missing_main"
+                ),
+            ])
+        );
         app_server.shutdown().await?;
         Ok(())
     }

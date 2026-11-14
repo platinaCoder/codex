@@ -84,6 +84,181 @@ async fn remove_pending_thread_metadata(
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ValidatedLegacySideMainRecovery {
+    main_thread_id: ThreadId,
+    side_thread_id: ThreadId,
+}
+
+async fn validate_legacy_side_main_recovery(
+    thread_manager: &ThreadManager,
+    thread_store: &dyn ThreadStore,
+    recovery: codex_app_server_protocol::LegacySideMainRecovery,
+) -> Result<ValidatedLegacySideMainRecovery, JSONRPCErrorError> {
+    let main_thread_id = ThreadId::from_string(&recovery.main_thread_id)
+        .map_err(|_| invalid_request("legacy SIDE recovery has an invalid MAIN thread id"))?;
+    let side_thread_id = ThreadId::from_string(&recovery.side_thread_id)
+        .map_err(|_| invalid_request("legacy SIDE recovery has an invalid SIDE thread id"))?;
+    if main_thread_id == side_thread_id {
+        return Err(invalid_request(
+            "legacy SIDE recovery cannot use the SIDE id as its canonical MAIN id",
+        ));
+    }
+
+    if thread_manager.get_thread(main_thread_id).await.is_ok() {
+        return Err(invalid_request(format!(
+            "legacy SIDE recovery MAIN id already belongs to a live thread: {main_thread_id}"
+        )));
+    }
+    match thread_store
+        .read_thread(StoreReadThreadParams {
+            thread_id: main_thread_id,
+            include_archived: true,
+            include_history: false,
+        })
+        .await
+    {
+        Ok(_) => {
+            return Err(invalid_request(format!(
+                "legacy SIDE recovery MAIN id collides with an existing stored thread: {main_thread_id}"
+            )));
+        }
+        Err(ThreadStoreError::ThreadNotFound { thread_id }) if thread_id == main_thread_id => {}
+        Err(ThreadStoreError::InvalidRequest { message })
+            if message == format!("no rollout found for thread id {main_thread_id}") => {}
+        Err(error) => {
+            return Err(internal_error(format!(
+                "failed to verify legacy SIDE recovery MAIN identity: {error}"
+            )));
+        }
+    }
+
+    let side = thread_store
+        .read_thread(StoreReadThreadParams {
+            thread_id: side_thread_id,
+            include_archived: true,
+            include_history: false,
+        })
+        .await
+        .map_err(|error| match error {
+            ThreadStoreError::ThreadNotFound { .. } => invalid_request(format!(
+                "legacy SIDE recovery source was not found: {side_thread_id}"
+            )),
+            error => internal_error(format!(
+                "failed to verify legacy SIDE recovery source: {error}"
+            )),
+        })?;
+    let side_feature = side.thread_source.as_ref().and_then(|source| match source {
+        codex_protocol::protocol::ThreadSource::Feature(feature) => Some(feature.as_str()),
+        _ => None,
+    });
+    match codex_protocol::resolve_conversation_role_feature(
+        side_feature,
+        Some(side.thread_id),
+        side.parent_thread_id,
+    ) {
+        codex_protocol::ConversationRole::Side { parent_main_id }
+            if parent_main_id == main_thread_id => {}
+        role => {
+            return Err(invalid_request(format!(
+                "legacy SIDE recovery source has conflicting canonical role metadata: {role:?}"
+            )));
+        }
+    }
+
+    // A missing MAIN with one exact persisted SIDE claim is unambiguous. Multiple claims are
+    // preserved but require an explicit future recovery choice rather than silently selecting one.
+    let expected_feature = format!(
+        "{}:{main_thread_id}",
+        codex_protocol::AI_LAB_SIDE_THREAD_SOURCE_PREFIX
+    );
+    let mut matching_claims = Vec::new();
+    for archived in [false, true] {
+        let mut cursor = None;
+        loop {
+            let page = thread_store
+                .list_threads(StoreListThreadsParams {
+                    page_size: THREAD_LIST_MAX_LIMIT,
+                    cursor,
+                    sort_key: StoreThreadSortKey::UpdatedAt,
+                    sort_direction: StoreSortDirection::Desc,
+                    allowed_sources: vec![
+                        codex_protocol::protocol::SessionSource::Cli,
+                        codex_protocol::protocol::SessionSource::VSCode,
+                    ],
+                    model_providers: None,
+                    cwd_filters: None,
+                    section: None,
+                    project_id: None,
+                    archived,
+                    search_term: None,
+                    relation_filter: None,
+                    use_state_db_only: false,
+                })
+                .await
+                .map_err(thread_store_list_error)?;
+            for listed_candidate in page.items {
+                // Legacy catalog summaries can omit role source and parent fields. Stable-ID
+                // hydration is authoritative for recovery ambiguity checks.
+                let candidate = thread_store
+                    .read_thread(StoreReadThreadParams {
+                        thread_id: listed_candidate.thread_id,
+                        include_archived: archived,
+                        include_history: false,
+                    })
+                    .await
+                    .unwrap_or(listed_candidate);
+                let candidate_feature =
+                    candidate
+                        .thread_source
+                        .as_ref()
+                        .and_then(|source| match source {
+                            codex_protocol::protocol::ThreadSource::Feature(feature) => {
+                                Some(feature.as_str())
+                            }
+                            _ => None,
+                        });
+                if candidate_feature == Some(expected_feature.as_str()) {
+                    match codex_protocol::resolve_conversation_role_feature(
+                        candidate_feature,
+                        Some(candidate.thread_id),
+                        candidate.parent_thread_id,
+                    ) {
+                        codex_protocol::ConversationRole::Side { parent_main_id }
+                            if parent_main_id == main_thread_id =>
+                        {
+                            matching_claims.push(candidate.thread_id);
+                        }
+                        role => {
+                            return Err(invalid_request(format!(
+                                "legacy SIDE recovery has a conflicting persisted claim from {}: {role:?}",
+                                candidate.thread_id
+                            )));
+                        }
+                    }
+                }
+            }
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
+        }
+    }
+    matching_claims.sort_unstable_by_key(ToString::to_string);
+    matching_claims.dedup();
+    if matching_claims.as_slice() != [side_thread_id] {
+        return Err(invalid_request(format!(
+            "legacy SIDE recovery is ambiguous: canonical MAIN {main_thread_id} has {} persisted SIDE claims",
+            matching_claims.len()
+        )));
+    }
+
+    Ok(ValidatedLegacySideMainRecovery {
+        main_thread_id,
+        side_thread_id,
+    })
+}
+
 struct ThreadListFilters {
     model_providers: Option<Vec<String>>,
     source_kinds: Option<Vec<ThreadSourceKind>>,
@@ -1216,6 +1391,7 @@ impl ThreadRequestProcessor {
             history_mode,
             session_start_source,
             thread_source,
+            legacy_side_main_recovery,
             project_id,
             daybreak_enabled,
             environments,
@@ -1302,6 +1478,7 @@ impl ThreadRequestProcessor {
                 history_mode.map(Into::into),
                 session_start_source,
                 thread_source.map(Into::into),
+                legacy_side_main_recovery,
                 project_id,
                 daybreak_enabled,
                 environment_requests,
@@ -1384,6 +1561,7 @@ impl ThreadRequestProcessor {
         history_mode: Option<ThreadHistoryMode>,
         session_start_source: Option<codex_app_server_protocol::ThreadStartSource>,
         thread_source: Option<codex_protocol::protocol::ThreadSource>,
+        legacy_side_main_recovery: Option<codex_app_server_protocol::LegacySideMainRecovery>,
         project_id: Option<String>,
         daybreak_enabled: Option<bool>,
         environment_requests: Option<Vec<TurnEnvironmentRequest>>,
@@ -1399,6 +1577,29 @@ impl ThreadRequestProcessor {
             .load_with_overrides(config_overrides.clone(), typesafe_overrides.clone())
             .await
             .map_err(|err| config_load_error(&err))?;
+        if legacy_side_main_recovery.is_some() {
+            if config.ephemeral {
+                return Err(invalid_request(
+                    "legacy SIDE recovery requires a durable MAIN thread",
+                ));
+            }
+            if !matches!(
+                thread_source.as_ref(),
+                None | Some(codex_protocol::protocol::ThreadSource::User)
+            ) {
+                return Err(invalid_request(
+                    "legacy SIDE recovery may only create an ordinary Standard MAIN thread",
+                ));
+            }
+            if matches!(
+                session_start_source,
+                Some(codex_app_server_protocol::ThreadStartSource::Clear)
+            ) {
+                return Err(invalid_request(
+                    "legacy SIDE recovery cannot create a cleared-history thread",
+                ));
+            }
+        }
         if config.ephemeral && daybreak_enabled.is_some() {
             return Err(invalid_request(
                 "daybreakEnabled is not supported for ephemeral threads",
@@ -1525,17 +1726,45 @@ impl ThreadRequestProcessor {
             thread_extension_init.insert(selected_capability_roots);
         }
         let mut start_options = StartThreadOptions::new(config);
-        let reserved_thread_id = if start_options.config.ephemeral {
+        let validated_legacy_recovery = match legacy_side_main_recovery {
+            Some(recovery) => Some(
+                validate_legacy_side_main_recovery(
+                    listener_task_context.thread_manager.as_ref(),
+                    thread_store.as_ref(),
+                    recovery,
+                )
+                .await?,
+            ),
+            None => None,
+        };
+        let pending_metadata = StoreThreadMetadataPatch {
+            project_id: project_id.clone().map(Some),
+            daybreak_enabled,
+            ..Default::default()
+        };
+        let reserved_thread_id = if let Some(recovery) = validated_legacy_recovery {
+            if !pending_metadata.is_empty() {
+                thread_store
+                    .stage_pending_thread_metadata(recovery.main_thread_id, pending_metadata)
+                    .await
+                    .map_err(|error| match error {
+                        ThreadStoreError::Unsupported { .. } => method_not_found(
+                            "legacy SIDE recovery is unavailable without sqlite state",
+                        ),
+                        ThreadStoreError::InvalidRequest { message } => invalid_request(message),
+                        error => internal_error(format!(
+                            "failed to stage legacy SIDE recovery metadata: {error}"
+                        )),
+                    })?;
+            }
+            Some(recovery.main_thread_id)
+        } else if start_options.config.ephemeral {
             None
         } else {
             stage_pending_thread_metadata(
                 listener_task_context.thread_manager.as_ref(),
                 thread_store.as_ref(),
-                StoreThreadMetadataPatch {
-                    project_id: project_id.clone().map(Some),
-                    daybreak_enabled,
-                    ..Default::default()
-                },
+                pending_metadata,
                 "thread/start",
             )
             .await?
@@ -1598,6 +1827,20 @@ impl ThreadRequestProcessor {
                 });
             }
         };
+        if let Some(recovery) = validated_legacy_recovery {
+            if thread_id != recovery.main_thread_id {
+                return Err(internal_error(
+                    "legacy SIDE recovery did not preserve the canonical MAIN identity",
+                ));
+            }
+            thread.ensure_rollout_materialized().await;
+            thread.flush_rollout().await.map_err(|error| {
+                internal_error(format!(
+                    "failed to materialize recovered canonical MAIN {} for SIDE {}: {error}",
+                    recovery.main_thread_id, recovery.side_thread_id
+                ))
+            })?;
+        }
         let session_telemetry = thread.session_telemetry();
         session_telemetry.record_startup_phase(
             "thread_start_create_thread",

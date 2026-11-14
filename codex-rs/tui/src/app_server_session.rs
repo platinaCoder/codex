@@ -59,6 +59,7 @@ use codex_app_server_protocol::GetAccountParams;
 use codex_app_server_protocol::GetAccountRateLimitsResponse;
 use codex_app_server_protocol::GetAccountResponse;
 use codex_app_server_protocol::JSONRPCErrorError;
+use codex_app_server_protocol::LegacySideMainRecovery;
 use codex_app_server_protocol::LogoutAccountResponse;
 use codex_app_server_protocol::MemoryResetResponse;
 use codex_app_server_protocol::Model as ApiModel;
@@ -931,6 +932,7 @@ impl AppServerSession {
             remote_cwd_override,
             selected_profile,
             ThreadSource::User,
+            None,
         )
         .await
     }
@@ -956,8 +958,39 @@ impl AppServerSession {
             ThreadSource::Feature(format!(
                 "{PERSISTENT_SIDE_THREAD_SOURCE_PREFIX}:{parent_thread_id}"
             )),
+            None,
         )
         .await
+    }
+
+    pub(crate) async fn recover_legacy_side_main_thread(
+        &mut self,
+        config: &Config,
+        side_thread: &Thread,
+        main_thread_id: ThreadId,
+        side_thread_id: ThreadId,
+    ) -> Result<AppServerStartedThread> {
+        let side_cwd = side_thread.cwd.to_path_buf();
+        let local_settings = LocalSettings::from(config);
+        let started = self
+            .start_thread_with_source(
+                &local_settings,
+                config,
+                /*session_start_source*/ None,
+                Some(side_cwd.as_path()),
+                /*selected_profile*/ None,
+                ThreadSource::User,
+                Some(LegacySideMainRecovery {
+                    main_thread_id: main_thread_id.to_string(),
+                    side_thread_id: side_thread_id.to_string(),
+                }),
+            )
+            .await?;
+        color_eyre::eyre::ensure!(
+            started.session.thread_id == main_thread_id,
+            "legacy SIDE recovery returned a different canonical MAIN identity"
+        );
+        Ok(started)
     }
 
     async fn start_thread_with_source(
@@ -968,6 +1001,7 @@ impl AppServerSession {
         remote_cwd_override: Option<&std::path::Path>,
         selected_profile: Option<&PermissionProfileSelection>,
         thread_source: ThreadSource,
+        legacy_side_main_recovery: Option<LegacySideMainRecovery>,
     ) -> Result<AppServerStartedThread> {
         let request_id = self.next_request_id();
         let persistent_side_main = codex_protocol::resolve_conversation_role_feature(
@@ -988,6 +1022,7 @@ impl AppServerSession {
             session_start_source,
         );
         params.thread_source = Some(thread_source);
+        params.legacy_side_main_recovery = legacy_side_main_recovery;
         if is_persistent_side {
             params.allow_provider_model_fallback = false;
             params.developer_instructions = with_terminal_visualization_instructions(
@@ -1459,6 +1494,33 @@ impl AppServerSession {
         )
         .await?;
         Ok(response.thread)
+    }
+
+    pub(crate) async fn thread_read_if_exists(
+        &mut self,
+        thread_id: ThreadId,
+    ) -> Result<Option<Thread>> {
+        let request_id = self.next_request_id();
+        match self
+            .client
+            .request_typed::<ThreadReadResponse>(ClientRequest::ThreadRead {
+                request_id,
+                params: ThreadReadParams {
+                    thread_id: thread_id.to_string(),
+                    include_turns: false,
+                },
+            })
+            .await
+        {
+            Ok(response) => Ok(Some(response.thread)),
+            Err(TypedRequestError::Server { source, .. })
+                if source.message == format!("thread not found: {thread_id}")
+                    || source.message == format!("thread not loaded: {thread_id}") =>
+            {
+                Ok(None)
+            }
+            Err(err) => Err(err).wrap_err("thread/read failed during TUI session lookup"),
+        }
     }
 
     pub(crate) async fn thread_archive(&mut self, thread_id: ThreadId) -> Result<()> {
