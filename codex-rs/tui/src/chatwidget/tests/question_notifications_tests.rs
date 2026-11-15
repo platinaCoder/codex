@@ -49,6 +49,34 @@ async fn live_async_question_notifies_once_and_takes_priority_over_turn_completi
 }
 
 #[tokio::test]
+async fn independent_notifications_are_queued_instead_of_overwritten() {
+    let (mut chat, _rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    chat.notify(Notification::AgentTurnComplete {
+        response: "first".into(),
+    });
+    chat.notify(Notification::PlanModePrompt {
+        title: "approval".into(),
+    });
+
+    assert!(matches!(
+        chat.pending_notification,
+        Some(Notification::PlanModePrompt { .. })
+    ));
+    assert_eq!(chat.pending_notifications.len(), 1);
+    assert!(matches!(
+        chat.pending_notifications.front(),
+        Some(Notification::AgentTurnComplete { response }) if response == "first"
+    ));
+
+    chat.pending_notification = chat.pending_notifications.pop_front();
+    assert!(matches!(
+        chat.pending_notification.as_ref(),
+        Some(Notification::AgentTurnComplete { response }) if response == "first"
+    ));
+}
+
+#[tokio::test]
 async fn async_question_notifications_respect_settings_and_ignore_empty_batches() {
     for (settings, expected) in [
         (Notifications::Enabled(true), true),

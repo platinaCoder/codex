@@ -1686,6 +1686,36 @@ async fn local_daemon_registers_approval_gated_mcp_tools_for_both_start_paths_sc
                 }
             }))
     };
+    let call_tool_for = |id: u32,
+                         thread_id: &str,
+                         turn_id: &str,
+                         call_id: &str,
+                         tool: &'static str,
+                         arguments: serde_json::Value| {
+        client
+            .post(mcp_url)
+            .header("Authorization", authorization)
+            .header("Accept", "application/json, text/event-stream")
+            .header("MCP-Protocol-Version", "2026-07-28")
+            .header("MCP-Method", "tools/call")
+            .header("MCP-Name", tool)
+            .json(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": {
+                    "name": tool,
+                    "arguments": arguments,
+                    "_meta": {
+                        "threadId": thread_id,
+                        "turnId": turn_id,
+                        "callId": call_id,
+                        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                        "io.modelcontextprotocol/clientCapabilities": {}
+                    }
+                }
+            }))
+    };
     let transport = app_server.thread_tool_transport();
     let crate::dynamic_tools_mcp::ThreadToolTransport::Mcp(tool_server) = &transport else {
         panic!("expected the daemon task-tool bridge");
@@ -1771,6 +1801,115 @@ async fn local_daemon_registers_approval_gated_mcp_tools_for_both_start_paths_sc
         child["config"]["mcp_servers.codex_tui"],
         starts[0]["config"]["mcp_servers.codex_tui"]
     );
+
+    let side_thread_id = app_server
+        .start_side_thread(
+            &app.local_settings,
+            &app.config,
+            delegation_source,
+            /*selected_profile*/ None,
+        )
+        .await?
+        .session
+        .thread_id
+        .to_string();
+
+    // Authenticated MAIN and SIDE callers use the same loopback MCP endpoint at once.
+    // Their requests carry independent caller tuples and both must complete;
+    // there is no global "busy conversation" gate.
+    let (main_response, side_response) = tokio::join!(
+        call_tool_for(
+            20,
+            &delegation_source.to_string(),
+            "main-concurrent-turn",
+            "main-concurrent-call",
+            "list_threads",
+            serde_json::json!({"limit": 10}),
+        )
+        .send(),
+        call_tool_for(
+            21,
+            &side_thread_id,
+            "side-concurrent-turn",
+            "side-concurrent-call",
+            "list_threads",
+            serde_json::json!({"limit": 10}),
+        )
+        .send()
+    );
+    let main_response = main_response?;
+    let side_response = side_response?;
+    assert!(main_response.status().is_success());
+    assert!(side_response.status().is_success());
+    let main_body = main_response.text().await?;
+    let side_body = side_response.text().await?;
+    assert!(main_body.contains("threads"), "{main_body}");
+    assert!(side_body.contains("threads"), "{side_body}");
+
+    // A malformed caller's failure must not cancel or hide an unrelated
+    // caller's successful read.
+    let (failed_response, surviving_response) = tokio::join!(
+        call_tool_for(
+            22,
+            &delegation_source.to_string(),
+            "main-failing-turn",
+            "main-failing-call",
+            "list_threads",
+            serde_json::json!({"limit": 0}),
+        )
+        .send(),
+        call_tool_for(
+            23,
+            &side_thread_id,
+            "side-surviving-turn",
+            "side-surviving-call",
+            "list_threads",
+            serde_json::json!({"limit": 10}),
+        )
+        .send()
+    );
+    let failed_response = failed_response?;
+    let surviving_response = surviving_response?;
+    assert!(failed_response.status().is_success());
+    assert!(surviving_response.status().is_success());
+    let failed_body = failed_response.text().await?;
+    let surviving_body = surviving_response.text().await?;
+    assert!(
+        failed_body.contains("limit must be between"),
+        "{failed_body}"
+    );
+    assert!(surviving_body.contains("threads"), "{surviving_body}");
+
+    // Outer and nested identity metadata cannot disagree.
+    let forged = client
+        .post(mcp_url)
+        .header("Authorization", authorization)
+        .header("Accept", "application/json, text/event-stream")
+        .header("MCP-Protocol-Version", "2026-07-28")
+        .header("MCP-Method", "tools/call")
+        .header("MCP-Name", "list_threads")
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 24,
+            "method": "tools/call",
+            "params": {
+                "name": "list_threads",
+                "arguments": {"limit": 10},
+                "_meta": {
+                    "threadId": delegation_source,
+                    "turnId": "main-forged-turn",
+                    "callId": "main-forged-call",
+                    "x-codex-turn-metadata": {"thread_id": "other-thread"},
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {}
+                }
+            }
+        }))
+        .send()
+        .await?;
+    assert!(forged.status().is_success());
+    assert!(forged.text().await?.contains("conflicting threadId"));
+
     // Fork another task: this synthetic MCP call has no active turn to cut before.
     let fork_source =
         create_history_rollout(&app.config, ThreadHistoryMode::Legacy, "Task to fork")?;

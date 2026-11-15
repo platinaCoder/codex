@@ -76,7 +76,7 @@ impl App {
             }
         ) && !ConfigToggle::Notifications.enabled(&resolved.tui)
         {
-            self.chat_widget.pending_notification = None;
+            self.chat_widget.clear_pending_notifications();
             self.config_notification_test_pending = None;
         }
         self.local_settings.custom_notification_filters = resolved.custom_notification_filters;

@@ -7,12 +7,20 @@ impl ChatWidget {
         if !notification.allowed_for(&self.local_settings.tui.notification_settings.notifications) {
             return;
         }
-        if let Some(existing) = self.pending_notification.as_ref()
-            && existing.priority() > notification.priority()
-        {
-            return;
+        match self.pending_notification.take() {
+            None => self.pending_notification = Some(notification),
+            Some(existing) if existing.priority() > notification.priority() => {
+                self.pending_notification = Some(existing);
+                self.pending_notifications.push_back(notification);
+            }
+            Some(existing) => {
+                // Preserve the old lower/equal-priority event instead of
+                // replacing it. The newest higher-priority event remains the
+                // visible head and the queue drains on subsequent draws.
+                self.pending_notifications.push_back(existing);
+                self.pending_notification = Some(notification);
+            }
         }
-        self.pending_notification = Some(notification);
         self.request_redraw();
     }
 
@@ -20,6 +28,17 @@ impl ChatWidget {
         if let Some(notif) = self.pending_notification.take() {
             tui.notify(notif.display());
         }
+        if self.pending_notification.is_none()
+            && let Some(next) = self.pending_notifications.pop_front()
+        {
+            self.pending_notification = Some(next);
+            self.request_redraw();
+        }
+    }
+
+    pub(crate) fn clear_pending_notifications(&mut self) {
+        self.pending_notification = None;
+        self.pending_notifications.clear();
     }
 }
 

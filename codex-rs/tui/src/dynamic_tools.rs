@@ -2438,6 +2438,11 @@ async fn deliver_ticket_notification(
     tool_name: &str,
     message: String,
 ) -> Result<Value, String> {
+    // Ticket events deliberately bypass ChatWidget::notify: the canonical
+    // store owns the durable outbox and this delivery path binds one stable
+    // notification ID to one MAIN turn. ChatWidget's desktop notification
+    // queue is only a secondary UI surface for generic approvals/questions;
+    // it cannot consume, replace, or acknowledge ticket events.
     let document = match check {
         crate::ticket_store::ImplementCheck::Delivered(document) => {
             let assignment =

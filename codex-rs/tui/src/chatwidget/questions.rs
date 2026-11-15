@@ -12,6 +12,12 @@ impl ChatWidget {
             Some(Notification::AsyncQuestion { .. })
         ) {
             self.pending_notification = None;
+        } else if let Some(index) = self
+            .pending_notifications
+            .iter()
+            .position(|notification| matches!(notification, Notification::AsyncQuestion { .. }))
+        {
+            self.pending_notifications.remove(index);
         }
         self.bottom_pane.take_question_drafts()
     }

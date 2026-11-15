@@ -31,7 +31,7 @@ pub(crate) enum AdmissionError {
     CallerLimit(usize),
     #[error("ticket workflow queue is full (limit {0})")]
     GlobalLimit(usize),
-    #[error("ticket workflow is reconnecting")]
+    #[error("TUI is reconnecting; tool was not sent")]
     Reconnecting,
 }
 

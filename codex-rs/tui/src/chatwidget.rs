@@ -33,6 +33,7 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -712,8 +713,11 @@ pub(crate) struct ChatWidget {
     /// Ignore a held key after it dismisses the preset submenu.
     quick_dial_menu_key_guard: Option<crate::activation_key_guard::ActivationKeyGuard>,
     permission_shortcut_pending: bool,
-    // Pending notification to show when unfocused on next Draw
+    // Head notification to show when unfocused on next Draw. Additional
+    // notifications stay in `pending_notifications` so independent approval,
+    // question, and completion events cannot overwrite one another.
     pub(crate) pending_notification: Option<Notification>,
+    pub(crate) pending_notifications: VecDeque<Notification>,
     /// When `Some`, the user has pressed a quit shortcut and the second press
     /// must occur before `quit_shortcut_expires_at`.
     quit_shortcut_expires_at: Option<Instant>,
