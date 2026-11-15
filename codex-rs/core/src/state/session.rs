@@ -233,6 +233,9 @@ impl SessionState {
         root_turn_id: String,
         response_id: String,
         usage: &TokenUsage,
+        effective_model: String,
+        effective_reasoning_effort: Option<codex_protocol::openai_models::ReasoningEffort>,
+        effective_service_tier: Option<String>,
     ) -> TokenUsageRecord {
         let mut turn_token_usage = self
             .latest_token_usage_record
@@ -258,6 +261,9 @@ impl SessionState {
             usage: usage.clone(),
             turn_token_usage,
             thread_token_usage,
+            effective_model: Some(effective_model),
+            effective_reasoning_effort,
+            effective_service_tier,
         };
         self.latest_token_usage_record = Some(record.clone());
         record
@@ -354,7 +360,15 @@ impl SessionState {
     }
 
     pub(crate) fn token_info(&self) -> Option<TokenUsageInfo> {
-        self.history.token_info()
+        let mut info = self.history.token_info()?;
+        if let Some(record) = self.latest_token_usage_record.as_ref() {
+            info.latest_turn_token_usage = record.turn_token_usage.clone();
+            info.effective_model.clone_from(&record.effective_model);
+            info.effective_reasoning_effort = record.effective_reasoning_effort.clone();
+            info.effective_service_tier
+                .clone_from(&record.effective_service_tier);
+        }
+        Some(info)
     }
 
     pub(crate) fn set_rate_limits(&mut self, snapshot: RateLimitSnapshot) {

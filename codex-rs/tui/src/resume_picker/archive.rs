@@ -72,7 +72,11 @@ impl PickerState {
 
         self.archive_state = ArchiveState::Pending { thread_id };
         self.request_frame();
-        (self.picker_loader)(PickerLoadRequest::Archive { thread_id });
+        let recovery = self.legacy_side_main_recoveries.get(&thread_id).cloned();
+        (self.picker_loader)(PickerLoadRequest::Archive {
+            thread_id,
+            recovery,
+        });
     }
 
     pub(super) fn handle_archive_result(
@@ -87,7 +91,7 @@ impl PickerState {
         self.archive_state = ArchiveState::Idle;
 
         if let Err(error) = result {
-            self.inline_error = Some(format!("Failed to archive session: {error}"));
+            self.inline_error = Some(format!("Failed to archive session: {error:#}"));
             self.request_frame();
             return;
         }
@@ -147,6 +151,30 @@ impl PickerState {
         (self.picker_loader)(PickerLoadRequest::Unarchive { thread_id });
     }
 
+    pub(super) fn request_canonical_root_restore(&mut self, thread_id: ThreadId) {
+        if !matches!(self.archive_state, ArchiveState::Idle) {
+            return;
+        }
+
+        self.archive_state = ArchiveState::Restoring { thread_id };
+        self.request_frame();
+        (self.picker_loader)(PickerLoadRequest::RestoreCanonicalRoot { thread_id });
+    }
+
+    pub(super) fn request_legacy_side_main_recovery(
+        &mut self,
+        recovery: super::super::LegacySideMainRecoveryContext,
+    ) {
+        if !matches!(self.archive_state, ArchiveState::Idle) {
+            return;
+        }
+
+        let thread_id = recovery.main_thread_id;
+        self.archive_state = ArchiveState::Restoring { thread_id };
+        self.request_frame();
+        (self.picker_loader)(PickerLoadRequest::RecoverLegacySideMain { recovery });
+    }
+
     pub(super) fn handle_unarchive_result(
         &mut self,
         thread_id: ThreadId,
@@ -159,9 +187,11 @@ impl PickerState {
         self.archive_state = ArchiveState::Idle;
 
         match result {
-            Ok(target) => Some(SessionSelection::Resume(target)),
+            Ok(target) => Some(self.action.selection(target)),
             Err(error) => {
-                self.inline_error = Some(format!("Failed to restore archived session: {error}"));
+                self.inline_error = Some(format!(
+                    "[session_open_failed] Could not open session; retry Enter: {error:#}"
+                ));
                 self.request_frame();
                 None
             }

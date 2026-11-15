@@ -539,6 +539,13 @@ pub(crate) fn finalize_tool_router(
         &code_mode_tool_names,
         hosted_specs,
     );
+    validate_side_tool_plan(
+        turn_context,
+        model_info,
+        &registry,
+        &model_visible_specs,
+        tool_mode,
+    )?;
     let tool_namespaces_info = include_tool_namespaces_info
         .then(|| {
             collect_tool_namespaces_info(&registry, &code_mode_tool_names, &model_visible_specs)
@@ -556,6 +563,86 @@ pub(crate) fn finalize_tool_router(
     ))
 }
 
+fn validate_side_tool_plan(
+    turn_context: &TurnContext,
+    model_info: &ModelInfo,
+    registry: &ToolRegistry,
+    model_visible_specs: &[ToolSpec],
+    tool_mode: ToolMode,
+) -> CodexResult<()> {
+    if turn_context.role_constraints.paired_main_id().is_none() {
+        return Ok(());
+    }
+    if !turn_context.requires_side_model_preflight {
+        return Ok(());
+    }
+
+    let available_tui_tools = registry
+        .entries()
+        .filter_map(|tool| {
+            let name = tool.runtime.tool_name().with_default_namespace();
+            (name.namespace.as_deref() == Some("codex_tui")
+                || tool.runtime.mcp_server_name() == Some("codex_tui"))
+            .then_some(name.name)
+        })
+        .collect::<HashSet<_>>();
+    let missing = [
+        "read_workspace_file",
+        "list_workspace_directory",
+        "search_workspace_text",
+        "list_tickets",
+        "read_ticket",
+        "create_ticket",
+        "update_ticket",
+        "append_ticket_comment",
+        "implement_ticket",
+    ]
+    .into_iter()
+    .filter(|name| !available_tui_tools.contains(*name))
+    .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(CodexErrorDetails::InvalidRequest(format!(
+            "SIDE model preflight is missing authenticated codex_tui workflow tools: {}",
+            missing.join(", ")
+        ))
+        .into());
+    }
+
+    if matches!(tool_mode, ToolMode::CodeMode | ToolMode::CodeModeOnly) {
+        if !model_visible_specs
+            .iter()
+            .any(|spec| spec.name() == codex_code_mode::PUBLIC_TOOL_NAME)
+        {
+            return Err(CodexErrorDetails::InvalidRequest(
+                "SIDE model preflight did not construct the functions.exec transport".to_string(),
+            )
+            .into());
+        }
+    }
+
+    if let Some(usable_context) = model_info.usable_context_window() {
+        let tool_schema_bytes = serde_json::to_vec(model_visible_specs)
+            .map_err(|error| CodexErrorDetails::InvalidRequest(error.to_string()))?
+            .len();
+        let instruction_bytes = turn_context.base_instructions.len()
+            + turn_context
+                .developer_instructions
+                .as_deref()
+                .map_or(0, str::len);
+        let serialized_tokens = (tool_schema_bytes + instruction_bytes).div_ceil(4);
+        let reserve_tokens = 4_096usize.max(serialized_tokens / 2);
+        let required_tokens = serialized_tokens.saturating_add(reserve_tokens);
+        if usize::try_from(usable_context).is_ok_and(|usable| usable < required_tokens) {
+            return Err(CodexErrorDetails::InvalidRequest(format!(
+                "SIDE model `{}` has an insufficient usable context window ({usable_context} tokens; preflight requires {required_tokens} from measured instructions/tool schema plus reserve)",
+                model_info.slug
+            ))
+            .into());
+        }
+    }
+    Ok(())
+}
+
 /// SIDE uses a defense-in-depth tool surface in addition to its read-only
 /// process sandbox. There is deliberately no arbitrary command transport: a
 /// read-only shell cannot provide a complete zero-write guarantee across the
@@ -566,23 +653,11 @@ pub(crate) fn finalize_tool_router(
 /// mutations and their durable assignment notifications.
 fn is_strict_read_only_turn(turn_context: &TurnContext) -> bool {
     turn_context.config.strict_read_only_tools
-        || matches!(
-            turn_context.thread_source.as_ref(),
-            Some(codex_protocol::protocol::ThreadSource::Feature(source))
-                if source
-                    .strip_prefix("ai_lab_side:")
-                    .is_some_and(|main_id| !main_id.is_empty())
-        )
+        || turn_context.role_constraints.requires_strict_read_only()
 }
 
 fn is_paired_side_turn(turn_context: &TurnContext) -> bool {
-    matches!(
-        turn_context.thread_source.as_ref(),
-        Some(codex_protocol::protocol::ThreadSource::Feature(source))
-            if source
-                .strip_prefix("ai_lab_side:")
-                .is_some_and(|main_id| !main_id.is_empty())
-    )
+    turn_context.role_constraints.paired_main_id().is_some()
 }
 
 /// Ticket mutation belongs only to a durably identified paired SIDE thread.

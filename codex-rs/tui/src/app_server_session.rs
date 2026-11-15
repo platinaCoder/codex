@@ -59,6 +59,7 @@ use codex_app_server_protocol::GetAccountParams;
 use codex_app_server_protocol::GetAccountRateLimitsResponse;
 use codex_app_server_protocol::GetAccountResponse;
 use codex_app_server_protocol::JSONRPCErrorError;
+use codex_app_server_protocol::LegacySideMainRecovery;
 use codex_app_server_protocol::LogoutAccountResponse;
 use codex_app_server_protocol::MemoryResetResponse;
 use codex_app_server_protocol::Model as ApiModel;
@@ -168,7 +169,7 @@ const JSONRPC_INVALID_REQUEST: i64 = -32600;
 const JSONRPC_METHOD_NOT_FOUND: i64 = -32601;
 const JSONRPC_INVALID_PARAMS: i64 = -32602;
 pub(crate) const EXTERNAL_AGENT_CONFIG_IMPORT_IN_PROGRESS_MESSAGE: &str = "A previous external agent import is still running. Wait for it to finish before importing again.";
-pub(crate) const PERSISTENT_SIDE_THREAD_SOURCE_PREFIX: &str = "ai_lab_side";
+pub(crate) use codex_protocol::AI_LAB_SIDE_THREAD_SOURCE_PREFIX as PERSISTENT_SIDE_THREAD_SOURCE_PREFIX;
 const THREAD_SETTINGS_UPDATE_METHOD: &str = "thread/settings/update";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -382,6 +383,21 @@ pub(crate) struct AppServerStartedThread {
     pub(crate) turns: Vec<Turn>,
     pub(crate) blocks_direct_input: bool,
     pub(crate) task_tools_available: bool,
+}
+
+const TASK_READ_POLICY_INCOMPATIBLE: &str = "the app-server runtime did not provide the calling thread's effective filesystem read policy; this Codex client cannot safely enable task read tools across the current runtime version boundary. Start with the matching --no-daemon runtime or promote a matching daemon package before using this task";
+
+pub(crate) fn validate_task_read_policy(thread: &Thread) -> Result<()> {
+    if thread
+        .extra
+        .as_ref()
+        .and_then(|extra| extra.effective_read_policy.as_ref())
+        .is_some()
+    {
+        Ok(())
+    } else {
+        Err(color_eyre::eyre::eyre!(TASK_READ_POLICY_INCOMPATIBLE))
+    }
 }
 
 pub(crate) fn is_active_writer_error(err: &color_eyre::eyre::Report) -> bool {
@@ -916,6 +932,7 @@ impl AppServerSession {
             remote_cwd_override,
             selected_profile,
             ThreadSource::User,
+            None,
         )
         .await
     }
@@ -941,8 +958,39 @@ impl AppServerSession {
             ThreadSource::Feature(format!(
                 "{PERSISTENT_SIDE_THREAD_SOURCE_PREFIX}:{parent_thread_id}"
             )),
+            None,
         )
         .await
+    }
+
+    pub(crate) async fn recover_legacy_side_main_thread(
+        &mut self,
+        config: &Config,
+        side_thread: &Thread,
+        main_thread_id: ThreadId,
+        side_thread_id: ThreadId,
+    ) -> Result<AppServerStartedThread> {
+        let side_cwd = side_thread.cwd.to_path_buf();
+        let local_settings = LocalSettings::from(config);
+        let started = self
+            .start_thread_with_source(
+                &local_settings,
+                config,
+                /*session_start_source*/ None,
+                Some(side_cwd.as_path()),
+                /*selected_profile*/ None,
+                ThreadSource::User,
+                Some(LegacySideMainRecovery {
+                    main_thread_id: main_thread_id.to_string(),
+                    side_thread_id: side_thread_id.to_string(),
+                }),
+            )
+            .await?;
+        color_eyre::eyre::ensure!(
+            started.session.thread_id == main_thread_id,
+            "legacy SIDE recovery returned a different canonical MAIN identity"
+        );
+        Ok(started)
     }
 
     async fn start_thread_with_source(
@@ -953,14 +1001,18 @@ impl AppServerSession {
         remote_cwd_override: Option<&std::path::Path>,
         selected_profile: Option<&PermissionProfileSelection>,
         thread_source: ThreadSource,
+        legacy_side_main_recovery: Option<LegacySideMainRecovery>,
     ) -> Result<AppServerStartedThread> {
         let request_id = self.next_request_id();
-        let persistent_side_main = match &thread_source {
-            ThreadSource::Feature(source) => source
-                .strip_prefix(&format!("{PERSISTENT_SIDE_THREAD_SOURCE_PREFIX}:"))
-                .and_then(|main_id| ThreadId::from_string(main_id).ok()),
-            _ => None,
-        };
+        let persistent_side_main = codex_protocol::resolve_conversation_role_feature(
+            match &thread_source {
+                ThreadSource::Feature(feature) => Some(feature.as_str()),
+                _ => None,
+            },
+            None,
+            None,
+        )
+        .paired_main_id();
         let is_persistent_side = persistent_side_main.is_some();
         let session_config = self.session_config_with_effective_service_tier(config);
         let mut params = thread_start_params_from_config(
@@ -970,7 +1022,9 @@ impl AppServerSession {
             session_start_source,
         );
         params.thread_source = Some(thread_source);
+        params.legacy_side_main_recovery = legacy_side_main_recovery;
         if is_persistent_side {
+            params.allow_provider_model_fallback = false;
             params.developer_instructions = with_terminal_visualization_instructions(
                 config,
                 config.developer_instructions.clone(),
@@ -999,6 +1053,7 @@ impl AppServerSession {
         } else {
             self.thread_tool_transport().configure(&mut params);
         }
+        let requested_side_model = is_persistent_side.then(|| params.model.clone()).flatten();
         let request_handle = self.request_handle();
         let (response, history_support, task_tools_available) =
             request_thread_start_with_history_fallback(&request_handle, request_id, params)
@@ -1006,6 +1061,17 @@ impl AppServerSession {
                 .map_err(|err| {
                     bootstrap_request_error("thread/start failed during TUI bootstrap", err)
                 })?;
+        if task_tools_available {
+            validate_task_read_policy(&response.thread)?;
+        }
+        if let Some(requested_model) = requested_side_model
+            && response.model != requested_model
+        {
+            return Err(color_eyre::eyre::eyre!(
+                "SIDE requested model {requested_model:?}, but the server resolved {:?}; provider fallback is disabled",
+                response.model
+            ));
+        }
         if history_support == ThreadHistorySupport::LegacyOnly {
             self.history_support = ThreadHistorySupport::LegacyOnly;
         }
@@ -1212,6 +1278,17 @@ impl AppServerSession {
             params.approvals_reviewer = selected_profile.approvals_reviewer.map(Into::into);
             remove_permission_config_overrides(&mut params.config);
         }
+        if presentation == ForkPresentation::SideConversation {
+            // Legacy SIDE forks are still accepted for migration tests and old rollouts. Their
+            // client config is not authority for permissions: clamp the fork before it reaches
+            // core while preserving the server-owned runtime roots carried by the session.
+            params.permissions =
+                Some(codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_READ_ONLY.to_string());
+            params.sandbox = None;
+            params.approval_policy = Some(AskForApproval::Never);
+            params.approvals_reviewer = Some(codex_app_server_protocol::ApprovalsReviewer::User);
+            remove_permission_config_overrides(&mut params.config);
+        }
         self.thread_tool_transport()
             .configure_mcp(&mut params.config);
         let response: ThreadForkResponse = match self
@@ -1244,6 +1321,12 @@ impl AppServerSession {
             }
         };
         let mut response = response;
+        let fork_has_task_tools = self.task_tools_available(thread_id)
+            || (presentation == ForkPresentation::SideConversation
+                && self.thread_tool_transport().provides_paired_side_tools());
+        if fork_has_task_tools {
+            validate_task_read_policy(&response.thread)?;
+        }
         if presentation == ForkPresentation::Regular
             && !response.thread.ephemeral
             && let Err(error) = self
@@ -1284,7 +1367,7 @@ impl AppServerSession {
             started.session.daybreak_enabled = false;
         }
         started.session.fork_parent_title = fork_parent.and_then(|thread| thread.name);
-        if self.task_tools_available(thread_id) {
+        if fork_has_task_tools {
             started.task_tools_available = true;
             self.remember_task_tool_thread(started.session.thread_id);
         }
@@ -1411,6 +1494,33 @@ impl AppServerSession {
         )
         .await?;
         Ok(response.thread)
+    }
+
+    pub(crate) async fn thread_read_if_exists(
+        &mut self,
+        thread_id: ThreadId,
+    ) -> Result<Option<Thread>> {
+        let request_id = self.next_request_id();
+        match self
+            .client
+            .request_typed::<ThreadReadResponse>(ClientRequest::ThreadRead {
+                request_id,
+                params: ThreadReadParams {
+                    thread_id: thread_id.to_string(),
+                    include_turns: false,
+                },
+            })
+            .await
+        {
+            Ok(response) => Ok(Some(response.thread)),
+            Err(TypedRequestError::Server { source, .. })
+                if source.message == format!("thread not found: {thread_id}")
+                    || source.message == format!("thread not loaded: {thread_id}") =>
+            {
+                Ok(None)
+            }
+            Err(err) => Err(err).wrap_err("thread/read failed during TUI session lookup"),
+        }
     }
 
     pub(crate) async fn thread_archive(&mut self, thread_id: ThreadId) -> Result<()> {
@@ -1959,6 +2069,9 @@ pub(crate) async fn start_thread_with_request_handle(
             .map_err(|err| {
                 bootstrap_request_error("thread/start failed during TUI bootstrap", err)
             })?;
+    if task_tools_available {
+        validate_task_read_policy(&response.thread)?;
+    }
     let mut started =
         started_thread_from_start_response(response, local_settings, &config, thread_params_mode)
             .await?;

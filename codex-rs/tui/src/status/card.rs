@@ -128,6 +128,7 @@ struct StatusHistoryCell {
     model_details: Vec<String>,
     directory: PathBuf,
     permissions: String,
+    role_summary: Option<String>,
     agents_summary: Arc<RwLock<String>>,
     collaboration_mode: Option<String>,
     model_provider: Option<String>,
@@ -214,6 +215,7 @@ pub(crate) fn new_status_output_with_rate_limits(
         collaboration_mode,
         reasoning_effort_override,
         "<none>".to_string(),
+        /*role_summary*/ None,
         refreshing_rate_limits,
     )
     .0
@@ -238,6 +240,7 @@ pub(crate) fn new_status_output_with_rate_limits_handle(
     collaboration_mode: Option<&str>,
     reasoning_effort_override: Option<Option<ReasoningEffort>>,
     agents_summary: String,
+    role_summary: Option<String>,
     refreshing_rate_limits: bool,
 ) -> (CompositeHistoryCell, StatusHistoryHandle) {
     let command = PlainHistoryCell::new(vec!["/status".magenta().into()]);
@@ -259,6 +262,7 @@ pub(crate) fn new_status_output_with_rate_limits_handle(
         collaboration_mode,
         reasoning_effort_override,
         agents_summary,
+        role_summary,
         refreshing_rate_limits,
     ));
     let handle = StatusHistoryHandle {
@@ -291,6 +295,7 @@ impl StatusHistoryCell {
         collaboration_mode: Option<&str>,
         reasoning_effort_override: Option<Option<ReasoningEffort>>,
         agents_summary: String,
+        role_summary: Option<String>,
         refreshing_rate_limits: bool,
     ) -> Self {
         let approval_policy = AskForApproval::from(config.permissions.approval_policy.value());
@@ -314,6 +319,9 @@ impl StatusHistoryCell {
         ];
         if let Some(provider_id) = &model_provider {
             config_entries.insert(2, ("provider", provider_id.clone()));
+        }
+        if let Some(service_tier) = config.service_tier.as_deref() {
+            config_entries.push(("service tier", service_tier.to_string()));
         }
         if config.model_provider.wire_api == WireApi::Responses {
             let effort_value = reasoning_effort_override
@@ -387,6 +395,7 @@ impl StatusHistoryCell {
             model_details,
             directory: config.cwd.to_path_buf(),
             permissions,
+            role_summary,
             collaboration_mode: collaboration_mode.map(ToString::to_string),
             model_provider,
             remote_connection: remote_connection.cloned(),
@@ -770,6 +779,9 @@ impl StatusHistoryCell {
         if self.model_provider.is_some() {
             push_label(&mut labels, &mut seen, "Model provider");
         }
+        if self.role_summary.is_some() {
+            push_label(&mut labels, &mut seen, "Conversation role");
+        }
         if account_value.is_some() {
             push_label(&mut labels, &mut seen, "Account");
         }
@@ -830,6 +842,9 @@ impl StatusHistoryCell {
         }
         lines.push(formatter.line("Directory", vec![Span::from(directory_value)]));
         lines.push(formatter.line("Permissions", vec![Span::from(self.permissions.clone())]));
+        if let Some(role_summary) = self.role_summary.as_ref() {
+            lines.push(formatter.line("Conversation role", vec![Span::from(role_summary.clone())]));
+        }
         lines.push(formatter.line("Agents.md", vec![Span::from(agents_summary)]));
 
         if let Some(account_value) = account_value {

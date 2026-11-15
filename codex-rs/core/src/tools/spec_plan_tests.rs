@@ -216,6 +216,13 @@ async fn probe_with(
 ) -> ToolPlanProbe {
     let (_session, mut turn) = make_session_and_context().await;
     configure_turn(&mut turn);
+    turn.role_constraints = crate::session::session::ConversationRoleConstraints::new(
+        codex_protocol::resolve_conversation_role(
+            turn.thread_source.as_ref(),
+            None,
+            turn.parent_thread_id,
+        ),
+    );
     ToolPlanProbe::from_router(plan_with_model(&turn, turn.model_info(), inputs))
 }
 
@@ -1135,6 +1142,8 @@ async fn strict_side_keeps_reads_and_bounded_ticket_workflow() {
                     "read_workspace_file",
                     /*defer_loading*/ false,
                 ),
+                dynamic_tool(Some("codex_tui"), "list_workspace_directory", false),
+                dynamic_tool(Some("codex_tui"), "search_workspace_text", false),
                 dynamic_tool(Some("codex_tui"), "list_tickets", false),
                 dynamic_tool(Some("codex_tui"), "read_ticket", false),
                 dynamic_tool(Some("codex_tui"), "create_ticket", false),
@@ -1296,6 +1305,8 @@ async fn persisted_side_identity_enforces_strict_surface_without_client_override
                     "read_workspace_file",
                     /*defer_loading*/ false,
                 ),
+                dynamic_tool(Some("codex_tui"), "list_workspace_directory", false),
+                dynamic_tool(Some("codex_tui"), "search_workspace_text", false),
                 dynamic_tool(Some("codex_tui"), "list_tickets", false),
                 dynamic_tool(Some("codex_tui"), "read_ticket", false),
                 dynamic_tool(Some("codex_tui"), "create_ticket", false),
@@ -1366,6 +1377,45 @@ async fn persisted_side_identity_enforces_strict_surface_without_client_override
             "mutating or untrusted tool leaked into model-visible SIDE catalog: {forbidden}"
         );
     }
+}
+
+#[tokio::test]
+async fn malformed_side_identity_fails_closed_without_paired_ticket_privileges() {
+    let plan = probe_with(
+        |turn| {
+            turn.thread_source = Some(ThreadSource::Feature(
+                "ai_lab_side:not-a-thread-id".to_string(),
+            ));
+        },
+        ToolPlanInputs {
+            dynamic_tools: [
+                "read_workspace_file",
+                "list_tickets",
+                "read_ticket",
+                "create_ticket",
+                "update_ticket",
+                "implement_ticket",
+            ]
+            .into_iter()
+            .map(|name| dynamic_tool(Some("codex_tui"), name, false))
+            .collect(),
+            ..ToolPlanInputs::default()
+        },
+    )
+    .await;
+
+    plan.assert_registered_contains(&[
+        &ToolName::namespaced("codex_tui", "read_workspace_file").to_string(),
+        &ToolName::namespaced("codex_tui", "list_tickets").to_string(),
+        &ToolName::namespaced("codex_tui", "read_ticket").to_string(),
+    ]);
+    plan.assert_registered_lacks(&[
+        "exec_command",
+        "apply_patch",
+        &ToolName::namespaced("codex_tui", "create_ticket").to_string(),
+        &ToolName::namespaced("codex_tui", "update_ticket").to_string(),
+        &ToolName::namespaced("codex_tui", "implement_ticket").to_string(),
+    ]);
 }
 
 #[tokio::test]

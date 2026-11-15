@@ -20,7 +20,18 @@ async fn test_server_with_cwd(
     tool_arguments: Value,
     cwd: Option<&std::path::Path>,
 ) -> color_eyre::Result<(TempDir, AppServerSession, String, String)> {
+    test_server_with_cwd_and_config(tool_arguments, cwd, None).await
+}
+
+async fn test_server_with_cwd_and_config(
+    tool_arguments: Value,
+    cwd: Option<&std::path::Path>,
+    config_toml: Option<&str>,
+) -> color_eyre::Result<(TempDir, AppServerSession, String, String)> {
     let codex_home = tempfile::tempdir()?;
+    if let Some(config_toml) = config_toml {
+        std::fs::write(codex_home.path().join("config.toml"), config_toml)?;
+    }
     let mut config = ConfigBuilder::default()
         .codex_home(codex_home.path().to_path_buf())
         .build()
@@ -972,6 +983,146 @@ async fn dedicated_workspace_tools_read_without_shell_execution() -> color_eyre:
     Ok(())
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn readable_path_tools_follow_allowed_external_symlinks_and_reject_escapes()
+-> color_eyre::Result<()> {
+    use std::os::unix::fs::symlink;
+
+    let workspace = tempfile::tempdir()?;
+    let allowed = tempfile::tempdir()?;
+    let allowed_file = allowed.path().join("review.txt");
+    std::fs::write(&allowed_file, "ticket-13 external review needle\n")?;
+
+    symlink(&allowed_file, workspace.path().join("review-link"))?;
+    symlink(allowed.path(), workspace.path().join("review-dir"))?;
+    symlink("review-link", workspace.path().join("review-chain"))?;
+    symlink("missing", workspace.path().join("dangling"))?;
+    symlink("loop-b", workspace.path().join("loop-a"))?;
+    symlink("loop-a", workspace.path().join("loop-b"))?;
+    let config_toml = r#"default_permissions = "reader-test"
+
+[permissions.reader-test.filesystem]
+":root" = "read"
+"#;
+    let (_codex_home, server, source, _target) =
+        test_server_with_cwd_and_config(json!({}), Some(workspace.path()), Some(&config_toml))
+            .await?;
+
+    for path in [
+        allowed_file.to_string_lossy().into_owned(),
+        "review-link".to_string(),
+        "review-chain".to_string(),
+    ] {
+        let read = response_json(
+            call_tool(
+                &server,
+                &source,
+                "read_workspace_file",
+                json!({"path": path}),
+            )
+            .await,
+        );
+        assert!(
+            read["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("external review"))
+        );
+    }
+
+    let list = response_json(
+        call_tool(
+            &server,
+            &source,
+            "list_workspace_directory",
+            json!({"path": "review-dir"}),
+        )
+        .await,
+    );
+    assert!(list["entries"].as_array().is_some_and(|entries| {
+        entries.iter().any(|entry| {
+            entry["path"]
+                .as_str()
+                .is_some_and(|path| path.ends_with("review.txt"))
+        })
+    }));
+
+    let search = response_json(
+        call_tool(
+            &server,
+            &source,
+            "search_workspace_text",
+            json!({"path": "review-dir", "query": "review needle"}),
+        )
+        .await,
+    );
+    assert_eq!(search["matches"].as_array().map(Vec::len), Some(1));
+
+    for path in ["dangling", "loop-a"] {
+        assert!(
+            !call_tool(
+                &server,
+                &source,
+                "read_workspace_file",
+                json!({"path": path}),
+            )
+            .await
+            .success,
+            "{path} must fail closed"
+        );
+    }
+    symlink(".", allowed.path().join("recursive-loop"))?;
+    assert!(
+        !call_tool(
+            &server,
+            &source,
+            "search_workspace_text",
+            json!({"path": "review-dir", "query": "needle"}),
+        )
+        .await
+        .success
+    );
+
+    server.shutdown().await?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn effective_read_policy_rejects_denied_canonical_symlink_target() -> color_eyre::Result<()> {
+    use codex_protocol::permissions::FileSystemAccessMode;
+    use codex_protocol::permissions::FileSystemSandboxEntry;
+    use codex_utils_path_uri::PathUri;
+    use std::os::unix::fs::symlink;
+
+    let workspace = tempfile::tempdir()?;
+    let denied = tempfile::tempdir()?;
+    let denied_file = denied.path().join("secret.txt");
+    std::fs::write(&denied_file, "secret")?;
+    symlink(&denied_file, workspace.path().join("denied-link"))?;
+    let cwd = std::fs::canonicalize(workspace.path())?;
+    let policy = EffectiveReadPolicy {
+        cwd,
+        file_system: FileSystemSandboxPolicy::restricted(vec![
+            FileSystemSandboxEntry::new(
+                PathUri::from_host_native_path(workspace.path())?.into(),
+                FileSystemAccessMode::Read,
+            ),
+            FileSystemSandboxEntry::new(
+                PathUri::from_host_native_path(denied.path())?.into(),
+                FileSystemAccessMode::Deny,
+            ),
+        ]),
+    };
+
+    let error = policy
+        .resolve("denied-link")
+        .expect_err("canonical denied target must fail closed");
+    assert!(error.contains("effective readable roots"), "{error}");
+    assert!(policy.resolve(&denied_file.to_string_lossy()).is_err());
+    Ok(())
+}
+
 #[test]
 fn ticket_capabilities_are_exact_pathless_and_mcp_only() {
     let specs = tool_specs();
@@ -1015,9 +1166,10 @@ fn ticket_capabilities_are_exact_pathless_and_mcp_only() {
         })
         .collect::<Vec<_>>();
     for name in TICKET_TOOLS {
-        assert!(
-            DELEGATION_TOOLS.contains(&name)
-                || direct_names.iter().any(|candidate| candidate == name),
+        assert_eq!(
+            direct_names.iter().any(|candidate| candidate == name),
+            !TICKET_MUTATION_TOOLS.contains(&name),
+            "direct SIDE fallback must expose only read-only ticket tools: {name}"
         );
     }
     for name in DELEGATION_TOOLS {

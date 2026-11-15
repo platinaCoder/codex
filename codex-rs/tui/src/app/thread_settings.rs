@@ -91,7 +91,10 @@ impl App {
             ..ThreadSettingsUpdateParams::default()
         };
 
-        if is_cyber_model {
+        // Cyber's convenience profile is a Standard-thread UX only. SIDE's immutable role ceiling
+        // is also enforced by core, but the client must not forge a combined model+workspace
+        // update in the first place.
+        if is_cyber_model && !self.side_threads.contains_key(&thread_id) {
             let workspace_profile = PermissionProfile::workspace_write();
             let workspace_allowed = self
                 .config

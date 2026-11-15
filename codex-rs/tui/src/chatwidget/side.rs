@@ -16,6 +16,9 @@ impl ChatWidget {
 
     pub(crate) fn set_side_conversation_active(&mut self, active: bool) {
         self.active_side_conversation = active;
+        if !active {
+            self.side_parent_thread_id = None;
+        }
         let placeholder = if active {
             self.side_placeholder_text.clone()
         } else {
@@ -30,6 +33,10 @@ impl ChatWidget {
 
     pub(crate) fn side_conversation_active(&self) -> bool {
         self.active_side_conversation
+    }
+
+    pub(crate) fn set_side_parent_thread_id(&mut self, parent_thread_id: ThreadId) {
+        self.side_parent_thread_id = Some(parent_thread_id);
     }
 
     pub(crate) fn set_side_conversation_context_label(&mut self, label: Option<String>) {

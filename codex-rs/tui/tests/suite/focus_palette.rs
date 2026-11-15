@@ -1140,7 +1140,10 @@ text(JSON.stringify({ catalogSafe: true, read }));
     );
 
     submit(&mut terminal, "Hi! Say Hi to MAIN")?;
-    terminal.wait_for_screen("SIDE_BRIDGE_REMOVED_OK")?;
+    // The responder emits this only after the code-mode call confirms the legacy MAIN bridge is
+    // absent. Tool output is intentionally collapsed in the transcript, so assert the visible
+    // assistant acknowledgement instead of the hidden `SIDE_BRIDGE_REMOVED_OK` payload.
+    terminal.wait_for_screen("SIDE_PROACTIVE_SEND_OK")?;
 
     let registry =
         std::fs::read_to_string(terminal._codex_home.path().join("ai_lab_side_pairs.json"))?;
@@ -1158,7 +1161,7 @@ text(JSON.stringify({ catalogSafe: true, read }));
     };
     terminal.restart_binary(&codex, &workspace_path, &resume_args)?;
     terminal.wait_for_startup()?;
-    terminal.wait_for_screen("SIDE_BRIDGE_REMOVED_OK")?;
+    terminal.wait_for_screen("SIDE_PROACTIVE_SEND_OK")?;
     submit(&mut terminal, "/side")?;
     terminal.wait_for_screen("SIDE • focused")?;
     submit(&mut terminal, "COLD_RESUME_READ")?;

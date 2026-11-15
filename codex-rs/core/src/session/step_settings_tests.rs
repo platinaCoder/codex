@@ -1,8 +1,10 @@
 use super::*;
 use crate::config::PermissionProfileState;
 use crate::config::test_config;
+use crate::session::session::ConversationRoleConstraints;
 use crate::session::session::SessionConfiguration;
 use crate::session::session::SessionSettingsUpdate;
+use crate::session::session::validate_conversation_role_model;
 use crate::session::tests::make_session_configuration_for_tests;
 use codex_config::ConfigLayerStack;
 use codex_config::RequirementSource;
@@ -11,6 +13,7 @@ use codex_features::Feature;
 use codex_models_manager::manager::StaticModelsManager;
 use codex_models_manager::model_info::model_info_from_slug;
 use codex_prompts::render_model_instructions;
+use codex_protocol::ThreadId;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::Settings;
 use codex_protocol::models::BaseInstructionsProvenance;
@@ -341,6 +344,30 @@ fn configured_settings() -> StepSettings {
         approval_policy: Constrained::allow_any(AskForApproval::OnRequest),
         approvals_reviewer: ApprovalsReviewer::User,
     }
+}
+
+#[test]
+fn side_model_validation_rejects_fallback_and_missing_text_modality() {
+    let parent = ThreadId::new();
+    let constraints = ConversationRoleConstraints::new(codex_protocol::ConversationRole::Side {
+        parent_main_id: parent,
+    });
+    let settings = configured_settings();
+    let mut model = model_info_from_slug("model-a");
+    model.used_fallback_model_metadata = true;
+    assert!(
+        validate_conversation_role_model(constraints, &settings, &model)
+            .expect_err("fallback metadata must fail")
+            .contains("fallback metadata")
+    );
+
+    model.used_fallback_model_metadata = false;
+    model.input_modalities = vec![codex_protocol::openai_models::InputModality::Image];
+    assert!(
+        validate_conversation_role_model(constraints, &settings, &model)
+            .expect_err("text-incompatible model must fail")
+            .contains("text input")
+    );
 }
 
 fn step_settings_constraints(requirements: &ConfigRequirements) -> StepSettingsConstraints<'_> {

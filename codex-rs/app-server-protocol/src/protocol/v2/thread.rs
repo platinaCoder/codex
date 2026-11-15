@@ -122,6 +122,13 @@ pub struct ThreadStartParams {
     /// Optional client-supplied analytics source classification for this thread.
     #[ts(optional = nullable)]
     pub thread_source: Option<ThreadSource>,
+    /// Recovery-only identity for a legacy paired conversation whose durable SIDE
+    /// rollout predates materialization of its blank MAIN. The server validates the
+    /// exact persisted SIDE provenance and rejects collisions or multiple claims
+    /// before creating the missing Standard thread at `mainThreadId`.
+    #[experimental("thread/start.legacySideMainRecovery")]
+    #[ts(optional = nullable)]
+    pub legacy_side_main_recovery: Option<LegacySideMainRecovery>,
     /// Optional project identity for this new thread. Durable threads persist
     /// the assignment; ephemeral threads expose it only in live responses.
     #[experimental("thread/start.projectId")]
@@ -163,6 +170,14 @@ pub struct ThreadStartParams {
     #[experimental("thread/start.experimentalRawEvents")]
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub experimental_raw_events: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct LegacySideMainRecovery {
+    pub main_thread_id: String,
+    pub side_thread_id: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq, JsonSchema, TS)]
@@ -1993,12 +2008,27 @@ impl From<codex_protocol::ResponseUsageMetadata> for ResponseUsageMetadata {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct ThreadTokenUsage {
+    /// Cumulative usage for the canonical thread across all completed responses.
     pub total: TokenUsageBreakdown,
+    /// Latest provider/context-window sample retained for compatibility.
     pub last: TokenUsageBreakdown,
+    /// Cumulative usage for the latest logical turn.
+    #[serde(default)]
+    pub latest_turn: TokenUsageBreakdown,
+    /// Effective request settings for the latest accounted response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional, type = "string")]
+    pub effective_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional, type = "string")]
+    pub effective_reasoning_effort: Option<ReasoningEffort>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional, type = "string")]
+    pub effective_service_tier: Option<String>,
     // TODO(aibrahim): make this not optional
     #[ts(type = "number | null")]
     pub model_context_window: Option<i64>,
@@ -2009,12 +2039,16 @@ impl From<CoreTokenUsageInfo> for ThreadTokenUsage {
         Self {
             total: value.total_token_usage.into(),
             last: value.last_token_usage.into(),
+            latest_turn: value.latest_turn_token_usage.into(),
+            effective_model: value.effective_model,
+            effective_reasoning_effort: value.effective_reasoning_effort,
+            effective_service_tier: value.effective_service_tier,
             model_context_window: value.model_context_window,
         }
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct TokenUsageBreakdown {

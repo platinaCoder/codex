@@ -3395,6 +3395,7 @@ async fn record_initial_history_seeds_token_info_from_rollout() {
             codex_rollout_budget_units: None,
         },
         model_context_window: Some(1_000),
+        ..Default::default()
     };
     let info2 = TokenUsageInfo {
         total_token_usage: TokenUsage {
@@ -3416,6 +3417,7 @@ async fn record_initial_history_seeds_token_info_from_rollout() {
             codex_rollout_budget_units: None,
         },
         model_context_window: Some(2_000),
+        ..Default::default()
     };
 
     rollout_items.push(RolloutItem::EventMsg(EventMsg::TokenCount(
@@ -3468,6 +3470,9 @@ fn latest_token_usage_record_stops_at_compaction_checkpoint() {
         usage: TokenUsage::default(),
         turn_token_usage: TokenUsage::default(),
         thread_token_usage: TokenUsage::default(),
+        effective_model: None,
+        effective_reasoning_effort: None,
+        effective_service_tier: None,
     };
     let checkpoint = |latest_token_usage_record| {
         RolloutItem::Compacted(Box::new(CompactedItem {
@@ -3557,6 +3562,7 @@ async fn recompute_token_usage_updates_model_context_window() {
             total_token_usage: TokenUsage::default(),
             last_token_usage: TokenUsage::default(),
             model_context_window: Some(258_400),
+            ..Default::default()
         }));
     }
 
@@ -3681,6 +3687,7 @@ async fn record_token_usage_info_notifies_extension_contributors(
             crate::session::TokenUsageContext::SpendingOnly => first_usage.clone(),
         },
         model_context_window: turn_context.model_context_window(),
+        ..Default::default()
     };
     let expected = vec![
         RecordedTokenUsage {
@@ -3691,6 +3698,7 @@ async fn record_token_usage_info_notifies_extension_contributors(
                 total_token_usage: first_usage.clone(),
                 last_token_usage: first_usage,
                 model_context_window: turn_context.model_context_window(),
+                ..Default::default()
             },
             saw_session_store: true,
             saw_thread_store: true,
@@ -3703,6 +3711,7 @@ async fn record_token_usage_info_notifies_extension_contributors(
                 total_token_usage: expected_total_usage,
                 last_token_usage: second_usage,
                 model_context_window: turn_context.model_context_window(),
+                ..Default::default()
             },
             saw_session_store: true,
             saw_thread_store: true,
@@ -4105,6 +4114,9 @@ async fn start_new_context_window_persists_checkpoint_state() {
         usage: TokenUsage::default(),
         turn_token_usage: TokenUsage::default(),
         thread_token_usage: TokenUsage::default(),
+        effective_model: None,
+        effective_reasoning_effort: None,
+        effective_service_tier: None,
     };
     session.state.lock().await.latest_token_usage_record = Some(token_usage_record.clone());
     let step_context = session
@@ -4549,6 +4561,7 @@ async fn set_rate_limits_retains_previous_credits() {
         forked_from_thread_id: None,
         parent_thread_id: None,
         thread_source: None,
+        role_constraints: ConversationRoleConstraints::standard(),
         originator: "test_originator".to_string(),
         dynamic_tools: Arc::default(),
         user_shell_override: None,
@@ -4672,6 +4685,7 @@ async fn set_rate_limits_updates_plan_type_when_present() {
         forked_from_thread_id: None,
         parent_thread_id: None,
         thread_source: None,
+        role_constraints: ConversationRoleConstraints::standard(),
         originator: "test_originator".to_string(),
         dynamic_tools: Arc::default(),
         user_shell_override: None,
@@ -5297,6 +5311,7 @@ pub(crate) async fn make_session_configuration_for_tests() -> SessionConfigurati
         forked_from_thread_id: None,
         parent_thread_id: None,
         thread_source: None,
+        role_constraints: ConversationRoleConstraints::standard(),
         originator: "test_originator".to_string(),
         dynamic_tools: Arc::default(),
         user_shell_override: None,
@@ -6871,6 +6886,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         forked_from_thread_id: None,
         parent_thread_id: None,
         thread_source: None,
+        role_constraints: ConversationRoleConstraints::standard(),
         originator: "test_originator".to_string(),
         dynamic_tools: Arc::default(),
         user_shell_override: None,
@@ -7192,6 +7208,7 @@ async fn make_session_with_config_and_rx(
         forked_from_thread_id: None,
         parent_thread_id: None,
         thread_source: None,
+        role_constraints: ConversationRoleConstraints::standard(),
         originator: "test_originator".to_string(),
         dynamic_tools: Arc::default(),
         user_shell_override: None,
@@ -7329,6 +7346,7 @@ async fn make_session_with_history_source_and_agent_control_and_rx(
         forked_from_thread_id: None,
         parent_thread_id: None,
         thread_source: None,
+        role_constraints: ConversationRoleConstraints::standard(),
         originator: "test_originator".to_string(),
         dynamic_tools: Arc::default(),
         user_shell_override: None,
@@ -9157,6 +9175,7 @@ where
         forked_from_thread_id: None,
         parent_thread_id: None,
         thread_source: None,
+        role_constraints: ConversationRoleConstraints::standard(),
         originator: "test_originator".to_string(),
         dynamic_tools: Arc::from(dynamic_tools),
         user_shell_override: None,
@@ -12827,6 +12846,7 @@ async fn set_total_token_usage(sess: &Session, total_token_usage: TokenUsage) {
         total_token_usage,
         last_token_usage: TokenUsage::default(),
         model_context_window: None,
+        ..Default::default()
     }));
 }
 

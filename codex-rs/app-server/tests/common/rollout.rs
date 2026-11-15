@@ -1,6 +1,7 @@
 use anyhow::Result;
 use codex_protocol::SessionId;
 use codex_protocol::ThreadId;
+use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::GitInfo;
 use codex_protocol::protocol::SessionMeta;
@@ -134,6 +135,18 @@ pub fn create_fake_rollout_with_token_usage(
                 total_tokens: 90,
                 codex_rollout_budget_units: None,
             },
+            latest_turn_token_usage: TokenUsage {
+                input_tokens: 80,
+                cached_input_tokens: 12,
+                cache_write_input_tokens: 0,
+                output_tokens: 22,
+                reasoning_output_tokens: 6,
+                total_tokens: 102,
+                codex_rollout_budget_units: None,
+            },
+            effective_model: Some("gpt-side-test".to_string()),
+            effective_reasoning_effort: Some(ReasoningEffort::Low),
+            effective_service_tier: Some("flex".to_string()),
             model_context_window: Some(200_000),
         }),
         rate_limits: None,

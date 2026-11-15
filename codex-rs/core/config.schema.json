@@ -1497,6 +1497,16 @@
       },
       "type": "object"
     },
+    "ConversationRolesToml": {
+      "additionalProperties": false,
+      "description": "Role-scoped defaults for new conversations.",
+      "properties": {
+        "side": {
+          "$ref": "#/definitions/SideConversationRoleToml"
+        }
+      },
+      "type": "object"
+    },
     "CopyOnSelect": {
       "description": "When mouse selections are copied on release.",
       "oneOf": [
@@ -4634,6 +4644,22 @@
       },
       "type": "object"
     },
+    "SideConversationRoleToml": {
+      "additionalProperties": false,
+      "description": "Model-only defaults for newly created SIDE conversations.\n\nPermission fields intentionally do not exist here: role permissions are server-owned and intersected independently from user configuration.",
+      "properties": {
+        "model": {
+          "type": "string"
+        },
+        "model_reasoning_effort": {
+          "$ref": "#/definitions/ReasoningEffort"
+        },
+        "service_tier": {
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
     "SkillConfig": {
       "additionalProperties": false,
       "properties": {
@@ -7311,6 +7337,14 @@
     },
     "computer_use": {
       "$ref": "#/definitions/ComputerUseConfigToml"
+    },
+    "conversation_roles": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/ConversationRolesToml"
+        }
+      ],
+      "description": "Model-only defaults for newly created role-scoped conversations."
     },
     "daybreak": {
       "description": "Default Daybreak preference for new threads and non-interactive turns.",

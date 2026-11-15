@@ -325,6 +325,16 @@ async fn read_thread_from_rollout_path(
     let meta_line = read_required_session_meta_line(path.as_path()).await?;
     thread.forked_from_id = meta_line.meta.forked_from_id;
     thread.parent_thread_id = meta_line.meta.parent_thread_id;
+    // The rollout summary intentionally contains only discovery fields. Stable role identity and
+    // delegation metadata belong to session_meta and must survive legacy hydration; otherwise a
+    // persisted SIDE can be relabeled as an ordinary resumable thread.
+    thread.thread_source = meta_line.meta.thread_source;
+    thread.agent_nickname = meta_line.meta.agent_nickname;
+    thread.agent_role = meta_line.meta.agent_role;
+    thread.agent_path = meta_line.meta.agent_path;
+    if !meta_line.meta.originator.is_empty() {
+        thread.originator = Some(meta_line.meta.originator);
+    }
     thread.history_mode = meta_line.meta.history_mode;
     if let Some(model_provider) = meta_line
         .meta

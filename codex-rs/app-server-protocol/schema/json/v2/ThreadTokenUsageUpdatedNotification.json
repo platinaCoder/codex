@@ -1,10 +1,59 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "definitions": {
+    "ReasoningEffort": {
+      "description": "A non-empty reasoning effort value advertised by the model.",
+      "minLength": 1,
+      "type": "string"
+    },
     "ThreadTokenUsage": {
       "properties": {
+        "effectiveModel": {
+          "description": "Effective request settings for the latest accounted response.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "effectiveReasoningEffort": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ReasoningEffort"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "effectiveServiceTier": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "last": {
-          "$ref": "#/definitions/TokenUsageBreakdown"
+          "allOf": [
+            {
+              "$ref": "#/definitions/TokenUsageBreakdown"
+            }
+          ],
+          "description": "Latest provider/context-window sample retained for compatibility."
+        },
+        "latestTurn": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/TokenUsageBreakdown"
+            }
+          ],
+          "default": {
+            "cacheWriteInputTokens": 0,
+            "cachedInputTokens": 0,
+            "inputTokens": 0,
+            "outputTokens": 0,
+            "reasoningOutputTokens": 0,
+            "totalTokens": 0
+          },
+          "description": "Cumulative usage for the latest logical turn."
         },
         "modelContextWindow": {
           "format": "int64",
@@ -14,7 +63,12 @@
           ]
         },
         "total": {
-          "$ref": "#/definitions/TokenUsageBreakdown"
+          "allOf": [
+            {
+              "$ref": "#/definitions/TokenUsageBreakdown"
+            }
+          ],
+          "description": "Cumulative usage for the canonical thread across all completed responses."
         }
       },
       "required": [

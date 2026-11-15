@@ -61,6 +61,8 @@ use codex_login::default_client::originator;
 use codex_login::default_client::set_default_client_residency_requirement;
 use codex_login::enforce_login_restrictions;
 use codex_login::is_workload_identity_selected;
+use codex_protocol::AI_LAB_SIDE_THREAD_SOURCE_PREFIX;
+use codex_protocol::ConversationRole;
 use codex_protocol::ThreadId;
 use codex_protocol::auth::AuthMode;
 use codex_protocol::config_types::AltScreenMode;
@@ -851,6 +853,222 @@ fn session_target_from_app_server_thread(
     }
 }
 
+fn persisted_app_server_conversation_role(
+    thread: &AppServerThread,
+) -> color_eyre::Result<ConversationRole> {
+    let feature = thread
+        .thread_source
+        .as_ref()
+        .and_then(|source| match source {
+            codex_app_server_protocol::ThreadSource::Feature(feature) => Some(feature.as_str()),
+            _ => None,
+        });
+    if !feature.is_some_and(|feature| feature.starts_with(AI_LAB_SIDE_THREAD_SOURCE_PREFIX)) {
+        return Ok(ConversationRole::Standard);
+    }
+    let thread_id = ThreadId::from_string(&thread.id).wrap_err_with(|| {
+        format!(
+            "persisted SIDE thread {} has an invalid stable identity",
+            thread.id
+        )
+    })?;
+    let control_parent = thread
+        .parent_thread_id
+        .as_deref()
+        .map(ThreadId::from_string)
+        .transpose()
+        .wrap_err_with(|| {
+            format!("persisted SIDE thread {thread_id} has an invalid control-parent identity")
+        })?;
+    Ok(codex_protocol::resolve_conversation_role_feature(
+        feature,
+        Some(thread_id),
+        control_parent,
+    ))
+}
+
+async fn canonical_resume_target_from_app_server_thread(
+    app_server: &mut AppServerSession,
+    config: &Config,
+    thread: AppServerThread,
+) -> color_eyre::Result<Option<resume_picker::SessionTarget>> {
+    let candidate_id = ThreadId::from_string(&thread.id).wrap_err_with(|| {
+        format!(
+            "resume candidate {} has an invalid stable thread identity",
+            thread.id
+        )
+    })?;
+    // Catalog rows can lag role metadata. Re-read the candidate before choosing a resume root so
+    // recency, focus, preview, or UI ordering can never relabel a persisted SIDE as MAIN.
+    let thread = app_server
+        .thread_read(candidate_id, /*include_turns*/ false)
+        .await
+        .wrap_err_with(|| {
+            format!("resume candidate {candidate_id} could not be verified by stable identity")
+        })?;
+    let canonical = canonical_resume_thread_from_verified(app_server, thread).await?;
+    let canonical_thread = match canonical.legacy_recovery {
+        Some(recovery) => {
+            materialize_legacy_side_main_recovery(app_server, config, recovery).await?
+        }
+        None => canonical.thread,
+    };
+    Ok(session_target_from_app_server_thread(
+        app_server.backend_id(),
+        canonical_thread,
+    ))
+}
+
+#[derive(Clone, Debug)]
+struct LegacySideMainRecoveryContext {
+    main_thread_id: ThreadId,
+    side_thread_id: ThreadId,
+    side_thread: AppServerThread,
+}
+
+struct CanonicalResumeThread {
+    thread: AppServerThread,
+    selected_from_side: bool,
+    legacy_recovery: Option<LegacySideMainRecoveryContext>,
+}
+
+async fn materialize_legacy_side_main_recovery(
+    app_server: &mut AppServerSession,
+    config: &Config,
+    recovery: LegacySideMainRecoveryContext,
+) -> color_eyre::Result<AppServerThread> {
+    // A previous selection may have persisted MAIN before the picker transitioned.
+    // Re-read both identities before reusing it; stale picker state is not authority.
+    let side = app_server
+        .thread_read(recovery.side_thread_id, false)
+        .await?;
+    color_eyre::eyre::ensure!(
+        persisted_app_server_conversation_role(&side)?
+            == (ConversationRole::Side {
+                parent_main_id: recovery.main_thread_id
+            }),
+        "[recovery_topology_conflict] SIDE no longer identifies the selected MAIN"
+    );
+    if let Some(main) = app_server
+        .thread_read_if_exists(recovery.main_thread_id)
+        .await?
+    {
+        color_eyre::eyre::ensure!(
+            !main.ephemeral
+                && main.parent_thread_id.is_none()
+                && persisted_app_server_conversation_role(&main)? == ConversationRole::Standard,
+            "[recovery_identity_collision] existing MAIN has conflicting topology"
+        );
+        return Ok(main);
+    }
+    app_server
+        .recover_legacy_side_main_thread(
+            config,
+            &recovery.side_thread,
+            recovery.main_thread_id,
+            recovery.side_thread_id,
+        )
+        .await
+        .wrap_err_with(|| {
+            format!(
+                "failed to recover canonical MAIN {} from legacy SIDE {}",
+                recovery.main_thread_id, recovery.side_thread_id
+            )
+        })?;
+    let recovered = app_server
+        .thread_read(recovery.main_thread_id, /*include_turns*/ false)
+        .await
+        .wrap_err("recovered canonical MAIN was not durably readable")?;
+    color_eyre::eyre::ensure!(
+        persisted_app_server_conversation_role(&recovered)? == ConversationRole::Standard,
+        "recovered canonical MAIN does not have Standard role"
+    );
+    Ok(recovered)
+}
+
+fn synthetic_legacy_main_from_side(
+    side: &AppServerThread,
+    main_thread_id: ThreadId,
+) -> AppServerThread {
+    let mut main = side.clone();
+    main.id = main_thread_id.to_string();
+    main.session_id = main_thread_id.to_string();
+    main.forked_from_id = None;
+    main.parent_thread_id = None;
+    main.ephemeral = false;
+    main.path = None;
+    main.environments = None;
+    main.extra = None;
+    main.model = None;
+    main.reasoning_effort = None;
+    main.can_accept_direct_input = None;
+    main.thread_source = Some(codex_app_server_protocol::ThreadSource::User);
+    main.agent_nickname = None;
+    main.agent_role = None;
+    main.name = None;
+    main.turns.clear();
+    main
+}
+
+async fn canonical_resume_thread_from_verified(
+    app_server: &mut AppServerSession,
+    thread: AppServerThread,
+) -> color_eyre::Result<CanonicalResumeThread> {
+    match persisted_app_server_conversation_role(&thread)? {
+        ConversationRole::Standard => Ok(CanonicalResumeThread {
+            thread,
+            selected_from_side: false,
+            legacy_recovery: None,
+        }),
+        ConversationRole::RestrictedSide { reason } => Err(color_eyre::eyre::eyre!(
+            "refusing to resume persisted SIDE thread {} because its canonical role metadata is invalid: {reason:?}",
+            thread.id
+        )),
+        ConversationRole::Side { parent_main_id } => {
+            if thread.ephemeral {
+                return Err(color_eyre::eyre::eyre!(
+                    "refusing to resume persisted SIDE thread {} because it is marked ephemeral",
+                    thread.id
+                ));
+            }
+            let side_thread_id = ThreadId::from_string(&thread.id).wrap_err_with(|| {
+                format!(
+                    "persisted SIDE thread {} has an invalid stable identity",
+                    thread.id
+                )
+            })?;
+            let Some(main) = app_server.thread_read_if_exists(parent_main_id).await? else {
+                return Ok(CanonicalResumeThread {
+                    thread: synthetic_legacy_main_from_side(&thread, parent_main_id),
+                    selected_from_side: true,
+                    legacy_recovery: Some(LegacySideMainRecoveryContext {
+                        main_thread_id: parent_main_id,
+                        side_thread_id,
+                        side_thread: thread,
+                    }),
+                });
+            };
+            let restored_main_id = ThreadId::from_string(&main.id).wrap_err_with(|| {
+                format!("canonical MAIN {parent_main_id} returned an invalid stable identity")
+            })?;
+            if restored_main_id != parent_main_id
+                || main.ephemeral
+                || persisted_app_server_conversation_role(&main)? != ConversationRole::Standard
+            {
+                return Err(color_eyre::eyre::eyre!(
+                    "persisted SIDE thread {} does not reference one valid canonical MAIN",
+                    thread.id
+                ));
+            }
+            Ok(CanonicalResumeThread {
+                thread: main,
+                selected_from_side: true,
+                legacy_recovery: None,
+            })
+        }
+    }
+}
+
 pub(crate) fn resume_source_kinds(include_non_interactive: bool) -> Vec<ThreadSourceKind> {
     let mut source_kinds = vec![ThreadSourceKind::Cli, ThreadSourceKind::VsCode];
     if include_non_interactive {
@@ -883,10 +1101,9 @@ async fn lookup_session_target_with_app_server(
             .thread_read(thread_id, /*include_turns*/ false)
             .await
         {
-            Ok(thread) => Ok(session_target_from_app_server_thread(
-                app_server.backend_id(),
-                thread,
-            )),
+            Ok(thread) => {
+                canonical_resume_target_from_app_server_thread(app_server, config, thread).await
+            }
             Err(err) => {
                 warn!(
                     session = id_or_name,
@@ -899,7 +1116,7 @@ async fn lookup_session_target_with_app_server(
     }
 
     let model_provider = app_server.history_model_provider(config).await?;
-    Ok(named_session_lookup::lookup(
+    let thread = named_session_lookup::lookup(
         app_server,
         config.codex_home.as_path(),
         id_or_name,
@@ -907,8 +1124,13 @@ async fn lookup_session_target_with_app_server(
         &[resume_source_kinds(/*include_non_interactive*/ false)],
         model_provider.as_deref(),
     )
-    .await?
-    .and_then(|thread| session_target_from_app_server_thread(app_server.backend_id(), thread)))
+    .await?;
+    match thread {
+        Some(thread) => {
+            canonical_resume_target_from_app_server_thread(app_server, config, thread).await
+        }
+        None => Ok(None),
+    }
 }
 
 async fn lookup_latest_session_target_with_app_server(
@@ -935,17 +1157,24 @@ async fn lookup_latest_session_target_with_app_server(
             Err(_) if lookup_mode == LatestSessionLookupMode::StateDbOnly => continue,
             response => response?,
         };
-        let target = response.data.into_iter().find_map(|thread| {
-            session_target_from_app_server_thread(app_server.backend_id(), thread)
-        });
-        if let Some(target) = target
-            && (uses_remote_workspace
+        for thread in response.data {
+            let listed_thread_id = ThreadId::from_string(&thread.id).ok();
+            let Some(target) =
+                canonical_resume_target_from_app_server_thread(app_server, config, thread).await?
+            else {
+                continue;
+            };
+            let selected_from_paired_side =
+                listed_thread_id.is_some_and(|thread_id| thread_id != target.thread_id);
+            if uses_remote_workspace
+                || selected_from_paired_side
                 || match target.path.as_deref() {
                     Some(path) => codex_rollout::existing_rollout_path(path).await.is_some(),
                     None => false,
-                })
-        {
-            return Ok(Some(target));
+                }
+            {
+                return Ok(Some(target));
+            }
         }
     }
     Ok(None)

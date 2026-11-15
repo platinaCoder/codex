@@ -205,9 +205,16 @@ enum PickerLoadRequest {
     },
     Archive {
         thread_id: ThreadId,
+        recovery: Option<super::LegacySideMainRecoveryContext>,
     },
     Unarchive {
         thread_id: ThreadId,
+    },
+    RestoreCanonicalRoot {
+        thread_id: ThreadId,
+    },
+    RecoverLegacySideMain {
+        recovery: super::LegacySideMainRecoveryContext,
     },
 }
 
@@ -354,9 +361,18 @@ enum PageCursor {
 struct PickerPage {
     rows: Vec<Row>,
     history_modes: HashMap<ThreadId, ThreadHistoryMode>,
+    canonical_roots_requiring_restore: HashSet<ThreadId>,
+    legacy_side_main_recoveries: HashMap<ThreadId, super::LegacySideMainRecoveryContext>,
+    quarantined_rows: Vec<QuarantinedSessionRow>,
     next_cursor: Option<PageCursor>,
     num_scanned_files: usize,
     reached_scan_cap: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct QuarantinedSessionRow {
+    thread_id: String,
+    reason_code: &'static str,
 }
 
 #[derive(Clone)]
@@ -822,20 +838,40 @@ fn spawn_app_server_page_loader(
                         _ = cancellation => {}
                     }
                 }
-                PickerLoadRequest::Archive { thread_id } => {
-                    let result = archive_request_handle
-                        .request_typed::<ThreadArchiveResponse>(ClientRequest::ThreadArchive {
-                            request_id: RequestId::String(format!(
-                                "resume-picker-archive-{}",
-                                Uuid::new_v4()
-                            )),
-                            params: ThreadArchiveParams {
-                                thread_id: thread_id.to_string(),
-                            },
-                        })
-                        .await
-                        .map(|_| ())
-                        .map_err(std::io::Error::other);
+                PickerLoadRequest::Archive {
+                    thread_id,
+                    recovery,
+                } => {
+                    let result = async {
+                        if let Some(recovery) = recovery {
+                            let config = config.as_ref().ok_or_else(|| {
+                                color_eyre::eyre::eyre!(
+                                    "legacy SIDE recovery requires the local startup configuration"
+                                )
+                            })?;
+                            super::materialize_legacy_side_main_recovery(
+                                &mut app_server,
+                                config,
+                                recovery,
+                            )
+                            .await?;
+                        }
+                        archive_request_handle
+                            .request_typed::<ThreadArchiveResponse>(ClientRequest::ThreadArchive {
+                                request_id: RequestId::String(format!(
+                                    "resume-picker-archive-{}",
+                                    Uuid::new_v4()
+                                )),
+                                params: ThreadArchiveParams {
+                                    thread_id: thread_id.to_string(),
+                                },
+                            })
+                            .await
+                            .map(|_| ())
+                            .map_err(color_eyre::eyre::Report::from)
+                    }
+                    .await
+                    .map_err(std::io::Error::other);
                     let _ = bg_tx.send(BackgroundEvent::Archive { thread_id, result });
                 }
                 PickerLoadRequest::Unarchive { thread_id } => {
@@ -858,6 +894,64 @@ fn spawn_app_server_page_loader(
                             history_mode: Some(response.thread.history_mode),
                         })
                         .map_err(std::io::Error::other);
+                    let _ = bg_tx.send(BackgroundEvent::Unarchive { thread_id, result });
+                }
+                PickerLoadRequest::RestoreCanonicalRoot { thread_id } => {
+                    // Legacy paired sessions can have an active SIDE record while their canonical
+                    // MAIN rollout is archived. Selecting the synthesized MAIN row restores it;
+                    // already-active MAIN roots fall back to a verified metadata read.
+                    let result = match app_server.thread_unarchive(thread_id).await {
+                        Ok(thread) => Ok(thread),
+                        Err(error)
+                            if format!("{error:#}")
+                                .contains("no archived rollout found for thread id") =>
+                        {
+                            app_server.thread_read(thread_id, false).await
+                        }
+                        Err(error) => Err(error),
+                    }
+                    .and_then(|thread| {
+                        color_eyre::eyre::ensure!(
+                            super::persisted_app_server_conversation_role(&thread)?
+                                == codex_protocol::ConversationRole::Standard,
+                            "restored canonical root is not a Standard thread"
+                        );
+                        Ok(SessionTarget {
+                            backend_id: app_server.backend_id(),
+                            path: thread.path,
+                            thread_id,
+                            cwd: Some(thread.cwd.to_path_buf()),
+                            history_mode: Some(thread.history_mode),
+                        })
+                    })
+                    .map_err(std::io::Error::other);
+                    let _ = bg_tx.send(BackgroundEvent::Unarchive { thread_id, result });
+                }
+                PickerLoadRequest::RecoverLegacySideMain { recovery } => {
+                    let thread_id = recovery.main_thread_id;
+                    let result = match config.as_ref() {
+                        Some(config) => super::materialize_legacy_side_main_recovery(
+                            &mut app_server,
+                            config,
+                            recovery,
+                        )
+                        .await
+                        .and_then(|thread| {
+                            super::session_target_from_app_server_thread(
+                                app_server.backend_id(),
+                                thread,
+                            )
+                            .ok_or_else(|| {
+                                color_eyre::eyre::eyre!(
+                                    "recovered canonical MAIN has an invalid stable identity"
+                                )
+                            })
+                        }),
+                        None => Err(color_eyre::eyre::eyre!(
+                            "legacy SIDE recovery requires the local startup configuration"
+                        )),
+                    }
+                    .map_err(std::io::Error::other);
                     let _ = bg_tx.send(BackgroundEvent::Unarchive { thread_id, result });
                 }
             }
@@ -915,6 +1009,10 @@ struct PickerState {
     all_rows: Vec<Row>,
     filtered_rows: Vec<Row>,
     seen_rows: HashSet<SeenRowKey>,
+    canonical_roots_requiring_restore: HashSet<ThreadId>,
+    legacy_side_main_recoveries: HashMap<ThreadId, super::LegacySideMainRecoveryContext>,
+    conflicted_legacy_roots: HashSet<ThreadId>,
+    quarantined_rows: Vec<QuarantinedSessionRow>,
     selected: usize,
     scroll_top: usize,
     pending_page_down_target: Option<usize>,
@@ -992,25 +1090,181 @@ async fn load_app_server_page(
     app_server: &mut AppServerSession,
     params: ThreadListParams,
 ) -> std::io::Result<PickerPage> {
+    let requested_archived = params.archived.unwrap_or(false);
+    let requested_cwd = params.cwd.clone();
     let response = app_server
         .thread_list(params)
         .await
         .map_err(std::io::Error::other)?;
     let num_scanned_files = response.data.len();
-    let (rows, history_modes): (Vec<_>, HashMap<_, _>) = response
-        .data
-        .into_iter()
-        .filter_map(|thread| {
-            let history_mode = thread.history_mode;
-            let row = row_from_app_server_thread(thread)?;
-            let thread_id = row.thread_id?;
-            Some((row, (thread_id, history_mode)))
-        })
-        .unzip();
+    let mut rows: Vec<Row> = Vec::new();
+    let mut history_modes = HashMap::new();
+    let mut canonical_roots_requiring_restore = HashSet::new();
+    let mut legacy_side_main_recoveries: HashMap<ThreadId, super::LegacySideMainRecoveryContext> =
+        HashMap::new();
+    let mut conflicted_legacy_roots = HashSet::new();
+    let mut seen_roots = HashSet::new();
+    let mut quarantined_rows = Vec::new();
+    for listed_thread in response.data {
+        let listed_id = match ThreadId::from_string(&listed_thread.id) {
+            Ok(thread_id) => thread_id,
+            Err(err) => {
+                warn!(thread_id = listed_thread.id, %err, "Skipping unverifiable app-server picker row");
+                quarantined_rows.push(QuarantinedSessionRow {
+                    thread_id: listed_thread.id,
+                    reason_code: "invalid_stable_id",
+                });
+                continue;
+            }
+        };
+        // State-DB catalog rows can lag source/parent metadata, so prefer a stable-ID read. Older
+        // standard sessions can exist only as catalog records, though; a failed hydration must not
+        // erase them when the server-owned list row itself has ordinary provenance.
+        let verified_thread = match app_server.thread_read(listed_id, false).await {
+            Ok(thread) => thread,
+            Err(err) => {
+                warn!(thread_id = %listed_id, %err, "Using persisted app-server picker metadata after thread hydration failed");
+                if listed_thread.parent_thread_id.is_some()
+                    && matches!(
+                        super::persisted_app_server_conversation_role(&listed_thread),
+                        Ok(codex_protocol::ConversationRole::Standard)
+                    )
+                {
+                    // A control parent without the matching SIDE source is an incomplete role
+                    // record, not a legacy standard session. Fail closed if hydration cannot
+                    // recover the authoritative source marker.
+                    quarantined_rows.push(QuarantinedSessionRow {
+                        thread_id: listed_id.to_string(),
+                        reason_code: "missing_side_provenance_for_parented_record",
+                    });
+                    continue;
+                }
+                listed_thread
+            }
+        };
+        let activity_preview = verified_thread.preview.clone();
+        let activity_updated_at = verified_thread.updated_at;
+        let canonical = match super::canonical_resume_thread_from_verified(
+            app_server,
+            verified_thread,
+        )
+        .await
+        {
+            Ok(canonical) => canonical,
+            Err(err) => {
+                warn!(thread_id = %listed_id, %err, "Quarantining app-server picker row with invalid role topology");
+                quarantined_rows.push(QuarantinedSessionRow {
+                    thread_id: listed_id.to_string(),
+                    reason_code: "invalid_or_conflicting_role_topology",
+                });
+                continue;
+            }
+        };
+        let mut canonical_thread = canonical.thread;
+        // Apply filters to the session Enter opens, not just its discovery SIDE.
+        if let Some(path) = canonical_thread.path.as_ref() {
+            let archived = path
+                .components()
+                .any(|component| component.as_os_str() == codex_rollout::ARCHIVED_SESSIONS_SUBDIR);
+            if archived != requested_archived {
+                continue;
+            }
+        }
+        let cwd_matches = match requested_cwd.as_ref() {
+            None => true,
+            Some(ThreadListCwdFilter::One(cwd)) => {
+                paths_match(canonical_thread.cwd.as_path(), Path::new(cwd))
+            }
+            Some(ThreadListCwdFilter::Many(cwds)) => cwds
+                .iter()
+                .any(|cwd| paths_match(canonical_thread.cwd.as_path(), Path::new(cwd))),
+        };
+        if !cwd_matches {
+            continue;
+        }
+        let canonical_id = match ThreadId::from_string(&canonical_thread.id) {
+            Ok(thread_id) => thread_id,
+            Err(err) => {
+                warn!(thread_id = canonical_thread.id, %err, "Quarantining canonical picker root with invalid identity");
+                quarantined_rows.push(QuarantinedSessionRow {
+                    thread_id: canonical_thread.id,
+                    reason_code: "invalid_canonical_root_id",
+                });
+                continue;
+            }
+        };
+        if let Some(recovery) = canonical.legacy_recovery.clone() {
+            if conflicted_legacy_roots.contains(&canonical_id) {
+                quarantined_rows.push(QuarantinedSessionRow {
+                    thread_id: recovery.side_thread_id.to_string(),
+                    reason_code: "multiple_side_claims_for_missing_main",
+                });
+                continue;
+            }
+            if let Some(previous) = legacy_side_main_recoveries.remove(&canonical_id) {
+                conflicted_legacy_roots.insert(canonical_id);
+                seen_roots.remove(&canonical_id);
+                rows.retain(|row| row.thread_id != Some(canonical_id));
+                history_modes.remove(&canonical_id);
+                quarantined_rows.push(QuarantinedSessionRow {
+                    thread_id: previous.side_thread_id.to_string(),
+                    reason_code: "multiple_side_claims_for_missing_main",
+                });
+                quarantined_rows.push(QuarantinedSessionRow {
+                    thread_id: recovery.side_thread_id.to_string(),
+                    reason_code: "multiple_side_claims_for_missing_main",
+                });
+                continue;
+            }
+            legacy_side_main_recoveries.insert(canonical_id, recovery);
+        }
+        if !seen_roots.insert(canonical_id) {
+            if canonical.selected_from_side && !activity_preview.trim().is_empty() {
+                for row in rows
+                    .iter_mut()
+                    .filter(|row| row.thread_id == Some(canonical_id))
+                {
+                    if row.preview == "(no message yet)" {
+                        row.preview = activity_preview.clone();
+                    }
+                }
+            }
+            continue;
+        }
+        if canonical.selected_from_side {
+            // Preserve SIDE activity for a MAIN that was allocated before its first message. The
+            // selection still targets MAIN and SIDE history remains independently durable.
+            if canonical_thread.preview.trim().is_empty() {
+                canonical_thread.preview = activity_preview;
+            }
+            canonical_thread.updated_at = canonical_thread.updated_at.max(activity_updated_at);
+            if canonical.legacy_recovery.is_none()
+                && canonical_thread.path.as_ref().is_some_and(|path| {
+                    path.components().any(|component| {
+                        component.as_os_str() == codex_rollout::ARCHIVED_SESSIONS_SUBDIR
+                    })
+                })
+            {
+                canonical_roots_requiring_restore.insert(canonical_id);
+            }
+        }
+        let history_mode = canonical_thread.history_mode;
+        let Some(row) = row_from_app_server_thread(canonical_thread) else {
+            continue;
+        };
+        let Some(thread_id) = row.thread_id else {
+            continue;
+        };
+        history_modes.insert(thread_id, history_mode);
+        rows.push(row);
+    }
 
     Ok(PickerPage {
         rows,
         history_modes,
+        canonical_roots_requiring_restore,
+        legacy_side_main_recoveries,
+        quarantined_rows,
         next_cursor: response.next_cursor.map(PageCursor::AppServer),
         num_scanned_files,
         reached_scan_cap: false,
@@ -1119,6 +1373,10 @@ impl PickerState {
             all_rows: Vec::new(),
             filtered_rows: Vec::new(),
             seen_rows: HashSet::new(),
+            canonical_roots_requiring_restore: HashSet::new(),
+            legacy_side_main_recoveries: HashMap::new(),
+            conflicted_legacy_roots: HashSet::new(),
+            quarantined_rows: Vec::new(),
             selected: 0,
             scroll_top: 0,
             pending_page_down_target: None,
@@ -1381,11 +1639,28 @@ impl PickerState {
             _ if self.keymap.list.accept.is_pressed(key)
                 && !matches!(self.archive_state, archive::ArchiveState::Idle) => {}
             _ if self.keymap.list.accept.is_pressed(key) => {
+                tracing::info!(selected = self.selected, rows = self.filtered_rows.len(), "resume picker activation received");
                 if let Some(row) = self.filtered_rows.get(self.selected) {
+                    tracing::info!(thread_id = ?row.thread_id, "resume picker selected canonical target");
                     let path = row.path.clone();
                     if let Some(thread_id) = row.thread_id {
                         if self.status == SessionStatus::Archived {
                             self.request_unarchive(thread_id);
+                            return Ok(None);
+                        }
+                        if let Some(recovery) = self
+                            .legacy_side_main_recoveries
+                            .get(&thread_id)
+                            .cloned()
+                        {
+                            self.request_legacy_side_main_recovery(recovery);
+                            return Ok(None);
+                        }
+                        if self
+                            .canonical_roots_requiring_restore
+                            .contains(&thread_id)
+                        {
+                            self.request_canonical_root_restore(thread_id);
                             return Ok(None);
                         }
                         return Ok(Some(self.action.selection(SessionTarget {
@@ -1531,6 +1806,10 @@ impl PickerState {
         self.all_rows.clear();
         self.filtered_rows.clear();
         self.seen_rows.clear();
+        self.canonical_roots_requiring_restore.clear();
+        self.legacy_side_main_recoveries.clear();
+        self.conflicted_legacy_roots.clear();
+        self.quarantined_rows.clear();
         self.local_cwd_matches.clear();
         self.selected = 0;
         self.pending_page_down_target = None;
@@ -1677,12 +1956,62 @@ impl PickerState {
 
     fn ingest_page(&mut self, page: PickerPage) {
         let PickerPage {
-            rows,
+            mut rows,
             history_modes,
+            canonical_roots_requiring_restore,
+            legacy_side_main_recoveries,
+            quarantined_rows,
             next_cursor,
             num_scanned_files,
             reached_scan_cap,
         } = page;
+        self.canonical_roots_requiring_restore
+            .extend(canonical_roots_requiring_restore);
+        self.quarantined_rows.extend(quarantined_rows);
+        for (main_thread_id, recovery) in legacy_side_main_recoveries {
+            if self.conflicted_legacy_roots.contains(&main_thread_id) {
+                rows.retain(|row| row.thread_id != Some(main_thread_id));
+                self.quarantined_rows.push(QuarantinedSessionRow {
+                    thread_id: recovery.side_thread_id.to_string(),
+                    reason_code: "multiple_side_claims_for_missing_main",
+                });
+                continue;
+            }
+            if let Some(previous) = self
+                .legacy_side_main_recoveries
+                .insert(main_thread_id, recovery.clone())
+                && previous.side_thread_id != recovery.side_thread_id
+            {
+                self.legacy_side_main_recoveries.remove(&main_thread_id);
+                self.conflicted_legacy_roots.insert(main_thread_id);
+                self.canonical_roots_requiring_restore
+                    .remove(&main_thread_id);
+                self.all_rows
+                    .retain(|row| row.thread_id != Some(main_thread_id));
+                rows.retain(|row| row.thread_id != Some(main_thread_id));
+                self.seen_rows.retain(|seen| match seen {
+                    SeenRowKey::Thread(thread_id) => *thread_id != main_thread_id,
+                    _ => true,
+                });
+                self.quarantined_rows.push(QuarantinedSessionRow {
+                    thread_id: previous.side_thread_id.to_string(),
+                    reason_code: "multiple_side_claims_for_missing_main",
+                });
+                self.quarantined_rows.push(QuarantinedSessionRow {
+                    thread_id: recovery.side_thread_id.to_string(),
+                    reason_code: "multiple_side_claims_for_missing_main",
+                });
+            }
+        }
+        if !self.quarantined_rows.is_empty() {
+            self.inline_error = Some(
+                self.quarantined_rows
+                    .iter()
+                    .map(|row| format!("{} [{}]", row.thread_id, row.reason_code))
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            );
+        }
         self.pagination
             .complete_page(next_cursor, num_scanned_files, reached_scan_cap);
         for mut row in rows {
@@ -1705,6 +2034,9 @@ impl PickerState {
                 }) {
                     // Preserve the pre-catalog behavior where metadata from a later page wins.
                     existing.history_mode = row.history_mode;
+                    if existing.preview == "(no message yet)" && row.preview != "(no message yet)" {
+                        existing.preview = row.preview;
+                    }
                 }
             } else {
                 self.all_rows.push(row);
@@ -1742,7 +2074,16 @@ impl PickerState {
             .iter()
             .filter(|row| self.row_matches_filter(row));
         if self.query.is_empty() {
-            self.filtered_rows = base_iter.cloned().collect();
+            self.filtered_rows = base_iter
+                .filter(|row| {
+                    row.preview != "(no message yet)"
+                        || row
+                            .thread_name
+                            .as_ref()
+                            .is_some_and(|name| !name.trim().is_empty())
+                })
+                .cloned()
+                .collect();
         } else {
             let q = self.query.to_lowercase();
             self.filtered_rows = base_iter.filter(|r| r.matches_query(&q)).cloned().collect();
@@ -2206,7 +2547,9 @@ fn thread_list_params(
         ancestor_thread_id: None,
         cwd: cwd_filter,
         use_state_db_only,
-        search_term: None,
+        // Include durable pre-content identities. Role resolution below collapses paired SIDE
+        // records and exposes a missing legacy MAIN only when its exact SIDE provenance is valid.
+        search_term: Some(String::new()),
     }
 }
 
@@ -2259,6 +2602,22 @@ fn list_viewport_width(width: u16) -> u16 {
 fn search_line(state: &PickerState, width: u16) -> Line<'_> {
     if let Some(error) = state.inline_error.as_deref() {
         return Line::from(truncate_text(error, usize::from(width)).red());
+    }
+    if let archive::ArchiveState::Pending { thread_id } = state.archive_state {
+        let message = if state.legacy_side_main_recoveries.contains_key(&thread_id) {
+            "Archiving session: recovering unused MAIN; checking saved sessions…"
+        } else {
+            "Archiving session…"
+        };
+        return Line::from(truncate_text(message, usize::from(width)));
+    }
+    if let archive::ArchiveState::Restoring { thread_id } = state.archive_state {
+        let message = if state.legacy_side_main_recoveries.contains_key(&thread_id) {
+            "Opening session: recovering unused MAIN; checking saved sessions…"
+        } else {
+            "Opening session…"
+        };
+        return Line::from(truncate_text(message, usize::from(width)));
     }
     if state.query.is_empty() {
         "Type to search".set_style(secondary_text_style()).into()
@@ -3726,6 +4085,67 @@ mod tests {
     use std::sync::Mutex;
     use tempfile::tempdir;
 
+    fn write_role_rollout(
+        codex_home: &Path,
+        filename_ts: &str,
+        timestamp: &str,
+        thread_id: ThreadId,
+        parent_thread_id: Option<ThreadId>,
+        thread_source: Option<codex_protocol::protocol::ThreadSource>,
+        preview: &str,
+        model_provider: &str,
+        cwd: &Path,
+    ) -> color_eyre::Result<PathBuf> {
+        let rollout_path = codex_home
+            .join("sessions")
+            .join(&filename_ts[0..4])
+            .join(&filename_ts[5..7])
+            .join(&filename_ts[8..10])
+            .join(format!("rollout-{filename_ts}-{thread_id}.jsonl"));
+        std::fs::create_dir_all(rollout_path.parent().expect("rollout parent"))?;
+        let session_meta = codex_protocol::protocol::SessionMeta {
+            session_id: thread_id.into(),
+            id: thread_id,
+            parent_thread_id,
+            timestamp: timestamp.to_string(),
+            cwd: cwd.to_path_buf(),
+            originator: "codex".to_string(),
+            cli_version: "0.0.0".to_string(),
+            source: codex_protocol::protocol::SessionSource::Cli,
+            thread_source,
+            model_provider: Some(model_provider.to_string()),
+            ..Default::default()
+        };
+        let session_meta = serde_json::to_value(codex_protocol::protocol::SessionMetaLine {
+            meta: session_meta,
+            git: None,
+        })?;
+        let mut lines = vec![
+            serde_json::json!({
+                "timestamp": timestamp,
+                "type": "session_meta",
+                "payload": session_meta,
+            })
+            .to_string(),
+        ];
+        if !preview.is_empty() {
+            lines.push(
+                serde_json::json!({
+                    "timestamp": timestamp,
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "user_message",
+                        "message": preview,
+                        "kind": "plain",
+                    },
+                })
+                .to_string(),
+            );
+        }
+        std::fs::write(&rollout_path, lines.join("\n") + "\n")?;
+        Ok(rollout_path)
+    }
+
     pub(super) fn page(
         rows: Vec<Row>,
         next_cursor: Option<&str>,
@@ -3735,6 +4155,9 @@ mod tests {
         PickerPage {
             rows,
             history_modes: HashMap::new(),
+            canonical_roots_requiring_restore: HashSet::new(),
+            legacy_side_main_recoveries: HashMap::new(),
+            quarantined_rows: Vec::new(),
             next_cursor: next_cursor.map(|cursor| PageCursor::AppServer(cursor.to_string())),
             num_scanned_files,
             reached_scan_cap,
@@ -6981,7 +7404,543 @@ session_picker_view = "dense"
 
         thread.thread_source = None;
         thread.name = Some(format!("AI Lab SIDE · parent {thread_id}"));
-        assert!(row_from_app_server_thread(thread).is_none());
+        assert!(
+            row_from_app_server_thread(thread).is_some(),
+            "a display name alone must not confer SIDE identity"
+        );
+    }
+
+    #[test]
+    fn default_picker_hides_unnamed_empty_sessions_but_uuid_search_keeps_them() {
+        let mut state = PickerState::new(
+            crate::backend_id::BackendId::new(),
+            FrameRequester::test_dummy(),
+            page_only_loader(|_| {}),
+            ProviderFilter::Any,
+            true,
+            None,
+            SessionPickerAction::Resume,
+        );
+        let id = ThreadId::new();
+        let mut empty = make_row(
+            "/tmp/empty.jsonl",
+            "2025-01-01T00:00:00Z",
+            "(no message yet)",
+        );
+        empty.thread_id = Some(id);
+        let mut named = empty.clone();
+        named.thread_id = Some(ThreadId::new());
+        named.thread_name = Some("Saved workspace".to_string());
+        let meaningful = make_row(
+            "/tmp/meaningful.jsonl",
+            "2025-01-01T00:00:00Z",
+            "SIDE has a real question",
+        );
+        state.all_rows = vec![empty, named, meaningful];
+        state.apply_filter();
+        assert_eq!(state.filtered_rows.len(), 2);
+        assert!(
+            state
+                .filtered_rows
+                .iter()
+                .all(|row| row.thread_id != Some(id))
+        );
+        state.query = id.to_string();
+        state.apply_filter();
+        assert_eq!(state.filtered_rows.len(), 1);
+        assert_eq!(state.filtered_rows[0].thread_id, Some(id));
+    }
+
+    #[tokio::test]
+    async fn picker_archives_missing_main_without_a_user_turn() -> color_eyre::Result<()> {
+        let home = tempdir()?;
+        let cwd = home.path().join("workspace");
+        std::fs::create_dir_all(&cwd)?;
+        let mut config = crate::legacy_core::config::ConfigBuilder::default()
+            .codex_home(home.path().to_path_buf())
+            .build()
+            .await?;
+        config.cwd = cwd.clone().abs();
+        let main_id = ThreadId::new();
+        let side_id = ThreadId::new();
+        let side_path = write_role_rollout(
+            home.path(),
+            "2025-01-01T12-00-00",
+            "2025-01-01T12:00:00Z",
+            side_id,
+            Some(main_id),
+            Some(codex_protocol::protocol::ThreadSource::Feature(format!(
+                "{}:{main_id}",
+                crate::app_server_session::PERSISTENT_SIDE_THREAD_SOURCE_PREFIX
+            ))),
+            "Saved SIDE conversation",
+            &config.model_provider_id,
+            &cwd,
+        )?;
+        let original_side = std::fs::read(&side_path)?;
+        let mut server = crate::start_embedded_app_server_for_picker(&config).await?;
+        let params = || {
+            thread_list_params(
+                None,
+                None,
+                SessionStatus::Active,
+                ProviderFilter::Any,
+                ThreadSortKey::UpdatedAt,
+                false,
+                false,
+            )
+        };
+        let page = load_app_server_page(&mut server, params()).await?;
+        assert!(page.legacy_side_main_recoveries.contains_key(&main_id));
+        let handle = server.request_handle();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let loader = spawn_app_server_page_loader(
+            false,
+            server,
+            handle,
+            false,
+            RawReasoningVisibility::Hidden,
+            Some(config.clone()),
+            tx,
+        );
+        let mut picker = PickerState::new(
+            crate::backend_id::BackendId::new(),
+            FrameRequester::test_dummy(),
+            loader,
+            ProviderFilter::Any,
+            true,
+            None,
+            SessionPickerAction::Resume,
+        );
+        picker.ingest_page(page);
+        assert_eq!(picker.filtered_rows[0].thread_id, Some(main_id));
+        picker
+            .handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL))
+            .await?;
+        assert!(
+            search_line(&picker, 100)
+                .to_string()
+                .contains("Archiving session")
+        );
+        let event = tokio::time::timeout(std::time::Duration::from_secs(20), rx.recv())
+            .await?
+            .expect("archive response");
+        picker.handle_background_event(event).await?;
+        assert!(picker.inline_error.is_none(), "{:?}", picker.inline_error);
+        assert!(picker.filtered_rows.is_empty());
+        let mut reopened = crate::start_embedded_app_server_for_picker(&config).await?;
+        let saved = reopened.thread_read(main_id, false).await?;
+        assert!(
+            saved
+                .path
+                .as_ref()
+                .unwrap()
+                .components()
+                .any(|part| part.as_os_str() == codex_rollout::ARCHIVED_SESSIONS_SUBDIR)
+        );
+        assert!(
+            load_app_server_page(&mut reopened, params())
+                .await?
+                .rows
+                .is_empty()
+        );
+        assert_eq!(std::fs::read(&side_path)?, original_side);
+        reopened.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn paired_picker_filters_use_canonical_main_directory() -> color_eyre::Result<()> {
+        let home = tempdir()?;
+        let main_cwd = home.path().join("main-workspace");
+        let side_cwd = home.path().join("side-workspace");
+        std::fs::create_dir_all(&main_cwd)?;
+        std::fs::create_dir_all(&side_cwd)?;
+        let mut config = crate::legacy_core::config::ConfigBuilder::default()
+            .codex_home(home.path().to_path_buf())
+            .build()
+            .await?;
+        config.cwd = side_cwd.clone().abs();
+        let main_id = ThreadId::new();
+        let side_id = ThreadId::new();
+        write_role_rollout(
+            home.path(),
+            "2025-01-01T11-00-00",
+            "2025-01-01T11:00:00Z",
+            main_id,
+            None,
+            Some(codex_protocol::protocol::ThreadSource::User),
+            "MAIN in another directory",
+            &config.model_provider_id,
+            &main_cwd,
+        )?;
+        write_role_rollout(
+            home.path(),
+            "2025-01-01T12-00-00",
+            "2025-01-01T12:00:00Z",
+            side_id,
+            Some(main_id),
+            Some(codex_protocol::protocol::ThreadSource::Feature(format!(
+                "{}:{main_id}",
+                crate::app_server_session::PERSISTENT_SIDE_THREAD_SOURCE_PREFIX
+            ))),
+            "SIDE in current directory",
+            &config.model_provider_id,
+            &side_cwd,
+        )?;
+        let mut server = crate::start_embedded_app_server_for_picker(&config).await?;
+        let params = |cwd| {
+            thread_list_params(
+                None,
+                cwd,
+                SessionStatus::Active,
+                ProviderFilter::Any,
+                ThreadSortKey::UpdatedAt,
+                false,
+                false,
+            )
+        };
+        let all = load_app_server_page(&mut server, params(None)).await?;
+        assert_eq!(all.rows.len(), 1);
+        assert_eq!(all.rows[0].thread_id, Some(main_id));
+        let current = load_app_server_page(
+            &mut server,
+            params(Some(ThreadListCwdFilter::One(
+                side_cwd.to_string_lossy().into_owned(),
+            ))),
+        )
+        .await?;
+        assert!(
+            current.rows.is_empty(),
+            "SIDE must not pull another directory's MAIN into Cwd"
+        );
+        let own = load_app_server_page(
+            &mut server,
+            params(Some(ThreadListCwdFilter::One(
+                main_cwd.to_string_lossy().into_owned(),
+            ))),
+        )
+        .await?;
+        assert_eq!(own.rows.len(), 1);
+        assert_eq!(own.rows[0].thread_id, Some(main_id));
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mixed_legacy_catalog_keeps_standard_and_collapses_side_activity_to_main()
+    -> color_eyre::Result<()> {
+        let home = tempdir()?;
+        let cwd = home.path().join("workspace");
+        std::fs::create_dir_all(&cwd)?;
+        let mut config = crate::legacy_core::config::ConfigBuilder::default()
+            .codex_home(home.path().to_path_buf())
+            .build()
+            .await?;
+        config.cwd = cwd.clone().abs();
+        let provider = config.model_provider_id.as_str();
+        let legacy_standard = ThreadId::new();
+        let canonical_main = ThreadId::new();
+        let side = ThreadId::new();
+        let duplicate_side = ThreadId::new();
+        let orphan_side = ThreadId::new();
+        let orphan_main = ThreadId::new();
+        let malformed_side = ThreadId::new();
+        write_role_rollout(
+            home.path(),
+            "2025-01-01T10-00-00",
+            "2025-01-01T10:00:00Z",
+            legacy_standard,
+            None,
+            None,
+            "pre-profile ordinary conversation",
+            provider,
+            &cwd,
+        )?;
+        write_role_rollout(
+            home.path(),
+            "2025-01-01T11-00-00",
+            "2025-01-01T11:00:00Z",
+            canonical_main,
+            None,
+            Some(codex_protocol::protocol::ThreadSource::User),
+            "",
+            provider,
+            &cwd,
+        )?;
+        for (thread_id, filename_ts, timestamp, preview) in [
+            (
+                side,
+                "2025-01-01T12-00-00",
+                "2025-01-01T12:00:00Z",
+                "earlier SIDE activity",
+            ),
+            (
+                duplicate_side,
+                "2025-01-01T12-30-00",
+                "2025-01-01T12:30:00Z",
+                "newest SIDE activity",
+            ),
+        ] {
+            write_role_rollout(
+                home.path(),
+                filename_ts,
+                timestamp,
+                thread_id,
+                Some(canonical_main),
+                Some(codex_protocol::protocol::ThreadSource::Feature(format!(
+                    "{}:{canonical_main}",
+                    crate::app_server_session::PERSISTENT_SIDE_THREAD_SOURCE_PREFIX
+                ))),
+                preview,
+                provider,
+                &cwd,
+            )?;
+        }
+        let orphan_side_rollout = write_role_rollout(
+            home.path(),
+            "2025-01-01T13-00-00",
+            "2025-01-01T13:00:00Z",
+            orphan_side,
+            Some(orphan_main),
+            Some(codex_protocol::protocol::ThreadSource::Feature(format!(
+                "{}:{orphan_main}",
+                crate::app_server_session::PERSISTENT_SIDE_THREAD_SOURCE_PREFIX
+            ))),
+            "",
+            provider,
+            &cwd,
+        )?;
+        write_role_rollout(
+            home.path(),
+            "2025-01-01T14-00-00",
+            "2025-01-01T14:00:00Z",
+            malformed_side,
+            None,
+            Some(codex_protocol::protocol::ThreadSource::Feature(format!(
+                "{}:not-a-uuid",
+                crate::app_server_session::PERSISTENT_SIDE_THREAD_SOURCE_PREFIX
+            ))),
+            "malformed SIDE",
+            provider,
+            &cwd,
+        )?;
+
+        let mut app_server = crate::start_embedded_app_server_for_picker(&config).await?;
+        let params = thread_list_params(
+            None,
+            None,
+            SessionStatus::Active,
+            ProviderFilter::Any,
+            ThreadSortKey::UpdatedAt,
+            /*include_non_interactive*/ false,
+            /*use_state_db_only*/ false,
+        );
+        app_server.thread_list(params.clone()).await?;
+        app_server.thread_archive(canonical_main).await?;
+
+        let page = load_app_server_page(&mut app_server, params).await?;
+        let listed_ids = page
+            .rows
+            .iter()
+            .filter_map(|row| row.thread_id)
+            .collect::<HashSet<_>>();
+        assert_eq!(listed_ids, HashSet::from([legacy_standard, orphan_main]));
+        assert!(!listed_ids.contains(&side));
+        assert!(!listed_ids.contains(&duplicate_side));
+        assert!(page.canonical_roots_requiring_restore.is_empty());
+        let archived_page = load_app_server_page(
+            &mut app_server,
+            thread_list_params(
+                None,
+                None,
+                SessionStatus::Archived,
+                ProviderFilter::Any,
+                ThreadSortKey::UpdatedAt,
+                false,
+                false,
+            ),
+        )
+        .await?;
+        assert_eq!(
+            archived_page
+                .rows
+                .iter()
+                .filter_map(|row| row.thread_id)
+                .collect::<Vec<_>>(),
+            vec![canonical_main]
+        );
+        let recovery = page
+            .legacy_side_main_recoveries
+            .get(&orphan_main)
+            .expect("missing legacy MAIN should be recoverable from persisted SIDE provenance")
+            .clone();
+        assert_eq!(recovery.side_thread_id, orphan_side);
+        assert_eq!(
+            page.quarantined_rows,
+            vec![QuarantinedSessionRow {
+                thread_id: malformed_side.to_string(),
+                reason_code: "invalid_or_conflicting_role_topology",
+            }]
+        );
+        let original_side_bytes = std::fs::read(&orphan_side_rollout)?;
+        let rollout_count_before = walkdir::WalkDir::new(home.path().join("sessions"))
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_file())
+            .count();
+        let recovered = crate::materialize_legacy_side_main_recovery(
+            &mut app_server,
+            &config,
+            recovery.clone(),
+        )
+        .await?;
+        let retried =
+            crate::materialize_legacy_side_main_recovery(&mut app_server, &config, recovery)
+                .await?;
+        assert_eq!(retried.id, recovered.id);
+        assert_eq!(recovered.id, orphan_main.to_string());
+        assert_eq!(
+            crate::persisted_app_server_conversation_role(&recovered)?,
+            codex_protocol::ConversationRole::Standard
+        );
+        assert_eq!(std::fs::read(&orphan_side_rollout)?, original_side_bytes);
+        app_server.shutdown().await?;
+
+        let rollout_count_after = walkdir::WalkDir::new(home.path().join("sessions"))
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_file())
+            .count();
+        assert_eq!(rollout_count_after, rollout_count_before + 1);
+
+        let mut resumed_server = crate::start_embedded_app_server_for_picker(&config).await?;
+        let cold_main = resumed_server.thread_read(orphan_main, false).await?;
+        let cold_side = resumed_server.thread_read(orphan_side, false).await?;
+        let active_page = load_app_server_page(
+            &mut resumed_server,
+            thread_list_params(
+                None,
+                None,
+                SessionStatus::Active,
+                ProviderFilter::Any,
+                ThreadSortKey::UpdatedAt,
+                false,
+                false,
+            ),
+        )
+        .await?;
+        assert!(
+            !active_page
+                .canonical_roots_requiring_restore
+                .contains(&orphan_main)
+        );
+        assert!(
+            !active_page
+                .legacy_side_main_recoveries
+                .contains_key(&orphan_main)
+        );
+        assert_eq!(cold_main.id, orphan_main.to_string());
+        assert_eq!(cold_side.id, orphan_side.to_string());
+        assert_eq!(
+            crate::persisted_app_server_conversation_role(&cold_side)?,
+            codex_protocol::ConversationRole::Side {
+                parent_main_id: orphan_main,
+            }
+        );
+        assert_eq!(std::fs::read(&orphan_side_rollout)?, original_side_bytes);
+        resumed_server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn multiple_legacy_sides_for_missing_main_fail_closed_without_hiding_standard_rows()
+    -> color_eyre::Result<()> {
+        let home = tempdir()?;
+        let cwd = home.path().join("workspace");
+        std::fs::create_dir_all(&cwd)?;
+        let mut config = crate::legacy_core::config::ConfigBuilder::default()
+            .codex_home(home.path().to_path_buf())
+            .build()
+            .await?;
+        config.cwd = cwd.clone().abs();
+        let provider = config.model_provider_id.as_str();
+        let standard = ThreadId::new();
+        let missing_main = ThreadId::new();
+        let first_side = ThreadId::new();
+        let second_side = ThreadId::new();
+        write_role_rollout(
+            home.path(),
+            "2025-01-01T10-00-00",
+            "2025-01-01T10:00:00Z",
+            standard,
+            None,
+            None,
+            "ordinary conversation",
+            provider,
+            &cwd,
+        )?;
+        for (thread_id, filename_ts, timestamp) in [
+            (first_side, "2025-01-01T11-00-00", "2025-01-01T11:00:00Z"),
+            (second_side, "2025-01-01T12-00-00", "2025-01-01T12:00:00Z"),
+        ] {
+            write_role_rollout(
+                home.path(),
+                filename_ts,
+                timestamp,
+                thread_id,
+                Some(missing_main),
+                Some(codex_protocol::protocol::ThreadSource::Feature(format!(
+                    "{}:{missing_main}",
+                    crate::app_server_session::PERSISTENT_SIDE_THREAD_SOURCE_PREFIX
+                ))),
+                "",
+                provider,
+                &cwd,
+            )?;
+        }
+
+        let mut app_server = crate::start_embedded_app_server_for_picker(&config).await?;
+        let page = load_app_server_page(
+            &mut app_server,
+            thread_list_params(
+                None,
+                None,
+                SessionStatus::Active,
+                ProviderFilter::Any,
+                ThreadSortKey::UpdatedAt,
+                false,
+                false,
+            ),
+        )
+        .await?;
+        let listed_ids = page
+            .rows
+            .iter()
+            .filter_map(|row| row.thread_id)
+            .collect::<HashSet<_>>();
+        assert_eq!(listed_ids, HashSet::from([standard]));
+        assert!(page.legacy_side_main_recoveries.is_empty());
+        let quarantined = page
+            .quarantined_rows
+            .iter()
+            .map(|row| (row.thread_id.clone(), row.reason_code))
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            quarantined,
+            HashSet::from([
+                (
+                    first_side.to_string(),
+                    "multiple_side_claims_for_missing_main"
+                ),
+                (
+                    second_side.to_string(),
+                    "multiple_side_claims_for_missing_main"
+                ),
+            ])
+        );
+        app_server.shutdown().await?;
+        Ok(())
     }
 
     #[test]

@@ -19547,6 +19547,39 @@
       "title": "ThreadDeletedNotification",
       "type": "object"
     },
+    "ThreadEffectiveReadPolicy": {
+      "description": "Local-path projection of the effective filesystem read policy. The server resolves special roots before publishing this snapshot; write and network authority are intentionally absent.",
+      "properties": {
+        "fullDiskReadAccess": {
+          "type": "boolean"
+        },
+        "readableRoots": {
+          "items": {
+            "$ref": "#/definitions/AbsolutePathBuf"
+          },
+          "type": "array"
+        },
+        "unreadableGlobs": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "unreadableRoots": {
+          "items": {
+            "$ref": "#/definitions/AbsolutePathBuf"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "fullDiskReadAccess",
+        "readableRoots",
+        "unreadableGlobs",
+        "unreadableRoots"
+      ],
+      "type": "object"
+    },
     "ThreadEnvironment": {
       "description": "An environment selected by a loaded thread, independent of connection status.",
       "properties": {
@@ -19572,6 +19605,19 @@
     },
     "ThreadExtra": {
       "description": "Extra app-server data for a thread.",
+      "properties": {
+        "effectiveReadPolicy": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ThreadEffectiveReadPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Server-owned effective read policy for a loaded thread. Clients must not use this field to request or widen permissions."
+        }
+      },
       "type": "object"
     },
     "ThreadForkParams": {
@@ -23328,8 +23374,52 @@
     },
     "ThreadTokenUsage": {
       "properties": {
+        "effectiveModel": {
+          "description": "Effective request settings for the latest accounted response.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "effectiveReasoningEffort": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ReasoningEffort"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "effectiveServiceTier": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "last": {
-          "$ref": "#/definitions/TokenUsageBreakdown"
+          "allOf": [
+            {
+              "$ref": "#/definitions/TokenUsageBreakdown"
+            }
+          ],
+          "description": "Latest provider/context-window sample retained for compatibility."
+        },
+        "latestTurn": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/TokenUsageBreakdown"
+            }
+          ],
+          "default": {
+            "cacheWriteInputTokens": 0,
+            "cachedInputTokens": 0,
+            "inputTokens": 0,
+            "outputTokens": 0,
+            "reasoningOutputTokens": 0,
+            "totalTokens": 0
+          },
+          "description": "Cumulative usage for the latest logical turn."
         },
         "modelContextWindow": {
           "format": "int64",
@@ -23339,7 +23429,12 @@
           ]
         },
         "total": {
-          "$ref": "#/definitions/TokenUsageBreakdown"
+          "allOf": [
+            {
+              "$ref": "#/definitions/TokenUsageBreakdown"
+            }
+          ],
+          "description": "Cumulative usage for the canonical thread across all completed responses."
         }
       },
       "required": [

@@ -2690,6 +2690,9 @@ async fn spawn_agent_fork_sanitizes_inherited_compaction_metadata() {
         usage: parent_usage.clone(),
         turn_token_usage: parent_usage.clone(),
         thread_token_usage: parent_usage,
+        effective_model: None,
+        effective_reasoning_effort: None,
+        effective_service_tier: None,
     };
     let parent_spawn_call_id = "spawn-call-token-usage".to_string();
     parent_thread
@@ -2814,6 +2817,9 @@ async fn spawn_agent_fork_sanitizes_inherited_compaction_metadata() {
             usage: child_usage.clone(),
             turn_token_usage: child_usage.clone(),
             thread_token_usage: child_usage,
+            effective_model: Some("gpt-5.5".to_string()),
+            effective_reasoning_effort: Some(ReasoningEffort::Medium),
+            effective_service_tier: None,
         })
     );
 }

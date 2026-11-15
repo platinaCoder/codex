@@ -168,7 +168,7 @@ async fn remote_resume_restores_saved_server_profile_without_permission_override
         .await?;
     assert_eq!(
         side.session.active_permission_profile.unwrap().id,
-        "server-only"
+        codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_READ_ONLY
     );
     let explicit_config = ConfigBuilder::default()
         .codex_home(home.path().to_path_buf())

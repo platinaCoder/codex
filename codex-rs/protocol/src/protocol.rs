@@ -2422,12 +2422,30 @@ pub struct TokenUsageRecord {
     pub usage: TokenUsage,
     pub turn_token_usage: TokenUsage,
     pub thread_token_usage: TokenUsage,
+    /// Effective request settings for this response, retained with per-thread accounting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_reasoning_effort: Option<ReasoningEffortConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_service_tier: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
 pub struct TokenUsageInfo {
     pub total_token_usage: TokenUsage,
     pub last_token_usage: TokenUsage,
+    /// Cumulative usage for the latest logical turn. Unlike `last_token_usage`, this is not
+    /// the current context-window sample and remains stable across lifecycle replay.
+    #[serde(default)]
+    pub latest_turn_token_usage: TokenUsage,
+    /// Effective request settings associated with the latest accounted response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_reasoning_effort: Option<ReasoningEffortConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_service_tier: Option<String>,
     // TODO(aibrahim): make this not optional
     #[ts(type = "number | null")]
     pub model_context_window: Option<i64>,
@@ -2448,6 +2466,10 @@ impl TokenUsageInfo {
             None => Self {
                 total_token_usage: TokenUsage::default(),
                 last_token_usage: TokenUsage::default(),
+                latest_turn_token_usage: TokenUsage::default(),
+                effective_model: None,
+                effective_reasoning_effort: None,
+                effective_service_tier: None,
                 model_context_window,
             },
         };
@@ -2484,6 +2506,10 @@ impl TokenUsageInfo {
         let mut info = Self {
             total_token_usage: TokenUsage::default(),
             last_token_usage: TokenUsage::default(),
+            latest_turn_token_usage: TokenUsage::default(),
+            effective_model: None,
+            effective_reasoning_effort: None,
+            effective_service_tier: None,
             model_context_window: Some(context_window),
         };
         info.fill_to_context_window(context_window);
@@ -6555,6 +6581,7 @@ mod tests {
             total_token_usage: TokenUsage::default(),
             last_token_usage: TokenUsage::default(),
             model_context_window: Some(258_400),
+            ..Default::default()
         });
         let last = Some(TokenUsage {
             input_tokens: 10,
@@ -6578,6 +6605,7 @@ mod tests {
             total_token_usage: TokenUsage::default(),
             last_token_usage: TokenUsage::default(),
             model_context_window: Some(258_400),
+            ..Default::default()
         });
         let last = Some(TokenUsage {
             input_tokens: 10,

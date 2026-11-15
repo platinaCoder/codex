@@ -62,12 +62,26 @@ use codex_features::Feature;
 use codex_features::Features;
 use codex_protocol::ThreadId;
 use codex_protocol::models::FunctionCallOutputBody;
+use codex_protocol::permissions::FileSystemSandboxPolicy;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use serde_json::json;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::fs::File;
+use std::fs::OpenOptions;
+use std::io::Read;
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
+#[cfg(all(unix, not(target_os = "linux")))]
+use std::os::unix::fs::MetadataExt;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -75,8 +89,6 @@ use tokio::sync::broadcast;
 use tokio::time::Instant;
 use uuid::Uuid;
 use walkdir::WalkDir;
-
-use crate::app_server_session::PERSISTENT_SIDE_THREAD_SOURCE_PREFIX;
 
 #[path = "dynamic_tools_response.rs"]
 mod response;
@@ -105,6 +117,8 @@ const MAX_WAIT_TIMEOUT_MS: u64 = 120_000;
 const MAX_WORKSPACE_FILE_BYTES: u64 = 256 * 1024;
 const MAX_WORKSPACE_RESULTS: usize = 200;
 const MAX_WORKSPACE_VISITED_FILES: usize = 5_000;
+const MAX_WORKSPACE_VISITED_ENTRIES: usize = 20_000;
+const MAX_WORKSPACE_SEARCH_DEPTH: usize = 64;
 pub(crate) const TICKET_DISPATCH_METADATA_KEY: &str = "ai_lab_ticket_assignment";
 #[cfg(test)]
 pub(crate) const TICKET_TOOLS: [&str; 9] = [
@@ -118,7 +132,7 @@ pub(crate) const TICKET_TOOLS: [&str; 9] = [
     "retry_ticket_notification",
     "append_ticket_comment",
 ];
-const TICKET_MUTATION_TOOLS: [&str; 7] = [
+pub(crate) const TICKET_MUTATION_TOOLS: [&str; 7] = [
     "create_ticket",
     "update_ticket",
     "implement_ticket",
@@ -405,7 +419,7 @@ pub(crate) fn tool_specs() -> Vec<DynamicToolSpec> {
         ),
         (
             "read_workspace_file",
-            "Read a UTF-8 text file under the calling task's workspace without executing commands or changing filesystem state.",
+            "Read a UTF-8 text file allowed by the calling task's effective server-owned filesystem read policy. Relative paths resolve from its workspace; permitted absolute paths and symlink targets are supported. This never executes commands or changes filesystem state.",
             json!({
                 "path": {"type": "string", "minLength": 1},
                 "maxChars": {"type": "integer", "minimum": 1, "maximum": MAX_OUTPUT_CHARS}
@@ -414,13 +428,13 @@ pub(crate) fn tool_specs() -> Vec<DynamicToolSpec> {
         ),
         (
             "list_workspace_directory",
-            "List one directory under the calling task's workspace without executing commands or changing filesystem state.",
+            "List one directory allowed by the calling task's effective server-owned filesystem read policy. Relative paths resolve from its workspace; permitted absolute paths and symlink targets are supported. This never executes commands or changes filesystem state.",
             json!({"path": {"type": "string"}}),
             Vec::new(),
         ),
         (
             "search_workspace_text",
-            "Search UTF-8 text files under the calling task's workspace. Results are bounded and this tool never executes commands or changes filesystem state.",
+            "Search UTF-8 text files allowed by the calling task's effective server-owned filesystem read policy. Relative paths resolve from its workspace; permitted absolute paths and directory symlinks are supported. Traversal and results are bounded, and this never executes commands or changes filesystem state.",
             json!({
                 "query": {"type": "string", "minLength": 1, "maxLength": 256},
                 "path": {"type": "string"},
@@ -628,7 +642,9 @@ pub(crate) fn non_delegation_tool_specs() -> Vec<DynamicToolSpec> {
 /// Ticket handlers and the store independently verify durable SIDE identity;
 /// arbitrary delegation and filesystem mutation remain unavailable.
 pub(crate) fn side_fallback_tool_specs() -> Vec<DynamicToolSpec> {
-    filtered_tool_specs(|name| !DELEGATION_TOOLS.contains(&name))
+    filtered_tool_specs(|name| {
+        !DELEGATION_TOOLS.contains(&name) && !TICKET_MUTATION_TOOLS.contains(&name)
+    })
 }
 
 fn filtered_tool_specs(mut retain: impl FnMut(&str) -> bool) -> Vec<DynamicToolSpec> {
@@ -1006,9 +1022,13 @@ async fn execute_inner(
         "read_workspace_file" => {
             let arguments: WorkspaceReadArguments = parse_arguments(params.arguments)?;
             let source = read_thread(&handle, &params.thread_id).await?;
-            let root = canonical_workspace_root(source.cwd.as_path())?;
-            let path = resolve_workspace_path(&root, &arguments.path)?;
-            let metadata = std::fs::metadata(&path).map_err(|error| error.to_string())?;
+            let policy = EffectiveReadPolicy::from_thread(&source)?;
+            let path = policy.resolve(&arguments.path)?;
+            let mut opened = policy.open_file(&path)?;
+            let metadata = opened
+                .file
+                .metadata()
+                .map_err(|error| format!("failed to inspect readable file: {error}"))?;
             if !metadata.is_file() {
                 return Err("path is not a regular file".to_string());
             }
@@ -1017,7 +1037,18 @@ async fn execute_inner(
                     "file exceeds the {MAX_WORKSPACE_FILE_BYTES}-byte read-only limit"
                 ));
             }
-            let bytes = std::fs::read(&path).map_err(|error| error.to_string())?;
+            let mut bytes = Vec::new();
+            opened
+                .file
+                .by_ref()
+                .take(MAX_WORKSPACE_FILE_BYTES + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|error| format!("failed to read permitted file: {error}"))?;
+            if bytes.len() as u64 > MAX_WORKSPACE_FILE_BYTES {
+                return Err(format!(
+                    "file exceeds the {MAX_WORKSPACE_FILE_BYTES}-byte read-only limit"
+                ));
+            }
             let text =
                 String::from_utf8(bytes).map_err(|_| "file is not valid UTF-8 text".to_string())?;
             let max_chars = arguments.max_chars.unwrap_or(MAX_OUTPUT_CHARS);
@@ -1027,7 +1058,7 @@ async fn execute_inner(
             let truncated = text.chars().count() > max_chars;
             let text = text.chars().take(max_chars).collect::<String>();
             Ok(json!({
-                "path": workspace_relative(&root, &path),
+                "path": policy.display_path(&opened.path),
                 "text": text,
                 "truncated": truncated
             }))
@@ -1035,16 +1066,15 @@ async fn execute_inner(
         "list_workspace_directory" => {
             let arguments: WorkspacePathArguments = parse_arguments(params.arguments)?;
             let source = read_thread(&handle, &params.thread_id).await?;
-            let root = canonical_workspace_root(source.cwd.as_path())?;
-            let path = resolve_workspace_path(&root, arguments.path.as_deref().unwrap_or("."))?;
-            if !path.is_dir() {
-                return Err("path is not a directory".to_string());
-            }
-            let mut entries = std::fs::read_dir(&path)
-                .map_err(|error| error.to_string())?
+            let policy = EffectiveReadPolicy::from_thread(&source)?;
+            let path = policy.resolve(arguments.path.as_deref().unwrap_or("."))?;
+            let opened = policy.open_directory(&path)?;
+            let directory_handle_path = open_handle_path(&opened.file, &opened.path)?;
+            let mut entries = std::fs::read_dir(directory_handle_path)
+                .map_err(|error| format!("failed to list permitted directory: {error}"))?
                 .filter_map(Result::ok)
                 .map(|entry| {
-                    let entry_path = entry.path();
+                    let entry_path = opened.path.join(entry.file_name());
                     let kind = entry
                         .file_type()
                         .ok()
@@ -1061,7 +1091,7 @@ async fn execute_inner(
                         })
                         .unwrap_or("unknown");
                     json!({
-                        "path": workspace_relative(&root, &entry_path),
+                        "path": policy.display_path(&entry_path),
                         "kind": kind
                     })
                 })
@@ -1070,7 +1100,7 @@ async fn execute_inner(
             let truncated = entries.len() > MAX_WORKSPACE_RESULTS;
             entries.truncate(MAX_WORKSPACE_RESULTS);
             Ok(json!({
-                "path": workspace_relative(&root, &path),
+                "path": policy.display_path(&opened.path),
                 "entries": entries,
                 "truncated": truncated
             }))
@@ -1088,38 +1118,61 @@ async fn execute_inner(
                 ));
             }
             let source = read_thread(&handle, &params.thread_id).await?;
-            let root = canonical_workspace_root(source.cwd.as_path())?;
-            let path = resolve_workspace_path(&root, arguments.path.as_deref().unwrap_or("."))?;
+            let policy = EffectiveReadPolicy::from_thread(&source)?;
+            let path = policy.resolve(arguments.path.as_deref().unwrap_or("."))?;
+            let opened_root = policy.open_directory(&path)?;
+            let walk_root = open_handle_path(&opened_root.file, &opened_root.path)?;
             let mut matches = Vec::new();
             let mut visited_files = 0usize;
-            for entry in WalkDir::new(&path)
-                .follow_links(false)
-                .into_iter()
-                .filter_map(Result::ok)
+            let mut visited_entries = 0usize;
+            for entry in WalkDir::new(&walk_root)
+                .follow_links(true)
+                .max_depth(MAX_WORKSPACE_SEARCH_DEPTH)
             {
-                if matches.len() >= max_results || visited_files >= MAX_WORKSPACE_VISITED_FILES {
+                if matches.len() >= max_results
+                    || visited_files >= MAX_WORKSPACE_VISITED_FILES
+                    || visited_entries >= MAX_WORKSPACE_VISITED_ENTRIES
+                {
                     break;
                 }
+                let entry = entry.map_err(|error| {
+                    format!("failed to traverse permitted search path safely: {error}")
+                })?;
+                visited_entries += 1;
                 if !entry.file_type().is_file() {
                     continue;
                 }
                 visited_files += 1;
-                let Ok(metadata) = entry.metadata() else {
-                    continue;
-                };
+                let relative = entry.path().strip_prefix(&walk_root).map_err(|_| {
+                    "search traversal returned a path outside its opened root".to_string()
+                })?;
+                let candidate = opened_root.path.join(relative);
+                let canonical = policy.authorize_canonical(&candidate)?;
+                let mut opened = policy.open_file(&canonical)?;
+                let metadata = opened
+                    .file
+                    .metadata()
+                    .map_err(|error| format!("failed to inspect readable file: {error}"))?;
                 if metadata.len() > MAX_WORKSPACE_FILE_BYTES {
                     continue;
                 }
-                let Ok(bytes) = std::fs::read(entry.path()) else {
+                let mut bytes = Vec::new();
+                opened
+                    .file
+                    .by_ref()
+                    .take(MAX_WORKSPACE_FILE_BYTES + 1)
+                    .read_to_end(&mut bytes)
+                    .map_err(|error| format!("failed to read permitted search file: {error}"))?;
+                if bytes.len() as u64 > MAX_WORKSPACE_FILE_BYTES {
                     continue;
-                };
+                }
                 let Ok(text) = std::str::from_utf8(&bytes) else {
                     continue;
                 };
                 for (line_index, line) in text.lines().enumerate() {
                     if line.contains(&query) {
                         matches.push(json!({
-                            "path": workspace_relative(&root, entry.path()),
+                            "path": policy.display_path(&opened.path),
                             "line": line_index + 1,
                             "text": truncate(line, 500)
                         }));
@@ -1135,6 +1188,7 @@ async fn execute_inner(
                 "visitedFiles": visited_files,
                 "truncated": matches.len() >= max_results
                     || visited_files >= MAX_WORKSPACE_VISITED_FILES
+                    || visited_entries >= MAX_WORKSPACE_VISITED_ENTRIES
             }))
         }
         "list_threads" | "list_archived_threads" => {
@@ -1365,6 +1419,10 @@ async fn execute_inner(
                 .map_err(|error| error.to_string())?;
             let thread_id = started.thread.id.clone();
             let daybreak_enabled = started.thread.daybreak_enabled.unwrap_or(false);
+            if task_tools_available {
+                crate::app_server_session::validate_task_read_policy(&started.thread)
+                    .map_err(|error| error.to_string())?;
+            }
             register_background_thread(app_event_tx, started.thread, task_tools_available).await?;
             let cyber_access_program = background_turn_program(
                 &features,
@@ -1475,6 +1533,8 @@ async fn execute_inner(
             )
             .await?;
             let forked_thread_id = response.thread.id.clone();
+            crate::app_server_session::validate_task_read_policy(&response.thread)
+                .map_err(|error| error.to_string())?;
             register_background_thread(
                 app_event_tx,
                 response.thread,
@@ -2057,31 +2117,165 @@ fn paginate_text(text: &str, cursor: usize, max_chars: usize) -> Result<TextPage
     })
 }
 
-fn canonical_workspace_root(root: &Path) -> Result<PathBuf, String> {
-    std::fs::canonicalize(root)
-        .map_err(|error| format!("failed to resolve workspace root: {error}"))
+struct EffectiveReadPolicy {
+    cwd: PathBuf,
+    file_system: FileSystemSandboxPolicy,
 }
 
-fn resolve_workspace_path(root: &Path, requested: &str) -> Result<PathBuf, String> {
-    let requested = Path::new(requested);
-    let candidate = if requested.is_absolute() {
-        requested.to_path_buf()
-    } else {
-        root.join(requested)
-    };
-    let resolved = std::fs::canonicalize(&candidate)
-        .map_err(|error| format!("failed to resolve workspace path: {error}"))?;
-    if !resolved.starts_with(root) {
-        return Err("path is outside the calling task's workspace".to_string());
+struct OpenedReadPath {
+    path: PathBuf,
+    file: File,
+}
+
+impl EffectiveReadPolicy {
+    fn from_thread(thread: &Thread) -> Result<Self, String> {
+        // App-server owns this absolute cwd and has already resolved the projected policy
+        // against it. Do not require the cwd to remain materialized before an absolute read;
+        // relative requests still fail safely when their joined target cannot be canonicalized.
+        let cwd = thread.cwd.as_path().to_path_buf();
+        let read_policy = thread
+            .extra
+            .as_ref()
+            .and_then(|extra| extra.effective_read_policy.as_ref())
+            .ok_or_else(|| {
+                "the calling task's effective server-owned filesystem read policy is unavailable; the task was created or resumed through an incompatible app-server runtime"
+                    .to_string()
+            })?;
+        Ok(Self {
+            cwd,
+            file_system: read_policy.to_file_system_policy(),
+        })
     }
-    Ok(resolved)
+
+    fn resolve(&self, requested: &str) -> Result<PathBuf, String> {
+        let requested = Path::new(requested);
+        let candidate = if requested.is_absolute() {
+            requested.to_path_buf()
+        } else {
+            self.cwd.join(requested)
+        };
+        self.authorize_canonical(&candidate)
+    }
+
+    fn authorize_canonical(&self, candidate: &Path) -> Result<PathBuf, String> {
+        let canonical = std::fs::canonicalize(candidate).map_err(|error| {
+            format!("failed to resolve readable path (dangling links and symlink loops are rejected): {error}")
+        })?;
+        self.authorize(&canonical)?;
+        Ok(canonical)
+    }
+
+    fn authorize(&self, canonical: &Path) -> Result<(), String> {
+        if self
+            .file_system
+            .can_read_local_path_with_cwd(canonical, &self.cwd)
+        {
+            Ok(())
+        } else {
+            Err(format!(
+                "resolved path is outside the calling task's effective readable roots: {}",
+                canonical.display()
+            ))
+        }
+    }
+
+    fn open_file(&self, canonical: &Path) -> Result<OpenedReadPath, String> {
+        self.open(canonical, false)
+    }
+
+    fn open_directory(&self, canonical: &Path) -> Result<OpenedReadPath, String> {
+        self.open(canonical, true)
+    }
+
+    fn open(&self, canonical: &Path, directory: bool) -> Result<OpenedReadPath, String> {
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        options.custom_flags(
+            libc::O_CLOEXEC
+                | libc::O_NONBLOCK
+                | libc::O_NOFOLLOW
+                | if directory { libc::O_DIRECTORY } else { 0 },
+        );
+        #[cfg(windows)]
+        if directory {
+            // FILE_FLAG_BACKUP_SEMANTICS permits a read-only directory handle.
+            options.custom_flags(0x0200_0000);
+        }
+        let file = options
+            .open(canonical)
+            .map_err(|error| format!("failed to open resolved readable path safely: {error}"))?;
+        let metadata = file
+            .metadata()
+            .map_err(|error| format!("failed to inspect opened readable path: {error}"))?;
+        if directory && !metadata.is_dir() {
+            return Err("path is not a directory".to_string());
+        }
+        if !directory && !metadata.is_file() {
+            return Err("path is not a regular file".to_string());
+        }
+        let actual = open_handle_path(&file, canonical)?;
+        self.authorize(&actual)?;
+        Ok(OpenedReadPath { path: actual, file })
+    }
+
+    fn display_path(&self, path: &Path) -> String {
+        path.strip_prefix(&self.cwd)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .into_owned()
+    }
 }
 
-fn workspace_relative(root: &Path, path: &Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .into_owned()
+#[cfg(target_os = "linux")]
+fn open_handle_path(file: &File, _fallback: &Path) -> Result<PathBuf, String> {
+    std::fs::canonicalize(format!("/proc/self/fd/{}", file.as_raw_fd()))
+        .map_err(|error| format!("failed to revalidate opened readable path: {error}"))
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn open_handle_path(file: &File, fallback: &Path) -> Result<PathBuf, String> {
+    let canonical = std::fs::canonicalize(fallback)
+        .map_err(|error| format!("failed to revalidate opened readable path: {error}"))?;
+    let opened = file
+        .metadata()
+        .map_err(|error| format!("failed to inspect opened readable path: {error}"))?;
+    let current = std::fs::metadata(&canonical)
+        .map_err(|error| format!("failed to inspect revalidated readable path: {error}"))?;
+    if opened.dev() != current.dev() || opened.ino() != current.ino() {
+        return Err("readable path changed while it was being opened".to_string());
+    }
+    Ok(canonical)
+}
+
+#[cfg(windows)]
+fn open_handle_path(file: &File, fallback: &Path) -> Result<PathBuf, String> {
+    let canonical = std::fs::canonicalize(fallback)
+        .map_err(|error| format!("failed to revalidate opened readable path: {error}"))?;
+    let opened = file
+        .metadata()
+        .map_err(|error| format!("failed to inspect opened readable path: {error}"))?;
+    let current = std::fs::metadata(&canonical)
+        .map_err(|error| format!("failed to inspect revalidated readable path: {error}"))?;
+    let same_file = match (
+        opened.volume_serial_number(),
+        opened.file_index(),
+        current.volume_serial_number(),
+        current.file_index(),
+    ) {
+        (Some(opened_volume), Some(opened_index), Some(current_volume), Some(current_index)) => {
+            opened_volume == current_volume && opened_index == current_index
+        }
+        _ => {
+            opened.len() == current.len()
+                && opened.modified().ok() == current.modified().ok()
+                && opened.file_type() == current.file_type()
+        }
+    };
+    if !same_file {
+        return Err("readable path changed while it was being opened".to_string());
+    }
+    Ok(canonical)
 }
 
 fn delegated_prompt(source_thread_id: &str, prompt: &str) -> String {
@@ -2134,12 +2328,24 @@ fn same_thread_id(first: &str, second: &str) -> bool {
 }
 
 fn is_side_thread(thread: &Thread) -> bool {
+    let thread_id = ThreadId::from_string(&thread.id).ok();
+    let control_parent = thread
+        .parent_thread_id
+        .as_deref()
+        .and_then(|parent| ThreadId::from_string(parent).ok());
     matches!(
-        thread.thread_source.as_ref(),
-        Some(ThreadSource::Feature(source))
-            if source
-                .strip_prefix(PERSISTENT_SIDE_THREAD_SOURCE_PREFIX)
-                .is_some_and(|suffix| suffix.starts_with(':'))
+        codex_protocol::resolve_conversation_role_feature(
+            thread
+                .thread_source
+                .as_ref()
+                .and_then(|source| match source {
+                    ThreadSource::Feature(feature) => Some(feature.as_str()),
+                    _ => None,
+                }),
+            thread_id,
+            control_parent,
+        ),
+        codex_protocol::ConversationRole::Side { .. }
     )
 }
 
@@ -2216,16 +2422,23 @@ async fn paired_main_thread_id(
     side_thread_id: &str,
 ) -> Result<String, String> {
     let side = read_thread(handle, side_thread_id).await?;
-    let Some(ThreadSource::Feature(source)) = side.thread_source.as_ref() else {
-        return Err("only a durable SIDE thread can message a paired MAIN thread".to_string());
-    };
-    let prefix = format!("{PERSISTENT_SIDE_THREAD_SOURCE_PREFIX}:");
-    let Some(parent) = source.strip_prefix(&prefix) else {
-        return Err("calling thread is not a durable SIDE thread".to_string());
-    };
-    let parent = ThreadId::from_string(parent)
-        .map_err(|_| "SIDE pairing metadata contains an invalid MAIN thread id".to_string())?
-        .to_string();
+    let side_id =
+        ThreadId::from_string(&side.id).map_err(|_| "SIDE thread id is malformed".to_string())?;
+    let control_parent = side
+        .parent_thread_id
+        .as_deref()
+        .and_then(|parent| ThreadId::from_string(parent).ok());
+    let parent = codex_protocol::resolve_conversation_role_feature(
+        side.thread_source.as_ref().and_then(|source| match source {
+            ThreadSource::Feature(feature) => Some(feature.as_str()),
+            _ => None,
+        }),
+        Some(side_id),
+        control_parent,
+    )
+    .paired_main_id()
+    .ok_or_else(|| "calling thread is not a valid durable SIDE thread".to_string())?
+    .to_string();
     let main = read_thread(handle, &parent).await?;
     if !same_thread_id(&main.id, &parent) {
         return Err("paired MAIN thread could not be verified".to_string());

@@ -1,3 +1,4 @@
+use super::session::ConversationRoleConstraints;
 use super::step_settings::ResolvedStepSettings;
 use super::token_budget::has_explicit_settings;
 use super::token_budget::resolve_token_budget;
@@ -349,6 +350,12 @@ pub struct TurnContext {
     /// Persisted thread identity. Security-sensitive behavior must use this
     /// server-owned value instead of client resume overrides.
     pub(crate) thread_source: Option<ThreadSource>,
+    pub(crate) role_constraints: ConversationRoleConstraints,
+    /// History-only injection builds a filtered tool plan to initialize context before
+    /// app-server dynamic tools are attached. Model-capable turns must run the full SIDE
+    /// capability preflight; injection-only contexts must not fail merely because that
+    /// authenticated catalog is not available yet.
+    pub(crate) requires_side_model_preflight: bool,
     pub(crate) history_mode: ThreadHistoryMode,
     pub(crate) parent_thread_id: Option<ThreadId>,
     pub(crate) originator: String,
@@ -364,6 +371,7 @@ pub struct TurnContext {
     pub(crate) timezone: Option<String>,
     pub(crate) app_server_client_name: Option<String>,
     pub(crate) developer_instructions: Option<String>,
+    pub(crate) base_instructions: String,
     pub(crate) multi_agent_version: MultiAgentVersion,
     pub(crate) network: Option<NetworkProxy>,
     // TODO(anp): Reconcile this parallel turn snapshot with TurnEnvironment::sandbox_context
@@ -392,6 +400,10 @@ enum TurnContextBuildMode {
     /// Resolves and stores model/multi-agent metadata and performs normal skill discovery.
     /// Used for execution and initial context creation.
     Full,
+
+    /// Initializes the reference context for a history-only injection with normal
+    /// discovery, while deferring model-call capability preflight until a real turn.
+    InitialInject,
 
     /// Prepares startup resources with normal skill discovery, without updating
     /// shared model/multi-agent metadata.
@@ -441,6 +453,8 @@ impl TurnContext {
             provider: self.provider.clone(),
             session_source: self.session_source.clone(),
             thread_source: self.thread_source.clone(),
+            role_constraints: self.role_constraints,
+            requires_side_model_preflight: self.requires_side_model_preflight,
             history_mode: self.history_mode,
             parent_thread_id: self.parent_thread_id,
             originator: self.originator.clone(),
@@ -450,6 +464,7 @@ impl TurnContext {
             timezone: self.timezone.clone(),
             app_server_client_name: self.app_server_client_name.clone(),
             developer_instructions: None,
+            base_instructions: self.base_instructions.clone(),
             multi_agent_version: MultiAgentVersion::Disabled,
             network: self.network.clone(),
             windows_sandbox_level: self.windows_sandbox_level,
@@ -854,6 +869,8 @@ impl TurnContext {
             provider: self.provider.clone(),
             session_source: self.session_source.clone(),
             thread_source: self.thread_source.clone(),
+            role_constraints: self.role_constraints,
+            requires_side_model_preflight: self.requires_side_model_preflight,
             history_mode: self.history_mode,
             parent_thread_id: self.parent_thread_id,
             originator: self.originator.clone(),
@@ -864,6 +881,7 @@ impl TurnContext {
             timezone: self.timezone.clone(),
             app_server_client_name: self.app_server_client_name.clone(),
             developer_instructions: self.developer_instructions.clone(),
+            base_instructions: self.base_instructions.clone(),
             multi_agent_version: self.multi_agent_version,
             network: self.network.clone(),
             windows_sandbox_level: self.windows_sandbox_level,
@@ -1140,6 +1158,8 @@ impl Session {
             provider,
             session_source,
             thread_source: session_configuration.thread_source.clone(),
+            role_constraints: session_configuration.role_constraints,
+            requires_side_model_preflight: true,
             history_mode: session_configuration.history_mode,
             parent_thread_id: session_configuration.parent_thread_id,
             originator: session_configuration.originator.clone(),
@@ -1150,6 +1170,7 @@ impl Session {
             timezone: Some(timezone),
             app_server_client_name: session_configuration.app_server_client_name.clone(),
             developer_instructions: session_configuration.developer_instructions.clone(),
+            base_instructions: session_configuration.base_instructions.clone(),
             multi_agent_version,
             network,
             windows_sandbox_level: session_configuration.windows_sandbox_level,
@@ -1301,7 +1322,7 @@ impl Session {
             )
             .await;
         let multi_agent_version = match build_mode {
-            TurnContextBuildMode::Full => {
+            TurnContextBuildMode::Full | TurnContextBuildMode::InitialInject => {
                 // Only execution and initial context creation publish model metadata.
                 self.services
                     .thread_extension_data
@@ -1381,6 +1402,10 @@ impl Session {
             skills_snapshot,
         );
         turn_context.code_mode_available = self.services.code_mode_service.is_available();
+        turn_context.requires_side_model_preflight = !matches!(
+            build_mode,
+            TurnContextBuildMode::InitialInject | TurnContextBuildMode::InjectItems
+        );
         turn_context.extension_data.insert(trusted_plugin_roots);
         turn_context.active_host_plugin_identities = Some(
             plugin_outcome
@@ -1464,6 +1489,13 @@ impl Session {
     /// This context must not be used to capture or execute a step.
     pub(crate) async fn new_inject_items_context(&self) -> Arc<TurnContext> {
         self.new_default_turn_for(TurnContextBuildMode::InjectItems)
+            .await
+    }
+
+    /// Builds the complete initial recording context for injected history without
+    /// requiring app-server dynamic tools that are attached after thread startup.
+    pub(crate) async fn new_initial_inject_items_turn(&self) -> Arc<TurnContext> {
+        self.new_default_turn_for(TurnContextBuildMode::InitialInject)
             .await
     }
 

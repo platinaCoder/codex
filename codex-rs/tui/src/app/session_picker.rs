@@ -89,6 +89,7 @@ impl App {
                     return Ok(AppRunControl::Continue);
                 }
                 let thread_id = target_session.thread_id;
+                tracing::info!(%thread_id, active_thread_id = ?self.active_thread_id, "resume picker dispatching foreground transition");
                 let switching_threads = self.current_displayed_thread_id() != Some(thread_id);
                 if switching_threads {
                     for (id, channel) in &self.thread_event_channels {
@@ -110,6 +111,12 @@ impl App {
                 {
                     return Ok(AppRunControl::Exit(reason));
                 }
+                if switching_threads && self.current_displayed_thread_id() != Some(thread_id) {
+                    self.add_session_picker_error(format!(
+                        "[session_transition_incomplete] Selected session {thread_id} did not become the foreground conversation."
+                    ));
+                }
+                tracing::info!(%thread_id, active_thread_id = ?self.active_thread_id, displayed_thread_id = ?self.current_displayed_thread_id(), "resume picker foreground transition completed");
                 if switching_threads
                     && self.current_displayed_thread_id() == Some(thread_id)
                     && let Some(input_state) = self.agents_overview.input_states.remove(&thread_id)

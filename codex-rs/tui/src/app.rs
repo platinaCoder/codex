@@ -563,6 +563,8 @@ pub(crate) struct App {
     workspace_command_runner: Option<WorkspaceCommandRunner>,
     /// Legacy bootstrap and server-setting inputs; local preferences live in `local_settings`.
     pub(crate) config: Config,
+    /// Immutable launch snapshot used to create role-scoped conversations.
+    pub(crate) role_startup_config: Config,
     pub(crate) local_settings: crate::local_settings::LocalSettings,
     launch_cwd: PathBuf,
     /// Resume anchor selected by `/cd`; ordinary resumes retain the immutable launch cwd.

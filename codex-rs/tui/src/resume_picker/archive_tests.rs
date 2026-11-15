@@ -27,8 +27,9 @@ fn archive_picker_state() -> (PickerState, Arc<Mutex<Vec<ThreadId>>>) {
     let requests = Arc::new(Mutex::new(Vec::new()));
     let request_sink = Arc::clone(&requests);
     let picker_loader: PickerLoader = Arc::new(move |request| {
-        if let PickerLoadRequest::Archive { thread_id }
-        | PickerLoadRequest::Unarchive { thread_id } = request
+        if let PickerLoadRequest::Archive { thread_id, .. }
+        | PickerLoadRequest::Unarchive { thread_id }
+        | PickerLoadRequest::RestoreCanonicalRoot { thread_id } = request
         {
             request_sink
                 .lock()
@@ -46,6 +47,44 @@ fn archive_picker_state() -> (PickerState, Arc<Mutex<Vec<ThreadId>>>) {
         SessionPickerAction::Resume,
     );
     (state, requests)
+}
+
+#[tokio::test]
+async fn canonical_root_restore_targets_main_and_preserves_fork_action() {
+    let (mut state, requests) = archive_picker_state();
+    let main_thread_id = ThreadId::new();
+    state.action = SessionPickerAction::Fork;
+    set_selected_session(&mut state, main_thread_id);
+    state
+        .canonical_roots_requiring_restore
+        .insert(main_thread_id);
+
+    assert!(
+        state
+            .handle_key(KeyEvent::from(KeyCode::Enter))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(*requests.lock().unwrap(), vec![main_thread_id]);
+
+    let selection = state.handle_unarchive_result(
+        main_thread_id,
+        Ok(SessionTarget {
+            backend_id: state.backend_id,
+            path: None,
+            thread_id: main_thread_id,
+            cwd: None,
+            history_mode: None,
+        }),
+    );
+    assert!(matches!(
+        selection,
+        Some(SessionSelection::Fork(SessionTarget {
+            thread_id,
+            ..
+        })) if thread_id == main_thread_id
+    ));
 }
 
 fn set_selected_session(state: &mut PickerState, thread_id: ThreadId) {
@@ -246,6 +285,10 @@ async fn archived_session_restore_resumes_after_completion() {
             .is_none()
     );
     assert_eq!(state.archive_state, ArchiveState::Restoring { thread_id });
+    assert_eq!(
+        super::super::search_line(&state, 100).to_string(),
+        "Opening session…"
+    );
     assert_eq!(*requests.lock().unwrap(), vec![thread_id]);
 
     assert!(
@@ -296,7 +339,7 @@ fn archived_session_restore_failure_preserves_session_and_allows_retry() {
     assert_eq!(state.archive_state, ArchiveState::Idle);
     assert_eq!(
         state.inline_error.as_deref(),
-        Some("Failed to restore archived session: restore denied")
+        Some("[session_open_failed] Could not open session; retry Enter: restore denied")
     );
     assert_eq!(state.filtered_rows.len(), 1);
 

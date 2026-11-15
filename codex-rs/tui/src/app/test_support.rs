@@ -33,6 +33,7 @@ pub(crate) async fn make_test_app() -> Box<App> {
         launch_cwd: config.cwd.to_path_buf(),
         runtime_working_directory_override: None,
         local_settings: crate::local_settings::LocalSettings::from(&config),
+        role_startup_config: config.clone(),
         config,
         state_db: None,
         cli_kv_overrides: Vec::new(),

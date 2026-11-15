@@ -3164,6 +3164,13 @@ async fn handle_start_side_seeds_navigation_before_thread_started() -> Result<()
         .expect("create other rollout"),
     )?;
     let mut app_server = Box::pin(crate::start_embedded_app_server_for_picker(&config)).await?;
+    app_server
+        .start_dynamic_tool_mcp(
+            config.clone(),
+            app.app_event_tx.clone(),
+            app.dynamic_tool_status_updates.clone(),
+        )
+        .await?;
     let started = app_server
         .resume_thread(
             &crate::local_settings::LocalSettings::from(&config),
@@ -3190,6 +3197,7 @@ async fn handle_start_side_seeds_navigation_before_thread_started() -> Result<()
         },
     )
     .await;
+    let parent_runtime_permission_override = app.runtime_permission_profile_override.clone();
 
     let control = Box::pin(app.handle_start_side(
         &mut tui,
@@ -3239,10 +3247,8 @@ async fn handle_start_side_seeds_navigation_before_thread_started() -> Result<()
         &PermissionProfile::read_only()
     );
     assert_eq!(
-        app.runtime_permission_profile_override,
-        Some(RuntimePermissionProfileOverride::from_config(
-            app.chat_widget.config_ref()
-        ))
+        app.runtime_permission_profile_override, parent_runtime_permission_override,
+        "SIDE activation must not rewrite the MAIN startup permission override"
     );
     app.select_agents_overview_thread(&mut tui, &mut app_server, other_thread_id)
         .await?;
@@ -3304,6 +3310,13 @@ async fn blank_primary_thread_gets_an_independent_persistent_side() -> Result<()
     let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
     let config = app.chat_widget.config_ref().clone();
     let mut app_server = Box::pin(crate::start_embedded_app_server_for_picker(&config)).await?;
+    app_server
+        .start_dynamic_tool_mcp(
+            config.clone(),
+            app.app_event_tx.clone(),
+            app.dynamic_tool_status_updates.clone(),
+        )
+        .await?;
     let started = app_server.start_thread(&config).await?;
     let parent_thread_id = started.session.thread_id;
     app.enqueue_primary_thread_session(started.session, started.turns)
@@ -3341,19 +3354,51 @@ async fn blank_primary_thread_gets_an_independent_persistent_side() -> Result<()
         stored_side.forked_from_id, None,
         "SIDE must own an independent rollout instead of inheriting MAIN history"
     );
-
-    crate::init_state_db_for_app_server_target(&app.config, &crate::AppServerTarget::Embedded)
-        .await?
-        .expect("state database")
-        .set_thread_preview_if_empty(side_thread_id, "Persistent SIDE history")
+    let direct_resume = crate::lookup_session_target_with_app_server(
+        &mut app_server,
+        &config,
+        &side_thread_id.to_string(),
+    )
+    .await?
+    .expect("direct SIDE resume reference should resolve to its canonical MAIN");
+    assert_eq!(direct_resume.thread_id, parent_thread_id);
+    assert_ne!(direct_resume.thread_id, side_thread_id);
+    let state_db =
+        crate::init_state_db_for_app_server_target(&app.config, &crate::AppServerTarget::Embedded)
+            .await?
+            .expect("state database");
+    state_db
+        .set_thread_preview_if_empty(side_thread_id, "Most recently focused SIDE history")
         .await
-        .expect("seed persistent SIDE preview");
+        .expect("seed SIDE preview");
+    let latest_resume = crate::lookup_latest_session_target_with_app_server(
+        &mut app_server,
+        &config,
+        Some(config.cwd.as_path()),
+        /*include_non_interactive*/ true,
+    )
+    .await?
+    .expect("the newest paired session should remain resumable through MAIN");
+    assert_eq!(latest_resume.thread_id, parent_thread_id);
+
+    let mut conflicting_side = stored_side.clone();
+    conflicting_side.parent_thread_id = Some(ThreadId::new().to_string());
+    assert!(
+        matches!(
+            crate::persisted_app_server_conversation_role(&conflicting_side)?,
+            codex_protocol::ConversationRole::RestrictedSide { .. }
+        ),
+        "conflicting persisted pair identity must fail closed"
+    );
 
     super::side_pair_registry::forget_pair_if_matches(
         app.local_settings.codex_home.as_path(),
         parent_thread_id,
         side_thread_id,
     )?;
+    app_server
+        .thread_set_name(side_thread_id, "legacy unnamed SIDE".to_string())
+        .await?;
     assert_eq!(
         super::side_pair_registry::paired_side(
             app.local_settings.codex_home.as_path(),
@@ -3365,7 +3410,7 @@ async fn blank_primary_thread_gets_an_independent_persistent_side() -> Result<()
         app.find_persisted_side_thread(&mut app_server, parent_thread_id)
             .await,
         Some(side_thread_id),
-        "legacy reverse-only SIDE metadata should migrate to the MAIN lookup registry"
+        "legacy reverse-only SIDE metadata should migrate by stable role hydration even without the canonical discovery name"
     );
     assert_eq!(
         super::side_pair_registry::paired_side(
@@ -5191,8 +5236,8 @@ async fn inactive_thread_started_notification_preserves_primary_model_when_path_
 }
 
 /// `thread/read` is metadata/replay hydration and does not return a fresh
-/// server-authored `PermissionProfile`, so it must not reuse the cached primary
-/// session profile after swapping in the read thread's cwd.
+/// server-authored role configuration, so it must use the immutable startup
+/// snapshot rather than the active primary thread's mutable settings.
 #[tokio::test]
 async fn thread_read_session_state_does_not_reuse_primary_permission_profile() {
     let mut app = make_test_app().await;
@@ -5253,7 +5298,7 @@ async fn thread_read_session_state_does_not_reuse_primary_permission_profile() {
     assert_eq!(session.cwd.as_path(), test_path_buf("/tmp/read").as_path());
     assert_eq!(
         session.runtime_workspace_roots,
-        vec![test_path_buf("/tmp/read").abs()]
+        app.role_startup_config.workspace_roots
     );
     let expected_permission_profile = app
         .chat_widget
@@ -5264,7 +5309,7 @@ async fn thread_read_session_state_does_not_reuse_primary_permission_profile() {
     assert_eq!(
         session.permission_profile, expected_permission_profile,
         "thread/read does not return fresh server permissions; the fallback profile must use the \
-         active widget permissions rather than reusing the cached primary session profile"
+         immutable startup permissions rather than reusing the cached primary session profile"
     );
 
     app.enqueue_primary_thread_session(session, Vec::new())
@@ -5327,10 +5372,11 @@ fn agent_picker_item_name_snapshot() {
 }
 
 #[tokio::test]
-async fn side_thread_config_is_durable_and_appends_developer_guardrails() {
-    let app = make_test_app().await;
+async fn side_thread_config_is_durable_and_leaves_role_policy_to_core() {
+    let mut app = make_test_app().await;
     let parent_thread_id = ThreadId::from_u128(/*value*/ 23);
     let original_approval_policy = app.config.permissions.approval_policy.value();
+    app.role_startup_config.developer_instructions = Some("startup developer policy".to_string());
 
     let side_config = app
         .side_thread_config(parent_thread_id)
@@ -5348,49 +5394,22 @@ async fn side_thread_config_is_durable_and_appends_developer_guardrails() {
             network_access: false
         }
     );
-    let developer_instructions = side_config
-        .developer_instructions
-        .as_deref()
-        .expect("side developer instructions");
-    assert!(
-        developer_instructions.contains("You are in a side conversation, not the main thread.")
+    assert_eq!(
+        side_config.developer_instructions.as_deref(),
+        Some("startup developer policy")
     );
-    assert!(developer_instructions.contains("Explicitly injected MAIN context is provided only"));
-    assert!(
-        developer_instructions.contains("Only instructions submitted directly to SIDE are active")
-    );
-    assert!(developer_instructions.contains("Do not continue, execute, or complete any task"));
-    assert!(developer_instructions.contains("Focus on substance over praise."));
-    assert!(developer_instructions.contains("Question assumptions, identify biases"));
-    assert!(developer_instructions.contains("Treat coherence and truth as separate things."));
-    assert!(developer_instructions.contains("Preserve uncertainty where it exists."));
-    assert!(developer_instructions.contains("Answer in continuous prose."));
-    assert!(developer_instructions.contains("Explain unfamiliar symbols, indices, operators"));
-    assert!(developer_instructions.contains("Translate the equation into equivalent pseudocode"));
-    assert!(
-        developer_instructions.contains("Distinguish what the mathematical expression specifies")
-    );
-    assert!(developer_instructions.contains("Never assume a particular neural architecture"));
-    assert!(developer_instructions.contains("Prioritize building conceptual understanding"));
-    assert!(developer_instructions.contains("Delimit inline mathematical notation"));
-    assert!(
-        developer_instructions
-            .contains("External tools may be available according to this thread's current")
-    );
-    assert!(
-        developer_instructions.contains("Do not infer active instructions from reference context")
-    );
-    assert!(developer_instructions.contains("SIDE is strictly read-only"));
-    assert!(developer_instructions.contains("Never edit, create, or delete arbitrary files"));
-    assert!(developer_instructions.contains("bounded writes"));
-    assert!(developer_instructions.contains(&parent_thread_id.to_string()));
     assert!(app.transcript_cells.is_empty());
 }
 
 #[tokio::test]
-async fn side_thread_config_inherits_parent_thread_runtime_settings() {
+async fn side_thread_config_uses_immutable_startup_runtime_settings() {
     let mut app = make_test_app().await;
     let parent_thread_id = ThreadId::new();
+    let startup_model = app.role_startup_config.model.clone();
+    let startup_effort = app.role_startup_config.model_reasoning_effort.clone();
+    let startup_tier = app.role_startup_config.service_tier.clone();
+    let startup_approval = app.role_startup_config.permissions.approval_policy.value();
+    let startup_reviewer = app.role_startup_config.approvals_reviewer;
     app.config.model = Some("persisted-default-model".to_string());
     app.config.model_reasoning_effort = Some(ReasoningEffortConfig::Low);
 
@@ -5424,13 +5443,42 @@ async fn side_thread_config_inherits_parent_thread_runtime_settings() {
             side_config.approvals_reviewer,
         ),
         (
-            Some("parent-thread-model"),
-            Some(ReasoningEffortConfig::High),
-            Some(parent_service_tier),
-            AskForApproval::OnRequest.to_core(),
-            ApprovalsReviewer::AutoReview,
+            startup_model.as_deref(),
+            startup_effort,
+            startup_tier.as_deref(),
+            startup_approval,
+            startup_reviewer,
         )
     );
+    assert_eq!(
+        side_config.permissions.permission_profile(),
+        &PermissionProfile::read_only()
+    );
+}
+
+#[tokio::test]
+async fn side_thread_config_supports_a_distinct_catalog_backed_model() {
+    let mut app = make_test_app().await;
+    let parent_thread_id = ThreadId::new();
+    app.chat_widget.set_model("gpt-6-astra");
+    app.role_startup_config.conversation_roles.side =
+        Some(codex_config::SideConversationRoleToml {
+            model: Some("gpt-5.6-luna".to_string()),
+            model_reasoning_effort: Some(ReasoningEffortConfig::Low),
+            service_tier: None,
+        });
+
+    let side_config = app
+        .side_thread_config(parent_thread_id)
+        .expect("configured SIDE model should pass catalog validation");
+
+    assert_eq!(app.chat_widget.current_model(), "gpt-6-astra");
+    assert_eq!(side_config.model.as_deref(), Some("gpt-5.6-luna"));
+    assert_eq!(
+        side_config.model_reasoning_effort,
+        Some(ReasoningEffortConfig::Low)
+    );
+    assert!(side_config.strict_read_only_tools);
     assert_eq!(
         side_config.permissions.permission_profile(),
         &PermissionProfile::read_only()
@@ -6674,6 +6722,7 @@ async fn make_test_app() -> Box<App> {
         launch_cwd: config.cwd.to_path_buf(),
         runtime_working_directory_override: None,
         local_settings: crate::local_settings::LocalSettings::from(&config),
+        role_startup_config: config.clone(),
         config,
         state_db: None,
         cli_kv_overrides: Vec::new(),
@@ -6805,6 +6854,7 @@ pub(super) async fn make_test_app_with_channels() -> (
             launch_cwd: config.cwd.to_path_buf(),
             runtime_working_directory_override: None,
             local_settings: crate::local_settings::LocalSettings::from(&config),
+            role_startup_config: config.clone(),
             config,
             state_db: None,
             cli_kv_overrides: Vec::new(),
@@ -7846,6 +7896,7 @@ fn token_usage_notification(
                 reasoning_output_tokens: 0,
             },
             model_context_window,
+            ..Default::default()
         },
     })
 }
@@ -10167,6 +10218,33 @@ async fn selecting_cyber_model_falls_back_to_user_when_auto_review_is_unavailabl
         params.approvals_reviewer,
         Some(codex_app_server_protocol::ApprovalsReviewer::User)
     );
+}
+
+#[tokio::test]
+async fn selecting_cyber_model_in_side_does_not_attach_workspace_permissions() {
+    let mut app = make_test_app().await;
+    let mut model = app
+        .model_catalog
+        .try_list_models()
+        .expect("model catalog")
+        .into_iter()
+        .find(|model| model.model == "gpt-5.5")
+        .expect("gpt-5.5 model");
+    model.model_specialty = Some(MODEL_SPECIALTY_CYBER.to_string());
+    app.model_catalog = Arc::new(ModelCatalog::new(vec![model]));
+    let main_thread_id = ThreadId::new();
+    let side_thread_id = ThreadId::new();
+    app.active_thread_id = Some(side_thread_id);
+    app.side_threads
+        .insert(side_thread_id, SideThreadState::new(main_thread_id));
+
+    let params = app
+        .active_thread_model_setting_update_params("gpt-5.5".to_string())
+        .expect("active SIDE should produce update params");
+
+    assert_eq!(params.permissions, None);
+    assert_eq!(params.approval_policy, None);
+    assert_eq!(params.approvals_reviewer, None);
 }
 
 #[tokio::test]

@@ -168,6 +168,11 @@ pub(crate) struct DynamicToolMcpServer {
 }
 
 impl DynamicToolMcpServer {
+    #[cfg(test)]
+    pub(crate) fn test_server_config(&self) -> &Value {
+        &self.config
+    }
+
     pub(crate) fn suspend(&self) {
         self.workflow.suspend();
     }

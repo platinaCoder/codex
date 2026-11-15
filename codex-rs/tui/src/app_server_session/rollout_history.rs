@@ -10,6 +10,7 @@ use super::is_history_pagination_unsupported;
 use super::started_thread_from_resume_response;
 use super::thread_resume_params_from_config;
 use super::thread_session_state_from_thread_response;
+use super::validate_task_read_policy;
 use crate::legacy_core::config::Config;
 use codex_app_server_client::TypedRequestError;
 use codex_app_server_protocol::AskForApproval;
@@ -177,30 +178,6 @@ impl AppServerSession {
         if model_settings == ResumeModelSettings::OverrideFromCurrentConfig {
             params.model_provider = self.explicit_model_provider(&config);
         }
-        // Resume authority comes from server-owned persisted thread metadata,
-        // never from a fallible client flag. A loaded thread may ignore client
-        // overrides, so explicitly preserve strictness in both places.
-        let persisted_side = self
-            .thread_read(thread_id, /*include_turns*/ false)
-            .await
-            .ok()
-            .is_some_and(|thread| match thread.thread_source {
-                Some(codex_app_server_protocol::ThreadSource::Feature(source)) => source
-                    .strip_prefix(&format!("{}:", super::PERSISTENT_SIDE_THREAD_SOURCE_PREFIX))
-                    .is_some_and(|main| ThreadId::from_string(main).is_ok()),
-                _ => false,
-            });
-        if persisted_side && !thread_tool_transport.provides_paired_side_tools() {
-            return Err(color_eyre::eyre::eyre!(
-                "SIDE tools are unavailable because the authenticated local MCP server did not start; resolve the startup warning and retry"
-            ));
-        }
-        if persisted_side {
-            params
-                .config
-                .get_or_insert_default()
-                .insert("strict_read_only_tools".to_string(), true.into());
-        }
         thread_tool_transport.configure_resume(&mut params);
         let mut rollout_maintenance_guard = None;
         params.exclude_turns = if self.history_support == ThreadHistorySupport::Paginated {
@@ -261,6 +238,39 @@ impl AppServerSession {
                 ));
             }
         };
+        // The resume response is the authoritative persisted identity. Core has already derived
+        // and enforced the role independently; this TUI check only prevents attaching a SIDE
+        // whose authenticated ticket transport is unavailable, without an extra metadata read
+        // for every ordinary resumed thread.
+        let control_parent = response
+            .thread
+            .parent_thread_id
+            .as_deref()
+            .and_then(|parent| ThreadId::from_string(parent).ok());
+        let persisted_role = codex_protocol::resolve_conversation_role_feature(
+            response
+                .thread
+                .thread_source
+                .as_ref()
+                .and_then(|source| match source {
+                    codex_app_server_protocol::ThreadSource::Feature(feature) => {
+                        Some(feature.as_str())
+                    }
+                    _ => None,
+                }),
+            Some(thread_id),
+            control_parent,
+        );
+        if persisted_role.requires_strict_read_only()
+            && !thread_tool_transport.provides_paired_side_tools()
+        {
+            return Err(color_eyre::eyre::eyre!(
+                "SIDE tools are unavailable because the authenticated local MCP server did not start; resolve the startup warning and retry"
+            ));
+        }
+        if transport_provides_task_tools || self.task_tools_available(thread_id) {
+            validate_task_read_policy(&response.thread)?;
+        }
         self.hydrate_initial_thread_history(
             &mut response.thread,
             response.turns_backwards_cursor.clone(),

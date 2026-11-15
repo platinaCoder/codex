@@ -248,6 +248,8 @@ mod tests {
     use codex_app_server_protocol::ThreadAttachmentUpdatedNotification;
     use codex_app_server_protocol::ThreadSettings;
     use codex_app_server_protocol::ThreadSettingsUpdatedNotification;
+    use codex_app_server_protocol::ThreadTokenUsage;
+    use codex_app_server_protocol::ThreadTokenUsageUpdatedNotification;
     use codex_app_server_protocol::WarningNotification;
     use codex_protocol::ThreadId;
     use codex_protocol::config_types::CollaborationMode;
@@ -384,5 +386,27 @@ mod tests {
         let target = server_notification_thread_target(&notification);
 
         assert_eq!(target, ServerNotificationThreadTarget::Thread(thread_id));
+    }
+
+    #[test]
+    fn token_usage_notifications_route_by_canonical_thread_id_independent_of_focus() {
+        let first_thread_id = ThreadId::new();
+        let second_thread_id = ThreadId::new();
+        let notification_for = |thread_id: ThreadId| {
+            ServerNotification::ThreadTokenUsageUpdated(ThreadTokenUsageUpdatedNotification {
+                thread_id: thread_id.to_string(),
+                turn_id: "turn-1".to_string(),
+                token_usage: ThreadTokenUsage::default(),
+            })
+        };
+
+        assert_eq!(
+            server_notification_thread_target(&notification_for(first_thread_id)),
+            ServerNotificationThreadTarget::Thread(first_thread_id)
+        );
+        assert_eq!(
+            server_notification_thread_target(&notification_for(second_thread_id)),
+            ServerNotificationThreadTarget::Thread(second_thread_id)
+        );
     }
 }

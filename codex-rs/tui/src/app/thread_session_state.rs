@@ -3,7 +3,6 @@ use crate::session_state::ThreadSessionState;
 use codex_app_server_protocol::AskForApproval;
 use codex_app_server_protocol::Thread;
 use codex_protocol::ThreadId;
-use codex_protocol::models::ActivePermissionProfile;
 use codex_protocol::models::PermissionProfile;
 
 impl App {
@@ -75,17 +74,43 @@ impl App {
         thread_id: ThreadId,
         thread: &Thread,
     ) -> ThreadSessionState {
-        let permission_profile = self.current_permission_profile();
-        let active_permission_profile = self.current_active_permission_profile();
-        let mut session = if let Some(mut session) = self.primary_session_configured.clone() {
-            if session.thread_id != thread_id {
-                // `thread/read` does not include all thread settings, so do not carry
-                // thread-scoped state from the currently active session.
-                session.collaboration_mode = None;
-                session.daybreak_enabled = false;
-            }
+        let role = codex_protocol::resolve_conversation_role_feature(
+            thread
+                .thread_source
+                .as_ref()
+                .and_then(|source| match source {
+                    codex_app_server_protocol::ThreadSource::Feature(feature) => {
+                        Some(feature.as_str())
+                    }
+                    _ => None,
+                }),
+            Some(thread_id),
+            thread
+                .parent_thread_id
+                .as_deref()
+                .and_then(|parent| ThreadId::from_string(parent).ok()),
+        );
+        let cached_session = if let Some(channel) = self.thread_event_channels.get(&thread_id) {
+            channel.store.lock().await.session.clone()
+        } else {
+            None
+        };
+        let mut session = if let Some(session) = cached_session.or_else(|| {
+            self.primary_session_configured
+                .clone()
+                .filter(|session| session.thread_id == thread_id)
+        }) {
             session
         } else {
+            let permission_profile = self
+                .role_startup_config
+                .permissions
+                .permission_profile()
+                .clone();
+            let active_permission_profile = self
+                .role_startup_config
+                .permissions
+                .active_permission_profile();
             ThreadSessionState {
                 daybreak_enabled: false,
                 windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
@@ -93,19 +118,19 @@ impl App {
                 forked_from_id: None,
                 fork_parent_title: None,
                 thread_name: None,
-                model: self.chat_widget.current_model().to_string(),
-                model_provider_id: self.config.model_provider_id.clone(),
-                service_tier: self.chat_widget.current_service_tier().map(str::to_string),
+                model: self.role_startup_config.model.clone().unwrap_or_default(),
+                model_provider_id: self.role_startup_config.model_provider_id.clone(),
+                service_tier: self.role_startup_config.service_tier.clone(),
                 approval_policy: AskForApproval::from(
-                    self.config.permissions.approval_policy.value(),
+                    self.role_startup_config.permissions.approval_policy.value(),
                 ),
-                approvals_reviewer: self.config.approvals_reviewer,
-                permission_profile: permission_profile.clone(),
-                active_permission_profile: active_permission_profile.clone(),
+                approvals_reviewer: self.role_startup_config.approvals_reviewer,
+                permission_profile,
+                active_permission_profile,
                 cwd: thread.cwd.clone(),
-                runtime_workspace_roots: self.config.workspace_roots.clone(),
+                runtime_workspace_roots: self.role_startup_config.workspace_roots.clone(),
                 instruction_source_paths: Vec::new(),
-                reasoning_effort: self.chat_widget.current_reasoning_effort(),
+                reasoning_effort: self.role_startup_config.model_reasoning_effort.clone(),
                 collaboration_mode: None,
                 message_history: None,
                 network_proxy: None,
@@ -119,8 +144,6 @@ impl App {
         session.thread_name = thread.name.clone();
         session.model_provider_id = thread.model_provider.clone();
         session.set_cwd_retargeting_implicit_runtime_workspace_root(thread.cwd.clone());
-        session.permission_profile = permission_profile;
-        session.active_permission_profile = active_permission_profile;
         session.instruction_source_paths = Vec::new();
         session.rollout_path = thread.path.clone();
         if let Some(model) = &thread.model {
@@ -128,23 +151,13 @@ impl App {
         } else if thread.path.is_some() {
             session.model.clear();
         }
+        if role.requires_strict_read_only() {
+            session.approval_policy = AskForApproval::Never;
+            session.permission_profile = PermissionProfile::read_only();
+            session.active_permission_profile = None;
+        }
         session.message_history = None;
         session
-    }
-
-    fn current_permission_profile(&self) -> PermissionProfile {
-        self.chat_widget
-            .config_ref()
-            .permissions
-            .permission_profile()
-            .clone()
-    }
-
-    fn current_active_permission_profile(&self) -> Option<ActivePermissionProfile> {
-        self.chat_widget
-            .config_ref()
-            .permissions
-            .active_permission_profile()
     }
 }
 
@@ -160,6 +173,7 @@ mod tests {
     use codex_app_server_protocol::AskForApproval;
     use codex_config::types::ApprovalsReviewer;
     use codex_protocol::config_types::ServiceTier;
+    use codex_protocol::models::ActivePermissionProfile;
     use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_WORKSPACE;
     use codex_protocol::models::ManagedFileSystemPermissions;
     use codex_protocol::models::PermissionProfile;
@@ -401,7 +415,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn thread_read_fallback_uses_active_permission_settings() {
+    async fn thread_read_fallback_uses_stable_startup_permission_settings() {
         let mut app = make_test_app().await;
         let primary_thread_id =
             ThreadId::from_string("00000000-0000-0000-0000-000000000404").expect("valid thread");
@@ -454,17 +468,90 @@ mod tests {
             .await;
 
         let expected_permission_profile = app
-            .chat_widget
-            .config_ref()
+            .role_startup_config
             .permissions
             .permission_profile()
             .clone();
         assert_eq!(session.permission_profile, expected_permission_profile);
         assert_ne!(
             session.permission_profile,
-            app.config.permissions.permission_profile().clone(),
-            "thread/read fallback must use the active widget permissions rather than stale app \
-             config defaults"
+            app.chat_widget
+                .config_ref()
+                .permissions
+                .permission_profile()
+                .clone(),
+            "thread/read fallback must not borrow the active widget permissions"
         );
+    }
+
+    #[tokio::test]
+    async fn thread_read_clamps_valid_and_conflicting_side_identity_to_role_ceiling() {
+        let mut app = make_test_app().await;
+        app.role_startup_config
+            .permissions
+            .set_permission_profile(PermissionProfile::workspace_write())
+            .expect("test startup profile should be configurable");
+        let main_thread_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000411").expect("valid thread");
+        let conflicting_main_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000412").expect("valid thread");
+
+        for (side_thread_id, control_parent) in [
+            (
+                ThreadId::from_string("00000000-0000-0000-0000-000000000413")
+                    .expect("valid thread"),
+                main_thread_id,
+            ),
+            (
+                ThreadId::from_string("00000000-0000-0000-0000-000000000414")
+                    .expect("valid thread"),
+                conflicting_main_id,
+            ),
+        ] {
+            let thread = Thread {
+                originator: None,
+                environments: None,
+                id: side_thread_id.to_string(),
+                extra: None,
+                session_id: side_thread_id.to_string(),
+                forked_from_id: None,
+                parent_thread_id: Some(control_parent.to_string()),
+                preview: "side thread".to_string(),
+                ephemeral: false,
+                section: None,
+                section_entered_at: None,
+                project_id: None,
+                daybreak_enabled: None,
+                history_mode: Default::default(),
+                model_provider: "read-provider".to_string(),
+                model: None,
+                reasoning_effort: None,
+                created_at: 1,
+                updated_at: 2,
+                recency_at: Some(2),
+                status: codex_app_server_protocol::ThreadStatus::Idle,
+                path: None,
+                cwd: test_path_buf("/tmp/side-read").abs(),
+                cli_version: "0.0.0".to_string(),
+                source: codex_app_server_protocol::SessionSource::Unknown,
+                can_accept_direct_input: None,
+                thread_source: Some(codex_app_server_protocol::ThreadSource::Feature(format!(
+                    "{}:{main_thread_id}",
+                    codex_protocol::AI_LAB_SIDE_THREAD_SOURCE_PREFIX
+                ))),
+                agent_nickname: None,
+                agent_role: None,
+                git_info: None,
+                name: Some("side thread".to_string()),
+                turns: Vec::new(),
+            };
+
+            let session = app
+                .session_state_for_thread_read(side_thread_id, &thread)
+                .await;
+            assert_eq!(session.approval_policy, AskForApproval::Never);
+            assert_eq!(session.permission_profile, PermissionProfile::read_only());
+            assert_eq!(session.active_permission_profile, None);
+        }
     }
 }
