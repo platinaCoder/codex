@@ -178,44 +178,14 @@ impl DynamicToolMcpServer {
     }
 
     pub(crate) fn retry_pending_ticket_notifications(&self) {
-        if !self.task_tools {
-            return;
-        }
-        if self.workflow.connection().is_err() {
-            return;
-        }
-        if !self.workflow.claim_retry() {
-            return;
-        }
-        let mut thread_start_params = self.thread_start_params.clone();
-        thread_start_params.config.get_or_insert_default().insert(
-            format!("mcp_servers.{}", self.namespace),
-            self.config.clone(),
+        launch_ticket_retry(
+            &self.workflow,
+            self.task_tools,
+            &self.thread_start_params,
+            self.namespace,
+            &self.config,
+            &self.features,
         );
-        let features = self.features.clone();
-        let workflow = Arc::clone(&self.workflow);
-        tokio::spawn(async move {
-            loop {
-                let Ok((handle, app_event_tx)) = workflow.connection() else {
-                    workflow.release_retry();
-                    break;
-                };
-                if let Err(error) = dynamic_tools::retry_pending_ticket_notifications(
-                    handle,
-                    thread_start_params.clone(),
-                    features.clone(),
-                    app_event_tx,
-                )
-                .await
-                {
-                    tracing::warn!(%error, "pending ticket notification retry pump failed");
-                }
-                if !workflow.take_retry_request() {
-                    workflow.release_retry();
-                    break;
-                }
-            }
-        });
     }
 
     pub(crate) async fn start(
@@ -272,7 +242,7 @@ impl DynamicToolMcpServer {
             workflow: Arc::clone(&workflow),
             thread_start_params: thread_start_params.clone(),
             features: features.clone(),
-            status_updates,
+            status_updates: status_updates.clone(),
             server_config: server_config.clone(),
             services,
         };
@@ -288,9 +258,41 @@ impl DynamicToolMcpServer {
                     authorization,
                     require_authorization,
                 ));
+        let retry_workflow = Arc::clone(&workflow);
+        let retry_params = thread_start_params.clone();
+        let retry_config = server_config.clone();
+        let retry_features = features.clone();
+        let mut statuses = status_updates.subscribe();
         let task = tokio::spawn(async move {
-            if let Err(error) = axum::serve(listener, router).await {
-                tracing::warn!(%error, "TUI task-tools MCP server stopped");
+            use std::future::IntoFuture;
+            let serving = axum::serve(listener, router).into_future();
+            tokio::pin!(serving);
+            let mut timer = tokio::time::interval(std::time::Duration::from_secs(5));
+            timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    result = &mut serving => {
+                        if let Err(error) = result { tracing::warn!(%error, "TUI task-tools MCP server stopped"); }
+                        break;
+                    }
+                    _ = timer.tick() => {}
+                    status = statuses.recv() => {
+                        match status {
+                            Ok(status) if matches!(status.status, codex_app_server_protocol::ThreadStatus::Idle) => {}
+                            Ok(_) => continue,
+                            Err(broadcast::error::RecvError::Lagged(_)) => {}
+                            Err(broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                }
+                launch_ticket_retry(
+                    &retry_workflow,
+                    task_tools,
+                    &retry_params,
+                    namespace,
+                    &retry_config,
+                    &retry_features,
+                );
             }
         });
         let server = Self {
@@ -307,8 +309,55 @@ impl DynamicToolMcpServer {
     }
 }
 
+fn launch_ticket_retry(
+    workflow: &Arc<TicketWorkflowCoordinator>,
+    task_tools: bool,
+    thread_start_params: &ThreadStartParams,
+    namespace: &str,
+    server_config: &Value,
+    features: &Features,
+) {
+    if !task_tools {
+        return;
+    }
+    if workflow.connection().is_err() {
+        return;
+    }
+    let Some(mut retry_permit) = workflow.claim_retry() else {
+        return;
+    };
+    let mut thread_start_params = thread_start_params.clone();
+    thread_start_params
+        .config
+        .get_or_insert_default()
+        .insert(format!("mcp_servers.{}", namespace), server_config.clone());
+    let features = features.clone();
+    let workflow = Arc::clone(workflow);
+    tokio::spawn(async move {
+        loop {
+            let Ok((handle, app_event_tx)) = workflow.connection() else {
+                break;
+            };
+            if let Err(error) = dynamic_tools::retry_pending_ticket_notifications(
+                handle,
+                thread_start_params.clone(),
+                features.clone(),
+                app_event_tx,
+            )
+            .await
+            {
+                tracing::warn!(%error, "pending ticket notification retry pump failed");
+            }
+            if !retry_permit.finish_pass() {
+                break;
+            }
+        }
+    });
+}
+
 impl Drop for DynamicToolMcpServer {
     fn drop(&mut self) {
+        self.workflow.suspend();
         self.task.abort();
     }
 }
@@ -475,37 +524,51 @@ impl ServerHandler for DynamicToolMcpHandler {
             .workflow
             .connection()
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-        let response = if matches!(
-            params.tool.as_str(),
-            "create_worktree" | "get_worktree_creation_status" | "list_worktrees"
-        ) {
-            let service = self.services.worktrees.as_ref().ok_or_else(|| {
-                McpError::invalid_params("Worktree tools are unavailable on this connection", None)
-            })?;
-            service
-                .execute(
-                    request_handle,
-                    params.thread_id,
-                    &params.tool,
-                    params.arguments,
-                )
-                .await
-        } else {
-            if !self.services.task_tools {
-                return Err(McpError::invalid_params(
-                    "Task tools are unavailable on this connection",
-                    None,
-                ));
-            }
-            dynamic_tools::execute(
-                request_handle,
-                params,
-                thread_start_params,
-                self.features.clone(),
-                self.status_updates.subscribe(),
-                Some(&app_event_tx),
+        let operation = async {
+            Ok::<_, McpError>(
+                if matches!(
+                    params.tool.as_str(),
+                    "create_worktree" | "get_worktree_creation_status" | "list_worktrees"
+                ) {
+                    let service = self.services.worktrees.as_ref().ok_or_else(|| {
+                        McpError::invalid_params(
+                            "Worktree tools are unavailable on this connection",
+                            None,
+                        )
+                    })?;
+                    service
+                        .execute(
+                            request_handle,
+                            params.thread_id,
+                            &params.tool,
+                            params.arguments,
+                        )
+                        .await
+                } else {
+                    if !self.services.task_tools {
+                        return Err(McpError::invalid_params(
+                            "Task tools are unavailable on this connection",
+                            None,
+                        ));
+                    }
+                    dynamic_tools::execute(
+                        request_handle,
+                        params,
+                        thread_start_params,
+                        self.features.clone(),
+                        self.status_updates.subscribe(),
+                        Some(&app_event_tx),
+                    )
+                    .await
+                },
             )
-            .await
+        };
+        let response = tokio::select! {
+            result = operation => result?,
+            _ = context.ct.cancelled() => return Err(McpError::internal_error(
+                "task call cancelled; a submitted mutation may already have committed; inspect canonical state", None)),
+            _ = tokio::time::sleep(std::time::Duration::from_secs(300)) => return Err(McpError::internal_error(
+                "task call timed out; inspect canonical state before retrying a mutation", None)),
         };
         let content = response
             .content_items
@@ -528,3 +591,7 @@ impl ServerHandler for DynamicToolMcpHandler {
         .into())
     }
 }
+
+#[cfg(test)]
+#[path = "dynamic_tools_mcp_tests.rs"]
+mod tests;

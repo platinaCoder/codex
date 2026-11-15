@@ -185,6 +185,7 @@ struct ResumeOrReassignTicketArguments {
 
 #[derive(Clone)]
 struct TicketAssignmentContext {
+    review_only: bool,
     ticket_id: u64,
     approved_revision: u64,
     assignee_thread_id: String,
@@ -706,6 +707,17 @@ fn success_response(value: Value) -> Result<DynamicToolCallResponse, String> {
     })
 }
 
+// Filesystem locks and fsync must not block the async executor. The closure
+// owns only the short canonical store transaction, never a network/user wait.
+async fn ticket_store_operation<T: Send + 'static>(
+    operation: impl FnOnce() -> crate::ticket_store::Result<T> + Send + 'static,
+) -> Result<T, String> {
+    tokio::task::spawn_blocking(operation)
+        .await
+        .map_err(|error| format!("ticket store worker failed: {error}"))?
+        .map_err(|error| error.to_string())
+}
+
 async fn execute_inner(
     handle: AppServerRequestHandle,
     params: DynamicToolCallParams,
@@ -737,17 +749,20 @@ async fn execute_inner(
             }
             let archive = arguments.include_archived.unwrap_or(false);
             let limit = arguments.limit.unwrap_or(100);
-            let tickets = if side {
-                store.list(archive, limit)
-            } else {
-                store.list_assigned(&params.thread_id, archive, limit)
-            }
-            .map_err(|error| error.to_string())?;
-            let store_id = if tickets.is_empty() {
-                store.store_id().ok()
-            } else {
-                Some(store.store_id().map_err(|error| error.to_string())?)
-            };
+            let (tickets, store_id) = ticket_store_operation(move || {
+                let tickets = if side {
+                    store.list(archive, limit)
+                } else {
+                    store.list_assigned(&params.thread_id, archive, limit)
+                }?;
+                let store_id = if tickets.is_empty() {
+                    store.store_id().ok()
+                } else {
+                    Some(store.store_id()?)
+                };
+                Ok((tickets, store_id))
+            })
+            .await?;
             Ok(json!({
                 "schemaVersion": 1,
                 "formatVersion": 3,
@@ -766,12 +781,14 @@ async fn execute_inner(
             if side {
                 paired_main_thread_id(&handle, &params.thread_id).await?;
             }
-            let document = if side {
-                store.read(arguments.ticket_id)
-            } else {
-                store.read_assigned(arguments.ticket_id, &params.thread_id)
-            }
-            .map_err(|error| error.to_string())?;
+            let document = ticket_store_operation(move || {
+                if side {
+                    store.read(arguments.ticket_id)
+                } else {
+                    store.read_assigned(arguments.ticket_id, &params.thread_id)
+                }
+            })
+            .await?;
             let metadata = json!({
                 "ticket": document.ticket,
                 "commentRevision": document.comment_revision,
@@ -830,8 +847,8 @@ async fn execute_inner(
             let store =
                 crate::ticket_store::TicketStore::from_workspace_roots(&ticket_workspace_roots)
                     .map_err(|error| error.to_string())?;
-            let document = store
-                .append_comment(
+            let document = ticket_store_operation(move || {
+                store.append_comment(
                     arguments.ticket_id,
                     arguments.expected_comment_revision,
                     crate::ticket_store::Source {
@@ -843,7 +860,8 @@ async fn execute_inner(
                     arguments.category,
                     arguments.body,
                 )
-                .map_err(|error| error.to_string())?;
+            })
+            .await?;
             if let Some(app_event_tx) = app_event_tx {
                 app_event_tx.send(AppEvent::TicketStoreChanged);
             }
@@ -1587,37 +1605,15 @@ async fn execute_inner(
                 .map_err(|error| error.to_string())?;
             let mut document = binding.document;
             if binding.notification_required {
-                let notification = format!(
-                    "Ticket #{} was reported implementation-complete and verified by its bound MAIN turn. Its lifecycle is now Awaiting Review. Review the result; do not accept it automatically.",
-                    document.ticket.id
-                );
-                let sent = send_delegated_message(
+                document = deliver_ready_notification(
                     &handle,
                     &features,
                     app_event_tx,
-                    &params.thread_id,
-                    &binding.side_thread_id,
-                    notification,
-                    /*model*/ None,
-                    /*mcp_config*/ None,
-                    "report_ticket_ready",
-                    /*ticket_context*/ None,
+                    mcp_config,
+                    &store,
+                    document,
                 )
-                .await
-                .map_err(|error| {
-                    format!(
-                        "ticket #{} is Awaiting Review, but SIDE notification failed: {error}",
-                        document.ticket.id
-                    )
-                })?;
-                document = store
-                    .record_ready_notification(&params.thread_id, &params.turn_id, &sent.turn_id)
-                    .map_err(|error| {
-                        format!(
-                            "ticket #{} is Awaiting Review and SIDE was notified in turn {}, but notification provenance could not be recorded: {error}",
-                            document.ticket.id, sent.turn_id
-                        )
-                    })?;
+                .await?;
             }
             if binding.transitioned || binding.notification_required {
                 if let Some(app_event_tx) = app_event_tx {
@@ -2275,8 +2271,12 @@ pub(crate) async fn retry_pending_ticket_notifications(
         .runtime_workspace_roots
         .clone()
         .unwrap_or_default();
-    let store = crate::ticket_store::TicketStore::from_workspace_roots(&ticket_workspace_roots)
-        .map_err(|error| error.to_string())?;
+    let store =
+        match crate::ticket_store::TicketStore::from_workspace_roots(&ticket_workspace_roots) {
+            Ok(store) => store,
+            Err(crate::ticket_store::Error::NoRoot) => return Ok(0),
+            Err(error) => return Err(error.to_string()),
+        };
     let pending = store
         .pending_notifications()
         .map_err(|error| error.to_string())?;
@@ -2297,26 +2297,46 @@ pub(crate) async fn retry_pending_ticket_notifications(
             .ok_or_else(|| format!("pending ticket {ticket_id} has no durable assignment"))?
             .assigned_by_side_thread_id
             .clone();
-        let check = crate::ticket_store::ImplementCheck::Pending(document);
-        let message = ticket_notification_message(&check, ticket_id)?;
         let delivery_handle = handle.clone();
         let delivery_features = features.clone();
         let delivery_events = app_event_tx.clone();
         let delivery_store = store.clone();
         let delivery_config = mcp_config.clone();
         deliveries.spawn(async move {
-            let result = deliver_ticket_notification(
-                &delivery_handle,
-                &delivery_features,
-                Some(&delivery_events),
-                delivery_config,
-                &delivery_store,
-                &source_thread_id,
-                check,
-                "ticket_notification_retry_pump",
-                message,
-            )
-            .await;
+            let delivery = async {
+                if document.ticket.status == crate::ticket_store::Status::AwaitingReview {
+                    deliver_ready_notification(
+                        &delivery_handle,
+                        &delivery_features,
+                        Some(&delivery_events),
+                        delivery_config,
+                        &delivery_store,
+                        document,
+                    )
+                    .await
+                    .map(|document| json!({"ticketId":document.ticket.id}))
+                } else {
+                    let check = crate::ticket_store::ImplementCheck::Pending(document);
+                    let message = ticket_notification_message(&check, ticket_id)?;
+                    deliver_ticket_notification(
+                        &delivery_handle,
+                        &delivery_features,
+                        Some(&delivery_events),
+                        delivery_config,
+                        &delivery_store,
+                        &source_thread_id,
+                        check,
+                        "ticket_notification_retry_pump",
+                        message,
+                    )
+                    .await
+                }
+            };
+            let result = tokio::time::timeout(Duration::from_secs(30), delivery)
+                .await
+                .unwrap_or_else(|_| {
+                    Err("ticket delivery timed out; durable event remains pending".into())
+                });
             (ticket_id, result)
         });
         if deliveries.len() >= 4 {
@@ -2413,6 +2433,8 @@ async fn find_ticket_notification_turn_once(
 
 fn notification_turn_id(turns: &[Turn], notification_id: &str) -> Option<String> {
     turns.iter().find_map(|turn| {
+        // Idempotent turn IDs exist before the first user-message item is flushed.
+        if turn.id == notification_id { return Some(turn.id.clone()); }
         turn.items
             .iter()
             .any(|item| {
@@ -2468,6 +2490,7 @@ async fn deliver_ticket_notification(
         .as_ref()
         .ok_or_else(|| "committed ticket is missing its durable assignment".to_string())?;
     let assignment_context = TicketAssignmentContext {
+        review_only: false,
         ticket_id: document.ticket.id,
         approved_revision: assignment.approved_revision,
         assignee_thread_id: assignment.assigned_to.clone(),
@@ -2550,6 +2573,75 @@ async fn deliver_ticket_notification(
     }))
 }
 
+fn ready_notification_id(assignment: &crate::ticket_store::Assignment) -> String {
+    use sha2::{Digest, Sha256};
+    let hash = Sha256::digest(
+        format!(
+            "ticket-ready:{}:{}",
+            assignment.notification_id,
+            assignment.ready_turn_id.as_deref().unwrap_or_default()
+        )
+        .as_bytes(),
+    );
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&hash[..16]);
+    Uuid::from_bytes(bytes).to_string()
+}
+
+async fn deliver_ready_notification(
+    handle: &AppServerRequestHandle,
+    features: &Features,
+    app_event_tx: Option<&AppEventSender>,
+    mcp_config: Option<HashMap<String, Value>>,
+    store: &crate::ticket_store::TicketStore,
+    document: crate::ticket_store::Document,
+) -> Result<crate::ticket_store::Document, String> {
+    let assignment = document
+        .ticket
+        .assignment
+        .as_ref()
+        .ok_or("missing ready assignment")?;
+    let main_turn = assignment
+        .ready_turn_id
+        .as_deref()
+        .ok_or("missing ready turn")?;
+    let current = store
+        .report_implementation_ready(&assignment.assigned_to, main_turn)
+        .map_err(|error| error.to_string())?;
+    if !current.notification_required {
+        return Ok(current.document);
+    }
+    let side = &assignment.assigned_by_side_thread_id;
+    let paired_main = paired_main_thread_id(handle, side).await?;
+    if !same_thread_id(&paired_main, &assignment.assigned_to) {
+        return Err("ready notification SIDE is no longer paired with the assigned MAIN".into());
+    }
+    let event_id = ready_notification_id(assignment);
+    let context = TicketAssignmentContext {
+        review_only: true,
+        ticket_id: document.ticket.id,
+        approved_revision: assignment.approved_revision,
+        assignee_thread_id: assignment.assigned_to.clone(),
+        notification_id: event_id.clone(),
+    };
+    let turn_id = if let Some(turn_id) =
+        find_ticket_notification_turn_once(handle, side, &event_id).await?
+    {
+        turn_id
+    } else {
+        send_delegated_message(handle, features, app_event_tx, &assignment.assigned_to, side,
+            format!("Ticket #{} was reported implementation-complete and verified by its bound MAIN turn. Its lifecycle is now Awaiting Review. Review the result; do not accept it automatically.", document.ticket.id),
+            None, mcp_config, "report_ticket_ready", Some(&context)).await?.turn_id
+    };
+    let updated = store
+        .record_ready_notification(&assignment.assigned_to, main_turn, &turn_id)
+        .map_err(|error| error.to_string())?;
+    if let Some(events) = app_event_tx {
+        events.send(AppEvent::TicketStoreChanged);
+    }
+    Ok(updated)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn send_delegated_message(
     handle: &AppServerRequestHandle,
@@ -2574,6 +2666,9 @@ async fn send_delegated_message(
     };
     validate_prompt(&prompt, MAX_DELEGATED_INPUT_BYTES)?;
     let thread = read_thread(handle, target_thread_id).await?;
+    if ticket_context.is_some() && matches!(thread.status, ThreadStatus::Active { .. }) {
+        return Err("ticket notification remains queued while its assignee is busy".into());
+    }
     let exclude_turns = thread.history_mode == ThreadHistoryMode::Paginated;
     let resumed: ThreadResumeResponse =
         request_with_history_fallback(handle, exclude_turns, |request_id, exclude_turns| {
@@ -2632,6 +2727,7 @@ async fn start_turn(
     ticket_context: Option<&TicketAssignmentContext>,
 ) -> Result<TurnStartResponse, String> {
     let (responsesapi_client_metadata_patch, additional_context) = ticket_context
+        .filter(|context| !context.review_only)
         .map(|context| {
             let binding = format!(
                 "v2:{}:{}:{}",

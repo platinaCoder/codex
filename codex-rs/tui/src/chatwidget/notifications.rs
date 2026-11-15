@@ -21,6 +21,11 @@ impl ChatWidget {
                 self.pending_notification = Some(notification);
             }
         }
+        // These are desktop summaries only. The app's thread-keyed request
+        // maps and canonical ticket outbox retain the actual pending work.
+        while self.pending_notifications.len() > 64 {
+            self.pending_notifications.pop_front();
+        }
         self.request_redraw();
     }
 

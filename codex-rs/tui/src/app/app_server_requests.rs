@@ -950,6 +950,63 @@ mod tests {
     }
 
     #[test]
+    fn main_side_mcp_approvals_remain_independent_in_either_resolution_order() {
+        for reverse in [false, true] {
+            let mut pending = PendingAppServerRequests::default();
+            for thread in ["main", "side"] {
+                for id in 1..=2 {
+                    assert_eq!(
+                        pending.note_server_request(&ServerRequest::McpServerElicitationRequest {
+                            request_id: AppServerRequestId::Integer(id),
+                            params: McpServerElicitationRequestParams {
+                                thread_id: thread.into(),
+                                turn_id: Some(format!("{thread}-turn")),
+                                server_name: "codex_tui".into(),
+                                request: McpServerElicitationRequest::Form {
+                                    meta: None,
+                                    message: "ticket approval".into(),
+                                    requested_schema: McpElicitationSchema {
+                                        schema_uri: None,
+                                        type_: McpElicitationObjectType::Object,
+                                        properties: BTreeMap::new(),
+                                        required: None,
+                                    },
+                                },
+                            },
+                        }),
+                        None
+                    );
+                }
+            }
+            let order = if reverse {
+                ["side", "main"]
+            } else {
+                ["main", "side"]
+            };
+            for thread in order {
+                for id in [2, 1] {
+                    let op = Op::ResolveElicitation {
+                        server_name: "codex_tui".into(),
+                        request_id: AppServerRequestId::Integer(id),
+                        decision: if thread == "side" {
+                            McpServerElicitationAction::Decline
+                        } else {
+                            McpServerElicitationAction::Accept
+                        },
+                        content: None,
+                        meta: None,
+                    };
+                    assert!(pending.take_resolution("unrelated", &op).unwrap().is_none());
+                    let resolved = pending.take_resolution(thread, &op).unwrap().unwrap();
+                    assert_eq!(resolved.request_id, AppServerRequestId::Integer(id));
+                    assert!(pending.take_resolution(thread, &op).unwrap().is_none());
+                }
+            }
+            assert!(pending.mcp_requests.is_empty());
+        }
+    }
+
+    #[test]
     fn correlates_mcp_elicitation_server_request_with_resolution() {
         let mut pending = PendingAppServerRequests::default();
 

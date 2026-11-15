@@ -366,10 +366,45 @@ impl TicketStore {
         }
     }
     pub(crate) fn store_id(&self) -> Result<Uuid> {
-        let _lock = Lock::acquire(&self.root)?;
-        self.identity()?;
-        self.recover_locked()?;
+        let _lock = self.read_lock()?;
         Ok(self.identity()?.store_id)
+    }
+
+    /// Concurrent readers share a stable canonical snapshot. Recovery/migration
+    /// still requires exclusive ownership, and is rechecked after reacquiring.
+    fn read_lock(&self) -> Result<Lock> {
+        loop {
+            let lock = Lock::shared(&self.root)?;
+            let identity = self.identity()?;
+            let transactions = self.root.join(".transactions");
+            let pending = if io_at(
+                transactions.try_exists(),
+                "checking ticket transactions",
+                &transactions,
+            )? {
+                reject_symlink(&transactions)?;
+                io_at(
+                    std::fs::read_dir(&transactions),
+                    "reading ticket transactions",
+                    &transactions,
+                )?
+                .next()
+                .transpose()
+                .map_err(|error| {
+                    io_error("reading ticket transaction entry", &transactions, error)
+                })?
+                .is_some()
+            } else {
+                false
+            };
+            if identity.format_version != LEGACY_FORMAT && !pending {
+                return Ok(lock);
+            }
+            drop(lock);
+            let _exclusive = Lock::acquire(&self.root)?;
+            self.identity()?;
+            self.recover_locked()?;
+        }
     }
 
     pub(crate) fn compact_index(&self) -> Result<String> {
@@ -414,9 +449,7 @@ impl TicketStore {
         )? {
             return Ok(Vec::new());
         }
-        let _lock = Lock::acquire(&self.root)?;
-        self.identity()?;
-        self.recover_locked()?;
+        let _lock = self.read_lock()?;
         let mut rows = self.all()?;
         rows.retain(|d| d.ticket.status.terminal() == archive);
         rows.sort_by_key(|d| d.ticket.id);
@@ -455,21 +488,22 @@ impl TicketStore {
         )? {
             return Ok(Vec::new());
         }
-        let _lock = Lock::acquire(&self.root)?;
-        self.identity()?;
-        self.recover_locked()?;
+        let _lock = self.read_lock()?;
         let mut documents = self
             .all()?
             .into_iter()
             .filter(|document| {
-                document.ticket.status == Status::InProgress
-                    && document
-                        .ticket
-                        .assignment
-                        .as_ref()
-                        .is_some_and(|assignment| {
-                            assignment.delivery_state == DeliveryState::Pending
-                        })
+                document
+                    .ticket
+                    .assignment
+                    .as_ref()
+                    .is_some_and(|assignment| {
+                        (document.ticket.status == Status::InProgress
+                            && assignment.delivery_state == DeliveryState::Pending)
+                            || (document.ticket.status == Status::AwaitingReview
+                                && assignment.ready_turn_id.is_some()
+                                && assignment.side_notification_turn_id.is_none())
+                    })
             })
             .collect::<Vec<_>>();
         documents.sort_by_key(|document| document.ticket.id);
@@ -477,9 +511,7 @@ impl TicketStore {
     }
 
     pub(crate) fn read(&self, id: u64) -> Result<Document> {
-        let _lock = Lock::acquire(&self.root)?;
-        self.identity()?;
-        self.recover_locked()?;
+        let _lock = self.read_lock()?;
         self.read_one(id)
     }
     pub(crate) fn create(&self, input: Create) -> Result<Document> {
@@ -1191,11 +1223,14 @@ impl TicketStore {
             return Err(Error::Invalid("comment body is required".into()));
         }
         self.ensure_root()?;
-        let _lock = Lock::acquire(&self.root)?;
-        self.ensure_identity_locked()?;
-        self.identity()?;
-        self.recover_locked()?;
-        let mut document = self.read_one(id)?;
+        // Lifecycle/dependency transactions own the exclusive store lock.
+        // Comments change only one immutable stream, so different tickets can
+        // commit concurrently under the shared store lock and their own lock.
+        let _store_lock = self.read_lock()?;
+        let directory = self.dir(id);
+        reject_symlink(&directory)?;
+        let _ticket_lock = Lock::acquire(&directory)?;
+        let mut document = self.read_one_locked(id)?;
         if document.comment_revision != expected_comment_revision {
             return Err(Error::Stale {
                 expected: expected_comment_revision,
@@ -1670,6 +1705,13 @@ impl TicketStore {
     fn read_one(&self, id: u64) -> Result<Document> {
         let dir = self.dir(id);
         reject_symlink(&dir)?;
+        let _ticket_lock = Lock::shared(&dir)?;
+        self.read_one_locked(id)
+    }
+
+    fn read_one_locked(&self, id: u64) -> Result<Document> {
+        let dir = self.dir(id);
+        reject_symlink(&dir)?;
         if !io_at(
             std::fs::metadata(&dir),
             "reading ticket directory metadata",
@@ -1716,11 +1758,15 @@ impl TicketStore {
                 .and_then(|value| value.to_str())
                 .is_some_and(|name| name.starts_with(".tmp-"))
             {
-                io_at(
-                    std::fs::remove_file(&path),
-                    "removing abandoned comment transaction",
-                    &path,
-                )?;
+                if let Err(error) = std::fs::remove_file(&path)
+                    && error.kind() != std::io::ErrorKind::NotFound
+                {
+                    return Err(io_error(
+                        "removing abandoned comment transaction",
+                        &path,
+                        error,
+                    ));
+                }
                 continue;
             }
             let id = path
@@ -1755,7 +1801,7 @@ impl TicketStore {
             &comments_dir,
         )? {
             io_at(
-                std::fs::create_dir(&comments_dir),
+                std::fs::create_dir_all(&comments_dir),
                 "creating comments directory",
                 &comments_dir,
             )?;
@@ -2739,6 +2785,12 @@ fn sync_dir(path: &Path) -> Result<()> {
 struct Lock(File);
 impl Lock {
     fn acquire(root: &Path) -> Result<Self> {
+        Self::open(root, false)
+    }
+    fn shared(root: &Path) -> Result<Self> {
+        Self::open(root, true)
+    }
+    fn open(root: &Path, shared: bool) -> Result<Self> {
         let p = root.join(".lock");
         if io_at(p.try_exists(), "checking ticket store lock", &p)? {
             reject_symlink(&p)?;
@@ -2754,7 +2806,13 @@ impl Lock {
         #[cfg(unix)]
         {
             use std::os::fd::AsRawFd;
-            if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            if unsafe {
+                libc::flock(
+                    f.as_raw_fd(),
+                    if shared { libc::LOCK_SH } else { libc::LOCK_EX },
+                )
+            } != 0
+            {
                 return Err(io_error(
                     "locking ticket store lock",
                     &p,
@@ -2865,6 +2923,76 @@ mod tests {
             )
             .unwrap()
     }
+    #[test]
+    fn ready_outbox_survives_cold_open_until_acknowledged() {
+        let lab = lab();
+        let store = TicketStore::test(lab.path());
+        let ticket = store.create(input("ready recovery", vec![])).unwrap();
+        let source = ticket.ticket.source.clone();
+        // Use the exact normal lifecycle fixture, then emulate a committed ready
+        // transition whose notification has not yet been acknowledged.
+        let accepted = advance_to_accepted(&store, ticket.ticket.id, &source);
+        let mut ready = accepted;
+        ready.ticket.status = Status::AwaitingReview;
+        ready.ticket.assignment.as_mut().unwrap().side_notification_turn_id = None;
+        { let _lock = Lock::acquire(&store.root).unwrap(); store.transactional_replace(&[ready]).unwrap(); }
+        let reopened = TicketStore::test(lab.path());
+        let pending = reopened.pending_notifications().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].ticket.id, ticket.ticket.id);
+        reopened.record_ready_notification("main", "main-implementation-turn", "side-ready-event").unwrap();
+        assert!(TicketStore::test(lab.path()).pending_notifications().unwrap().is_empty());
+    }
+
+    #[test]
+    fn comments_on_other_tickets_progress_while_one_ticket_is_locked() {
+        let lab = lab();
+        let store = Arc::new(TicketStore::test(lab.path()));
+        store.create(input("first", vec![])).unwrap();
+        let second = store.create(input("second", vec![])).unwrap();
+        let _snapshot = store.read_lock().unwrap();
+        let held = Lock::acquire(&store.dir(1)).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let other = Arc::clone(&store);
+        let writer = thread::spawn(move || {
+            tx.send(
+                other
+                    .append_comment(
+                        2,
+                        0,
+                        second.ticket.source,
+                        1,
+                        CommentCategory::Finding,
+                        "independent write".into(),
+                    )
+                    .map(|d| d.comment_revision),
+            )
+            .unwrap();
+        });
+        let result = rx.recv_timeout(std::time::Duration::from_secs(5));
+        drop(held);
+        writer.join().unwrap();
+        assert_eq!(result.unwrap().unwrap(), 1);
+    }
+
+    #[test]
+    fn read_snapshots_overlap() {
+        let lab = lab();
+        let store = Arc::new(TicketStore::test(lab.path()));
+        let ticket = store.create(input("shared snapshot", vec![])).unwrap();
+        let snapshot = store.read_lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reader = Arc::clone(&store);
+        let read = thread::spawn(move || {
+            let result = reader.read(ticket.ticket.id);
+            tx.send(result.map(|doc| doc.ticket.title)).unwrap();
+        });
+        let observed = rx.recv_timeout(std::time::Duration::from_secs(5));
+        drop(snapshot);
+        read.join().unwrap();
+        assert_eq!(observed.unwrap().unwrap(), "shared snapshot");
+    }
+
     #[test]
     fn concurrent_ids_and_interrupted_creation() {
         let d = lab();
