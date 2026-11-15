@@ -94,3 +94,25 @@ The promotion script is tested with a fake daemon launcher in a temporary home:
 validation is non-mutating, a busy install lock fails promptly, an existing
 entrypoint symlink is accepted, and fd 9 is not inherited by the update launcher.
 No production installation or daemon restart is part of validation.
+
+Review blocker 7 — human browsing versus model authority
+The cf0c3e7 human browser incorrectly reused MAIN assignment filters. A fresh
+isolated terminal reproduced its zero-ticket catalog despite repository fixtures.
+The strip/inbox and host /ticket detail overlay now use repository list/read;
+model-invoked MAIN tools still use list_assigned/read_assigned. SIDE tools retain
+repository-wide read access. The overlay does not submit model context or change
+canonical assignment, approval, lifecycle or comments.
+
+New App event-path regression covers unassigned, current-MAIN and other-MAIN
+active tickets in assigned/fresh sessions and MAIN/SIDE focus, opening each
+local detail overlay, archived-only filtering, and a separate repository. It
+asserts no model operations/events and byte-equivalent serialized documents.
+The real MCP integration additionally checks SIDE catalog/detail access and
+MAIN denial of unassigned/wrong-thread reads and comments. All 47 ticket,
+196 slash-command and 151 SIDE tests pass (overlapping groups, not a unique sum).
+The dev-small CLI build and diff checks pass. The earlier 611-test matrix is
+baseline evidence; only the stated groups were rerun for this UI-only correction.
+An isolated pseudoterminal using this CLI, a synthetic canonical repository and
+an unreachable local model endpoint verifies /tickets, Enter opening another
+MAIN's ticket, archive filtering and /ticket detail. No model turn is requested.
+Staged-binary terminal output and checks are bundled with the candidate.

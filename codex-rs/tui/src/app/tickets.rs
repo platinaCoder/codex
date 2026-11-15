@@ -65,18 +65,7 @@ enum KeyResult {
 }
 
 impl TicketUiState {
-    #[cfg(test)]
     fn refresh(&mut self, roots: &[AbsolutePathBuf], force: bool) {
-        self.refresh_for_viewer(roots, force, None, ActorRole::Main);
-    }
-
-    fn refresh_for_viewer(
-        &mut self,
-        roots: &[AbsolutePathBuf],
-        force: bool,
-        viewer_thread_id: Option<&str>,
-        role: ActorRole,
-    ) {
         if !force
             && self
                 .last_refresh
@@ -95,13 +84,9 @@ impl TicketUiState {
             }
         };
         self.available = true;
-        let tickets = match (viewer_thread_id, role) {
-            (Some(thread_id), ActorRole::Main) => store.list_assigned(thread_id, self.archive, 100),
-            (Some(_), ActorRole::Side) => store.list(self.archive, 100),
-            (Some(_), ActorRole::System) => Ok(Vec::new()),
-            (None, ActorRole::System) => Ok(Vec::new()),
-            (None, _) => store.list(self.archive, 100),
-        };
+        // This is a human-operated repository browser. Assignment restrictions
+        // belong to model-invoked tools, not the strip or host-only commands.
+        let tickets = store.list(self.archive, 100);
         match tickets {
             Ok(tickets) => {
                 self.tickets = tickets;
@@ -402,17 +387,7 @@ impl App {
     fn refresh_ticket_strip_for_viewer(&mut self, force: bool) {
         let viewer = self.ticket_viewer();
         self.ticket_ui.viewer_thread_id = viewer.as_ref().map(|(id, _)| id.clone());
-        let (viewer_thread_id, role) = viewer
-            .as_ref()
-            .map_or((None, ActorRole::System), |(id, role)| {
-                (Some(id.as_str()), *role)
-            });
-        self.ticket_ui.refresh_for_viewer(
-            &self.config.workspace_roots,
-            force,
-            viewer_thread_id,
-            role,
-        );
+        self.ticket_ui.refresh(&self.config.workspace_roots, force);
     }
 
     pub(super) fn open_ticket_inbox(&mut self, tui: &mut tui::Tui) {
@@ -440,16 +415,10 @@ impl App {
             );
             return;
         };
-        let document =
-            TicketStore::from_workspace_roots(&self.config.workspace_roots).and_then(|store| {
-                match role {
-                    ActorRole::Main => store.read_assigned(id, &viewer_thread_id),
-                    ActorRole::Side => store.read(id),
-                    ActorRole::System => Err(crate::ticket_store::Error::Invalid(
-                        "system is not an interactive ticket viewer".into(),
-                    )),
-                }
-            });
+        // Render only into the local overlay; browsing does not submit ticket
+        // contents to a model or change canonical assignment/approval state.
+        let document = TicketStore::from_workspace_roots(&self.config.workspace_roots)
+            .and_then(|store| store.read(id));
         let lines = match document {
             Ok(document) => {
                 self.ticket_ui
@@ -946,6 +915,144 @@ mod tests {
         state.refresh(&roots, true);
         assert_eq!(state.tickets[0].title, "after refresh");
         assert_eq!(state.tickets[0].revision, 2);
+    }
+
+    #[tokio::test]
+    async fn human_ticket_browser_is_repository_wide_without_model_or_assignment_changes()
+    -> Result<()> {
+        use crate::ticket_store::{Create, ImplementCheck, Proposal, Source, Transition, Update};
+        let (mut app, mut events, mut ops) = crate::app::tests::make_test_app_with_channels().await;
+        let main = ThreadId::new();
+        let side = ThreadId::new();
+        let fresh_main = ThreadId::new();
+        install_pair(&mut app, main, side, main);
+        let _lab = install_lab_store(&mut app);
+        let roots = app.config.workspace_roots.clone();
+        let store = TicketStore::from_workspace_roots(&roots)?;
+        let source = Source {
+            thread_id: side.to_string(),
+            turn_id: "fixture".into(),
+            role: ActorRole::Side,
+        };
+        let create = |title: &str| {
+            store
+                .create(Create {
+                    title: title.into(),
+                    scope: vec!["runtime".into()],
+                    source: source.clone(),
+                    dependencies: vec![],
+                    relevant_revisions: vec![],
+                    proposal: Proposal::default(),
+                })
+                .unwrap()
+        };
+        let unassigned = create("unassigned human-visible ticket");
+        let own = create("current MAIN ticket");
+        let other = create("other MAIN ticket");
+        for (doc, assignee) in [
+            (&own, main.to_string()),
+            (&other, ThreadId::new().to_string()),
+        ] {
+            assert!(matches!(
+                store.implement(
+                    doc.ticket.id,
+                    doc.ticket.revision,
+                    source.clone(),
+                    assignee,
+                    "fixture".into()
+                )?,
+                ImplementCheck::Pending(_)
+            ));
+        }
+        let archived = create("archived ticket");
+        store.update(
+            archived.ticket.id,
+            archived.ticket.revision,
+            source.clone(),
+            Update {
+                transition: Some(Transition {
+                    to: Status::Cancelled,
+                    reason: "fixture".into(),
+                }),
+                ..Default::default()
+            },
+        )?;
+        let before = [
+            unassigned.ticket.id,
+            own.ticket.id,
+            other.ticket.id,
+            archived.ticket.id,
+        ]
+        .map(|id| serde_json::to_value(store.read(id).unwrap()).unwrap());
+        let mut tui = crate::tui::test_support::make_test_tui()?;
+        let mut server = crate::start_embedded_app_server_for_picker(&app.config).await?;
+        for (primary, active) in [(main, main), (main, side), (fresh_main, fresh_main)] {
+            install_pair(&mut app, primary, side, active);
+            while events.try_recv().is_ok() {}
+            while ops.try_recv().is_ok() {}
+            app.ticket_ui.archive = false;
+            app.handle_event(&mut tui, &mut server, AppEvent::OpenTicketInbox)
+                .await?;
+            let mut ids = app
+                .ticket_ui
+                .tickets
+                .iter()
+                .map(|t| t.id)
+                .collect::<Vec<_>>();
+            ids.sort_unstable();
+            assert_eq!(
+                ids,
+                vec![unassigned.ticket.id, own.ticket.id, other.ticket.id]
+            );
+            assert!(app.ticket_ui.focused);
+            for id in ids {
+                app.handle_event(
+                    &mut tui,
+                    &mut server,
+                    AppEvent::OpenTicket { ticket_id: id },
+                )
+                .await?;
+                assert_eq!(app.ticket_ui.modal.as_ref().map(|modal| modal.id), Some(id));
+                assert!(matches!(app.overlay, Some(Overlay::Static(_))));
+                app.overlay = None;
+                app.dismiss_ticket_modal();
+            }
+            app.ticket_ui.archive = true;
+            app.refresh_ticket_strip_now();
+            assert_eq!(
+                app.ticket_ui
+                    .tickets
+                    .iter()
+                    .map(|t| t.id)
+                    .collect::<Vec<_>>(),
+                vec![archived.ticket.id]
+            );
+            assert!(
+                ops.try_recv().is_err(),
+                "human browsing must not submit model operations"
+            );
+            assert!(
+                events.try_recv().is_err(),
+                "human browsing must not enqueue model context"
+            );
+        }
+        let after = [
+            unassigned.ticket.id,
+            own.ticket.id,
+            other.ticket.id,
+            archived.ticket.id,
+        ]
+        .map(|id| serde_json::to_value(store.read(id).unwrap()).unwrap());
+        assert_eq!(before, after, "browsing must not mutate canonical tickets");
+        let _other_lab = install_lab_store(&mut app);
+        assert!(
+            app.ticket_ui.tickets.is_empty(),
+            "another repository must not leak tickets"
+        );
+        app.open_ticket_by_id(&mut tui, other.ticket.id);
+        assert!(app.ticket_ui.modal.is_none());
+        server.shutdown().await?;
+        Ok(())
     }
 
     #[tokio::test]

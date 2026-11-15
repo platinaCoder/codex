@@ -216,6 +216,105 @@ async fn concurrent_ticket_calls() -> color_eyre::Result<()> {
         .text()
         .await?;
     assert!(replay.contains("already consumed"), "{replay}");
+    // Human browsing is repository-wide; the MCP model surface must remain
+    // assignment-scoped for MAIN and repository-wide for authenticated SIDE.
+    let create = |title: &str| {
+        store
+            .create(Create {
+                title: title.into(),
+                scope: vec!["runtime".into()],
+                source: Source {
+                    thread_id: side.to_string(),
+                    turn_id: "fixture".into(),
+                    role: ActorRole::Side,
+                },
+                dependencies: vec![],
+                relevant_revisions: vec![],
+                proposal: Proposal::default(),
+            })
+            .unwrap()
+    };
+    let unassigned = create("unassigned visibility fixture");
+    let other = create("other MAIN visibility fixture");
+    let other_main = ThreadId::new().to_string();
+    let pending = match store.implement(
+        other.ticket.id,
+        1,
+        other.ticket.source.clone(),
+        other_main.clone(),
+        "fixture".into(),
+    )? {
+        ImplementCheck::Pending(doc) => doc,
+        _ => unreachable!(),
+    };
+    store.bind_assignment_delivery(
+        other.ticket.id,
+        &pending.ticket.assignment.unwrap().notification_id,
+        &other_main,
+        "other-turn",
+    )?;
+    let side_catalog = call(10, side, "list_tickets", json!({}))
+        .send()
+        .await?
+        .text()
+        .await?;
+    for title in [
+        "concurrency fixture",
+        "unassigned visibility fixture",
+        "other MAIN visibility fixture",
+    ] {
+        assert!(side_catalog.contains(title), "{side_catalog}");
+    }
+    let main_catalog = call(11, main, "list_tickets", json!({}))
+        .send()
+        .await?
+        .text()
+        .await?;
+    assert!(
+        main_catalog.contains("concurrency fixture"),
+        "{main_catalog}"
+    );
+    assert!(
+        !main_catalog.contains("unassigned visibility fixture"),
+        "{main_catalog}"
+    );
+    assert!(
+        !main_catalog.contains("other MAIN visibility fixture"),
+        "{main_catalog}"
+    );
+    for (offset, ticket) in [unassigned, other].into_iter().enumerate() {
+        let id = 20 + offset as u32 * 3;
+        let read = call(
+            id,
+            main,
+            "read_ticket",
+            json!({"ticketId":ticket.ticket.id}),
+        )
+        .send()
+        .await?
+        .text()
+        .await?;
+        assert!(
+            read.contains("not assigned to authenticated MAIN"),
+            "{read}"
+        );
+        let mutation = call(id+1, main, "append_ticket_comment", json!({"ticketId":ticket.ticket.id,
+            "expectedCommentRevision":0,"specificationRevision":1,"category":"finding","body":"must be denied"}))
+            .send().await?.text().await?;
+        assert!(mutation.contains("\"isError\":true"), "{mutation}");
+        assert_eq!(store.read(ticket.ticket.id)?.comment_revision, 0);
+        let read = call(
+            id + 2,
+            side,
+            "read_ticket",
+            json!({"ticketId":ticket.ticket.id}),
+        )
+        .send()
+        .await?
+        .text()
+        .await?;
+        assert!(read.contains(&ticket.ticket.title), "{read}");
+    }
     assert_eq!(bridge.workflow.active_call_count(), 0);
     drop(bridge);
     app.shutdown().await?;
