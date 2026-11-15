@@ -65,7 +65,18 @@ enum KeyResult {
 }
 
 impl TicketUiState {
+    #[cfg(test)]
     fn refresh(&mut self, roots: &[AbsolutePathBuf], force: bool) {
+        self.refresh_for_viewer(roots, force, None, ActorRole::Main);
+    }
+
+    fn refresh_for_viewer(
+        &mut self,
+        roots: &[AbsolutePathBuf],
+        force: bool,
+        viewer_thread_id: Option<&str>,
+        role: ActorRole,
+    ) {
         if !force
             && self
                 .last_refresh
@@ -84,7 +95,14 @@ impl TicketUiState {
             }
         };
         self.available = true;
-        match store.list(self.archive, 100) {
+        let tickets = match (viewer_thread_id, role) {
+            (Some(thread_id), ActorRole::Main) => store.list_assigned(thread_id, self.archive, 100),
+            (Some(_), ActorRole::Side) => store.list(self.archive, 100),
+            (Some(_), ActorRole::System) => Ok(Vec::new()),
+            (None, ActorRole::System) => Ok(Vec::new()),
+            (None, _) => store.list(self.archive, 100),
+        };
+        match tickets {
             Ok(tickets) => {
                 self.tickets = tickets;
                 self.selected = self.selected.min(self.tickets.len().saturating_sub(1));
@@ -359,10 +377,108 @@ impl App {
     }
 
     pub(super) fn refresh_ticket_strip(&mut self) {
-        self.ticket_ui.refresh(&self.config.workspace_roots, false);
+        self.refresh_ticket_strip_for_viewer(false);
     }
     pub(super) fn refresh_ticket_strip_now(&mut self) {
-        self.ticket_ui.refresh(&self.config.workspace_roots, true);
+        self.refresh_ticket_strip_for_viewer(true);
+    }
+
+    fn ticket_viewer(&self) -> Option<(String, ActorRole)> {
+        let thread_id = self.current_displayed_thread_id()?;
+        let role = if self.side_threads.contains_key(&thread_id) {
+            ActorRole::Side
+        } else {
+            if self
+                .primary_thread_id
+                .is_some_and(|primary| primary != thread_id)
+            {
+                return None;
+            }
+            ActorRole::Main
+        };
+        Some((thread_id.to_string(), role))
+    }
+
+    fn refresh_ticket_strip_for_viewer(&mut self, force: bool) {
+        let viewer = self.ticket_viewer();
+        self.ticket_ui.viewer_thread_id = viewer.as_ref().map(|(id, _)| id.clone());
+        let (viewer_thread_id, role) = viewer
+            .as_ref()
+            .map_or((None, ActorRole::System), |(id, role)| {
+                (Some(id.as_str()), *role)
+            });
+        self.ticket_ui.refresh_for_viewer(
+            &self.config.workspace_roots,
+            force,
+            viewer_thread_id,
+            role,
+        );
+    }
+
+    pub(super) fn open_ticket_inbox(&mut self, tui: &mut tui::Tui) {
+        if self.overlay.is_some() {
+            return;
+        }
+        if self.ticket_viewer().is_none() {
+            self.chat_widget.add_error_message(
+                "Ticket inbox requires an authenticated MAIN or SIDE thread.".to_string(),
+            );
+            return;
+        }
+        self.refresh_ticket_strip_for_viewer(true);
+        self.ticket_ui.focus();
+        tui.frame_requester().schedule_frame();
+    }
+
+    pub(super) fn open_ticket_by_id(&mut self, tui: &mut tui::Tui, id: u64) {
+        if self.overlay.is_some() {
+            return;
+        }
+        let Some((viewer_thread_id, role)) = self.ticket_viewer() else {
+            self.chat_widget.add_error_message(
+                "Opening a ticket requires an authenticated MAIN or SIDE thread.".to_string(),
+            );
+            return;
+        };
+        let document =
+            TicketStore::from_workspace_roots(&self.config.workspace_roots).and_then(|store| {
+                match role {
+                    ActorRole::Main => store.read_assigned(id, &viewer_thread_id),
+                    ActorRole::Side => store.read(id),
+                    ActorRole::System => Err(crate::ticket_store::Error::Invalid(
+                        "system is not an interactive ticket viewer".into(),
+                    )),
+                }
+            });
+        let lines = match document {
+            Ok(document) => {
+                self.ticket_ui
+                    .seen_comment_revisions
+                    .insert((viewer_thread_id.clone(), id), document.comment_revision);
+                self.ticket_ui.modal = Some(TicketModalState {
+                    id,
+                    revision: document.ticket.revision,
+                    status: document.ticket.status.clone(),
+                    role,
+                    review_required: document.ticket.review_required,
+                    comment_revision: document.comment_revision,
+                    approved_revision: document
+                        .ticket
+                        .assignment
+                        .as_ref()
+                        .map(|assignment| assignment.approved_revision),
+                });
+                modal_lines(&document, role)
+            }
+            Err(error) => vec![Line::from(format!("Unable to read ticket: {error}"))],
+        };
+        let _ = tui.enter_alt_screen();
+        self.overlay = Some(Overlay::new_static_with_lines(
+            lines,
+            format!("Ticket #{id} · untrusted stored data"),
+            self.keymap.pager.clone(),
+        ));
+        tui.frame_requester().schedule_frame();
     }
     pub(super) fn ticket_strip_height(&self) -> u16 {
         self.ticket_ui.height()
@@ -379,14 +495,14 @@ impl App {
             self.ticket_ui.focused = false;
         }
         if !self.ticket_ui.focused {
-            if paired.is_none()
+            if (paired.is_none() && self.ticket_viewer().is_none())
                 || self.inference_focused()
                 || !crate::key_hint::ctrl(KeyCode::Char('k')).is_press(key)
             {
                 return false;
             }
             if self.ticket_ui.last_refresh.is_none() {
-                self.ticket_ui.refresh(&self.config.workspace_roots, true);
+                self.refresh_ticket_strip_for_viewer(true);
             }
             if !self.ticket_ui.focus() {
                 return false;
@@ -398,49 +514,13 @@ impl App {
             KeyResult::Ignored => false,
             KeyResult::Consumed => {
                 if self.ticket_ui.last_refresh.is_none() {
-                    self.ticket_ui.refresh(&self.config.workspace_roots, true);
+                    self.refresh_ticket_strip_for_viewer(true);
                 }
                 tui.frame_requester().schedule_frame();
                 true
             }
             KeyResult::Open(id) => {
-                let role = self
-                    .paired_main_and_side()
-                    .filter(|(_, side)| self.current_displayed_thread_id() == Some(*side))
-                    .map_or(ActorRole::Main, |_| ActorRole::Side);
-                let document = TicketStore::from_workspace_roots(&self.config.workspace_roots)
-                    .and_then(|store| store.read(id));
-                let lines = match document {
-                    Ok(document) => {
-                        if let Some(viewer) = self.ticket_ui.viewer_thread_id.clone() {
-                            self.ticket_ui
-                                .seen_comment_revisions
-                                .insert((viewer, id), document.comment_revision);
-                        }
-                        self.ticket_ui.modal = Some(TicketModalState {
-                            id,
-                            revision: document.ticket.revision,
-                            status: document.ticket.status.clone(),
-                            role,
-                            review_required: document.ticket.review_required,
-                            comment_revision: document.comment_revision,
-                            approved_revision: document
-                                .ticket
-                                .assignment
-                                .as_ref()
-                                .map(|assignment| assignment.approved_revision),
-                        });
-                        modal_lines(&document, role)
-                    }
-                    Err(error) => vec![Line::from(format!("Unable to read ticket: {error}"))],
-                };
-                let _ = tui.enter_alt_screen();
-                self.overlay = Some(Overlay::new_static_with_lines(
-                    lines,
-                    format!("Ticket #{id} · untrusted stored data"),
-                    self.keymap.pager.clone(),
-                ));
-                tui.frame_requester().schedule_frame();
+                self.open_ticket_by_id(tui, id);
                 true
             }
         }

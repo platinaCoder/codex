@@ -992,7 +992,7 @@ fn ticket_capabilities_are_exact_pathless_and_mcp_only() {
         .iter()
         .filter(|function| TICKET_TOOLS.contains(&function.name.as_str()))
         .collect::<Vec<_>>();
-    assert_eq!(ticket_tools.len(), 4);
+    assert_eq!(ticket_tools.len(), TICKET_TOOLS.len());
     for function in ticket_tools {
         let properties = function.input_schema["properties"]
             .as_object()
@@ -1015,7 +1015,10 @@ fn ticket_capabilities_are_exact_pathless_and_mcp_only() {
         })
         .collect::<Vec<_>>();
     for name in TICKET_TOOLS {
-        assert!(direct_names.iter().any(|candidate| candidate == name));
+        assert!(
+            DELEGATION_TOOLS.contains(&name)
+                || direct_names.iter().any(|candidate| candidate == name),
+        );
     }
     for name in DELEGATION_TOOLS {
         assert!(!direct_names.iter().any(|candidate| candidate == name));

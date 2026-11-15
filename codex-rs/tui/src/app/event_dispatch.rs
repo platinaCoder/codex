@@ -358,6 +358,12 @@ impl App {
                 }
                 tui.frame_requester().schedule_frame();
             }
+            AppEvent::OpenTicketInbox => {
+                self.open_ticket_inbox(tui);
+            }
+            AppEvent::OpenTicket { ticket_id } => {
+                self.open_ticket_by_id(tui, ticket_id);
+            }
             AppEvent::DynamicToolCallCompleted {
                 request_id,
                 response,

@@ -345,6 +345,7 @@ struct TransactionManifest {
     ticket_ids: Vec<u64>,
 }
 
+#[derive(Clone)]
 pub(crate) struct TicketStore {
     lab: PathBuf,
     root: PathBuf,

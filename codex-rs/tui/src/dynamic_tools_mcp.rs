@@ -2,6 +2,8 @@
 
 use crate::app_event_sender::AppEventSender;
 use crate::dynamic_tools;
+use crate::ticket_workflow::CallerKey;
+use crate::ticket_workflow::TicketWorkflowCoordinator;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::State;
@@ -44,8 +46,6 @@ use serde_json::json;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::PoisonError;
-use std::sync::RwLock;
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
@@ -157,9 +157,8 @@ impl ToolServices {
     }
 }
 
-type ToolConnection = Arc<RwLock<Option<(AppServerRequestHandle, AppEventSender)>>>;
 pub(crate) struct DynamicToolMcpServer {
-    connection: ToolConnection,
+    workflow: Arc<TicketWorkflowCoordinator>,
     config: Value,
     namespace: &'static str,
     task_tools: bool,
@@ -170,17 +169,11 @@ pub(crate) struct DynamicToolMcpServer {
 
 impl DynamicToolMcpServer {
     pub(crate) fn suspend(&self) {
-        *self
-            .connection
-            .write()
-            .unwrap_or_else(PoisonError::into_inner) = None;
+        self.workflow.suspend();
     }
 
     pub(crate) fn reconnect(&self, handle: AppServerRequestHandle, events: AppEventSender) {
-        *self
-            .connection
-            .write()
-            .unwrap_or_else(PoisonError::into_inner) = Some((handle, events));
+        self.workflow.reconnect(handle, events);
         self.retry_pending_ticket_notifications();
     }
 
@@ -188,30 +181,39 @@ impl DynamicToolMcpServer {
         if !self.task_tools {
             return;
         }
-        let Some((handle, app_event_tx)) = self
-            .connection
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
-        else {
+        if self.workflow.connection().is_err() {
             return;
-        };
+        }
+        if !self.workflow.claim_retry() {
+            return;
+        }
         let mut thread_start_params = self.thread_start_params.clone();
         thread_start_params.config.get_or_insert_default().insert(
             format!("mcp_servers.{}", self.namespace),
             self.config.clone(),
         );
         let features = self.features.clone();
+        let workflow = Arc::clone(&self.workflow);
         tokio::spawn(async move {
-            if let Err(error) = dynamic_tools::retry_pending_ticket_notifications(
-                handle,
-                thread_start_params,
-                features,
-                app_event_tx,
-            )
-            .await
-            {
-                tracing::warn!(%error, "pending ticket notification retry pump failed");
+            loop {
+                let Ok((handle, app_event_tx)) = workflow.connection() else {
+                    workflow.release_retry();
+                    break;
+                };
+                if let Err(error) = dynamic_tools::retry_pending_ticket_notifications(
+                    handle,
+                    thread_start_params.clone(),
+                    features.clone(),
+                    app_event_tx,
+                )
+                .await
+                {
+                    tracing::warn!(%error, "pending ticket notification retry pump failed");
+                }
+                if !workflow.take_retry_request() {
+                    workflow.release_retry();
+                    break;
+                }
             }
         });
     }
@@ -264,10 +266,10 @@ impl DynamicToolMcpServer {
             overrides.remove("web_search");
         }
         let task_tools = services.task_tools;
-        let connection = Arc::new(RwLock::new(Some((request_handle, app_event_tx))));
+        let workflow = TicketWorkflowCoordinator::new(request_handle, app_event_tx);
         let namespace = services.namespace();
         let handler = DynamicToolMcpHandler {
-            connection: Arc::clone(&connection),
+            workflow: Arc::clone(&workflow),
             thread_start_params: thread_start_params.clone(),
             features: features.clone(),
             status_updates,
@@ -292,7 +294,7 @@ impl DynamicToolMcpServer {
             }
         });
         let server = Self {
-            connection,
+            workflow,
             config: server_config,
             namespace,
             task_tools,
@@ -329,7 +331,7 @@ async fn require_authorization(
 
 #[derive(Clone)]
 struct DynamicToolMcpHandler {
-    connection: ToolConnection,
+    workflow: Arc<TicketWorkflowCoordinator>,
     thread_start_params: ThreadStartParams,
     features: Features,
     status_updates: broadcast::Sender<ThreadStatusChangedNotification>,
@@ -410,6 +412,20 @@ impl ServerHandler for DynamicToolMcpHandler {
                 Value::String(value) => serde_json::from_str(value).ok(),
                 _ => None,
             });
+        if let Some(turn_metadata) = turn_metadata.as_ref().and_then(Value::as_object) {
+            for (outer_key, nested_key) in [("threadId", "thread_id"), ("turnId", "turn_id")] {
+                if let (Some(outer), Some(nested)) = (
+                    metadata.get(outer_key).and_then(Value::as_str),
+                    turn_metadata.get(nested_key).and_then(Value::as_str),
+                ) && outer != nested
+                {
+                    return Err(McpError::invalid_params(
+                        format!("conflicting {outer_key} task metadata"),
+                        None,
+                    ));
+                }
+            }
+        }
         let thread_id = metadata
             .get("threadId")
             .and_then(Value::as_str)
@@ -433,6 +449,22 @@ impl ServerHandler for DynamicToolMcpHandler {
             tool: request.name.into_owned(),
             arguments: Value::Object(request.arguments.unwrap_or_default()),
         };
+        let caller = CallerKey {
+            thread_id: params.thread_id.clone(),
+            turn_id: params.turn_id.clone(),
+            call_id: params.call_id.clone(),
+        };
+        let _permit = self
+            .workflow
+            .admit(caller)
+            .map_err(|error| McpError::invalid_request(error.to_string(), None))?;
+        tracing::debug!(
+            thread_id = %params.thread_id,
+            turn_id = %params.turn_id,
+            call_id = %params.call_id,
+            active_calls = self.workflow.active_call_count(),
+            "admitted concurrent task-tool call"
+        );
         let mut thread_start_params = self.thread_start_params.clone();
         thread_start_params.config.get_or_insert_default().insert(
             format!("mcp_servers.{}", self.services.namespace()),
@@ -440,13 +472,9 @@ impl ServerHandler for DynamicToolMcpHandler {
         );
         // Snapshot once: an in-flight call must never switch connections or replay a mutation.
         let (request_handle, app_event_tx) = self
-            .connection
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
-            .ok_or_else(|| {
-                McpError::internal_error("TUI is reconnecting; tool was not sent", None)
-            })?;
+            .workflow
+            .connection()
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
         let response = if matches!(
             params.tool.as_str(),
             "create_worktree" | "get_worktree_creation_status" | "list_worktrees"

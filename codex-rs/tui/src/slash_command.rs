@@ -56,6 +56,8 @@ pub enum SlashCommand {
     Diff,
     Mention,
     Status,
+    Tickets,
+    Ticket,
     Daemon,
     Warnings,
     Cd,
@@ -122,6 +124,8 @@ impl SlashCommand {
             SlashCommand::Daemon => "Manage the local background server",
             SlashCommand::Warnings => "view retained warnings and diagnostic details",
             SlashCommand::Status => "show current session configuration and token usage",
+            SlashCommand::Tickets => "open the authenticated ticket inbox",
+            SlashCommand::Ticket => "open one authenticated ticket by id",
             SlashCommand::Cd => "change the current working directory",
             SlashCommand::Pwd => "show the current working directory",
             SlashCommand::Usage => "view account usage or use a usage limit reset",
@@ -201,6 +205,7 @@ impl SlashCommand {
                 | SlashCommand::Btw
                 | SlashCommand::Infer
                 | SlashCommand::Resume
+                | SlashCommand::Ticket
         )
     }
 
@@ -215,6 +220,8 @@ impl SlashCommand {
                 | SlashCommand::Diff
                 | SlashCommand::Mention
                 | SlashCommand::Status
+                | SlashCommand::Tickets
+                | SlashCommand::Ticket
                 | SlashCommand::Daemon
                 | SlashCommand::Warnings
                 | SlashCommand::Pwd
@@ -243,6 +250,8 @@ impl SlashCommand {
                 | SlashCommand::Quit
                 | SlashCommand::Exit
                 | SlashCommand::Status
+                | SlashCommand::Tickets
+                | SlashCommand::Ticket
                 | SlashCommand::Warnings
                 | SlashCommand::DebugConfig
                 | SlashCommand::Pwd
@@ -293,6 +302,8 @@ impl SlashCommand {
             | SlashCommand::Skills
             | SlashCommand::Hooks
             | SlashCommand::Status
+            | SlashCommand::Tickets
+            | SlashCommand::Ticket
             | SlashCommand::Daemon
             | SlashCommand::Warnings
             | SlashCommand::Pwd
@@ -353,6 +364,16 @@ mod tests {
     #[test]
     fn stop_command_is_canonical_name() {
         assert_eq!(SlashCommand::Stop.command(), "stop");
+    }
+
+    #[test]
+    fn ticket_commands_are_host_only_and_available_during_work() {
+        assert_eq!(SlashCommand::from_str("tickets"), Ok(SlashCommand::Tickets));
+        assert_eq!(SlashCommand::from_str("ticket"), Ok(SlashCommand::Ticket));
+        assert!(SlashCommand::Tickets.available_when_thread_unavailable());
+        assert!(SlashCommand::Ticket.supports_inline_args());
+        assert!(SlashCommand::Tickets.available_during_task());
+        assert!(SlashCommand::Ticket.available_in_side_conversation());
     }
 
     #[test]

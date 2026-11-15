@@ -731,9 +731,13 @@ async fn execute_inner(
             let store =
                 crate::ticket_store::TicketStore::from_workspace_roots(&ticket_workspace_roots)
                     .map_err(|error| error.to_string())?;
+            let side = is_side_thread(&source);
+            if side {
+                paired_main_thread_id(&handle, &params.thread_id).await?;
+            }
             let archive = arguments.include_archived.unwrap_or(false);
             let limit = arguments.limit.unwrap_or(100);
-            let tickets = if is_side_thread(&source) {
+            let tickets = if side {
                 store.list(archive, limit)
             } else {
                 store.list_assigned(&params.thread_id, archive, limit)
@@ -758,7 +762,11 @@ async fn execute_inner(
             let store =
                 crate::ticket_store::TicketStore::from_workspace_roots(&ticket_workspace_roots)
                     .map_err(|error| error.to_string())?;
-            let document = if is_side_thread(&source) {
+            let side = is_side_thread(&source);
+            if side {
+                paired_main_thread_id(&handle, &params.thread_id).await?;
+            }
+            let document = if side {
                 store.read(arguments.ticket_id)
             } else {
                 store.read_assigned(arguments.ticket_id, &params.thread_id)
@@ -810,7 +818,11 @@ async fn execute_inner(
         "append_ticket_comment" => {
             let arguments: AppendTicketCommentArguments = parse_arguments(params.arguments)?;
             let source_thread = read_thread(&handle, &params.thread_id).await?;
-            let role = if is_side_thread(&source_thread) {
+            let side = is_side_thread(&source_thread);
+            if side {
+                paired_main_thread_id(&handle, &params.thread_id).await?;
+            }
+            let role = if side {
                 crate::ticket_store::ActorRole::Side
             } else {
                 crate::ticket_store::ActorRole::Main
@@ -848,6 +860,7 @@ async fn execute_inner(
             if !is_side_thread(&source_thread) {
                 return Err("create_ticket is owned by the paired SIDE thread; MAIN may only list or explicitly read tickets".to_string());
             }
+            paired_main_thread_id(&handle, &params.thread_id).await?;
             let store =
                 crate::ticket_store::TicketStore::from_workspace_roots(&ticket_workspace_roots)
                     .map_err(|error| error.to_string())?;
@@ -895,6 +908,7 @@ async fn execute_inner(
             if !is_side_thread(&source_thread) {
                 return Err("update_ticket is owned by the paired SIDE thread; MAIN has no ticket mutation or lifecycle authority".to_string());
             }
+            paired_main_thread_id(&handle, &params.thread_id).await?;
             let store =
                 crate::ticket_store::TicketStore::from_workspace_roots(&ticket_workspace_roots)
                     .map_err(|error| error.to_string())?;
@@ -2273,6 +2287,7 @@ pub(crate) async fn retry_pending_ticket_notifications(
             .map(|server| HashMap::from([(key, server.clone())]))
     });
     let mut recovered = 0;
+    let mut deliveries = tokio::task::JoinSet::new();
     for document in pending {
         let ticket_id = document.ticket.id;
         let source_thread_id = document
@@ -2284,28 +2299,54 @@ pub(crate) async fn retry_pending_ticket_notifications(
             .clone();
         let check = crate::ticket_store::ImplementCheck::Pending(document);
         let message = ticket_notification_message(&check, ticket_id)?;
-        match deliver_ticket_notification(
-            &handle,
-            &features,
-            Some(&app_event_tx),
-            mcp_config.clone(),
-            &store,
-            &source_thread_id,
-            check,
-            "ticket_notification_retry_pump",
-            message,
-        )
-        .await
-        {
-            Ok(_) => recovered += 1,
-            Err(error) => tracing::warn!(
-                ticket_id,
-                %error,
-                "pending ticket notification remains available for reconciliation"
-            ),
+        let delivery_handle = handle.clone();
+        let delivery_features = features.clone();
+        let delivery_events = app_event_tx.clone();
+        let delivery_store = store.clone();
+        let delivery_config = mcp_config.clone();
+        deliveries.spawn(async move {
+            let result = deliver_ticket_notification(
+                &delivery_handle,
+                &delivery_features,
+                Some(&delivery_events),
+                delivery_config,
+                &delivery_store,
+                &source_thread_id,
+                check,
+                "ticket_notification_retry_pump",
+                message,
+            )
+            .await;
+            (ticket_id, result)
+        });
+        if deliveries.len() >= 4 {
+            if let Some(joined) = deliveries.join_next().await {
+                record_ticket_delivery_result(joined, &mut recovered);
+            }
         }
     }
+    while let Some(joined) = deliveries.join_next().await {
+        record_ticket_delivery_result(joined, &mut recovered);
+    }
     Ok(recovered)
+}
+
+fn record_ticket_delivery_result(
+    joined: Result<(u64, Result<Value, String>), tokio::task::JoinError>,
+    recovered: &mut usize,
+) {
+    match joined {
+        Ok((_ticket_id, Ok(_))) => *recovered += 1,
+        Ok((ticket_id, Err(error))) => tracing::warn!(
+            ticket_id,
+            %error,
+            "pending ticket notification remains available for reconciliation"
+        ),
+        Err(error) => tracing::warn!(
+            %error,
+            "pending ticket notification task exited unexpectedly"
+        ),
+    }
 }
 
 async fn find_ticket_notification_turn_once(

@@ -636,6 +636,14 @@ pub(crate) enum AppEvent {
     /// Refresh the canonical ticket strip after an approved bounded mutation.
     TicketStoreChanged,
 
+    /// Open the authenticated ticket inbox without involving the model.
+    OpenTicketInbox,
+
+    /// Open one authenticated ticket without involving the model.
+    OpenTicket {
+        ticket_id: u64,
+    },
+
     /// Register task tools inherited by a dynamically created thread.
     TaskToolsAvailable {
         thread_id: ThreadId,

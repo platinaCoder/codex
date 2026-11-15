@@ -552,6 +552,10 @@ impl ChatWidget {
             }
             SlashCommand::Daemon => self.app_event_tx.send(AppEvent::OpenDaemonMenu),
             SlashCommand::Warnings => self.app_event_tx.send(AppEvent::OpenWarnings),
+            SlashCommand::Tickets => self.app_event_tx.send(AppEvent::OpenTicketInbox),
+            SlashCommand::Ticket => self.add_error_message(
+                "Usage: /ticket <id> (or /tickets for the authenticated inbox)".to_string(),
+            ),
             SlashCommand::Status => {
                 if self.should_prefetch_rate_limits() {
                     let request_id = self.next_status_refresh_request_id;
@@ -1139,6 +1143,12 @@ impl ChatWidget {
                 self.app_event_tx
                     .send(AppEvent::ResumeSessionByIdOrName(args));
             }
+            SlashCommand::Ticket if !trimmed.is_empty() => match trimmed.parse::<u64>() {
+                Ok(ticket_id) if ticket_id > 0 => {
+                    self.app_event_tx.send(AppEvent::OpenTicket { ticket_id });
+                }
+                _ => self.add_error_message("Usage: /ticket <positive numeric id>".to_string()),
+            },
             SlashCommand::Pets
                 if matches!(
                     args.trim().to_ascii_lowercase().as_str(),
@@ -1309,6 +1319,8 @@ impl ChatWidget {
         match cmd {
             SlashCommand::Ide
             | SlashCommand::Status
+            | SlashCommand::Tickets
+            | SlashCommand::Ticket
             | SlashCommand::Daemon
             | SlashCommand::Pwd
             | SlashCommand::Usage
