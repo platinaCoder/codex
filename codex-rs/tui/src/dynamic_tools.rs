@@ -120,7 +120,6 @@ const MAX_WORKSPACE_VISITED_FILES: usize = 5_000;
 const MAX_WORKSPACE_VISITED_ENTRIES: usize = 20_000;
 const MAX_WORKSPACE_SEARCH_DEPTH: usize = 64;
 pub(crate) const TICKET_DISPATCH_METADATA_KEY: &str = "ai_lab_ticket_assignment";
-#[cfg(test)]
 pub(crate) const TICKET_TOOLS: [&str; 9] = [
     "list_tickets",
     "read_ticket",
@@ -2490,9 +2489,8 @@ pub(crate) async fn retry_pending_ticket_notifications(
             Err(crate::ticket_store::Error::NoRoot) => return Ok(0),
             Err(error) => return Err(error.to_string()),
         };
-    let pending = store
-        .pending_notifications()
-        .map_err(|error| error.to_string())?;
+    let pending_store = store.clone();
+    let pending = ticket_store_operation(move || pending_store.pending_notifications()).await?;
     let mcp_config = thread_start_params.config.as_ref().and_then(|overrides| {
         let key = format!("mcp_servers.{NAMESPACE}");
         overrides
@@ -2647,7 +2645,9 @@ async fn find_ticket_notification_turn_once(
 fn notification_turn_id(turns: &[Turn], notification_id: &str) -> Option<String> {
     turns.iter().find_map(|turn| {
         // Idempotent turn IDs exist before the first user-message item is flushed.
-        if turn.id == notification_id { return Some(turn.id.clone()); }
+        if turn.id == notification_id {
+            return Some(turn.id.clone());
+        }
         turn.items
             .iter()
             .any(|item| {

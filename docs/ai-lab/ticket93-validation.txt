@@ -1,0 +1,96 @@
+Ticket 93 — turn-independent ticket workflow
+
+Baseline and ownership
+The original ticket93 branch descended from 4431be1 and omitted the promoted
+Ticket 13 runtime. This branch merges 51e269d, preserving its server-owned
+Standard/SIDE profiles, effective read policy, permission ceilings, per-thread
+accounting, empty MAIN persistence, resume activation, archive and Cwd filters.
+The primary checkout, installed runtime and lab gitlink are not advanced.
+
+Implementation
+- Session-owned MCP coordinator keys calls by authenticated thread/turn/call.
+  Admission allows 8 active calls per caller and 64 globally. Consumed call IDs
+  cannot replay within the session. Replay records are bounded to 4096 calls per
+  caller and 128 callers; exhaustion fails closed and requires a new session.
+  Caller metadata has bounded lengths. Reconnection does not erase replay state.
+- Call cancellation and ticket-call deadlines release only their own permits.
+  Mutation cancellation/timeouts explicitly require canonical-state inspection;
+  cancellation is not a promise that an already-submitted mutation was rolled back.
+- Retry claiming, dirtying and completion are synchronized. RAII cleanup releases
+  an interrupted pump. Idle events and a five-second recovery tick retry durable
+  work; missed timer ticks coalesce. Each delivery has a 30-second deadline and
+  at most four deliveries execute concurrently. Busy recipients retain pending
+  work instead of receiving a competing ticket turn.
+- Assignment and ready events use stable idempotency IDs. Ready IDs derive from
+  the persisted assignment event and ready turn, so no second database is needed.
+  Startup/reconnect/timer recovery includes unacknowledged ready notifications.
+  Recovery recognizes a stable turn ID before its user-message item is flushed.
+  Repeated assignment reconciliation updates its attempt counter without growing
+  the audit history on every tick. Canonical assignment/event checks fence stale
+  deliveries. Claims are durable audit markers, not exclusive network leases;
+  no transaction/coordinator lock is held across external delivery.
+- Read snapshots share a store lock; interrupted transactions and migrations still
+  acquire exclusive ownership. Comment streams have per-ticket locks, allowing
+  different-ticket comments to commit independently. Lifecycle/dependency changes
+  remain atomic store transactions because they can change multiple tickets.
+  Async MCP reads/comments/outbox scans offload filesystem locks and fsync.
+- /tickets and /ticket <id> are host-only commands in idle or busy MAIN and SIDE.
+  Persistent schemas do not confer authority: canonical exact-thread assignment
+  and runtime SIDE identity are checked on every call.
+- Actual approvals remain in the session-owned, thread-keyed PendingAppServerRequests
+  and replay state. ChatWidget desktop notices are summaries, not approval authority
+  or the ticket outbox. Their summary queue is bounded; consuming a desktop notice
+  cannot acknowledge or discard the actual request or canonical ticket event.
+
+Verification
+Native Linux, dev-small build, isolated artifact directory:
+  /srv/experiments/codex-ticket93-repair
+PKG_CONFIG_PATH=/usr/lib/openssl-3/pkgconfig
+CARGO_INCREMENTAL=0; RUST_MIN_STACK=16777216
+
+The targeted matrix contains 611 unique tests across 16 overlapping groups:
+  ticket: 46
+  compaction_tests: 6
+  cold: 4
+  side: 151
+  app_server_requests::tests: 12
+  pending_interactive_replay::tests: 13
+  question_notifications_tests: 5
+  slash_command: 196
+  resume_picker: 132
+  active_reconnect::: 5
+  thread_event: 26
+  thread_session_state::tests: 5
+  thread_usage: 44
+  local_daemon_registers_approval_gated_mcp_tools_for_both_start_paths: 1
+  embedded_no_daemon_side_mcp_bridge_receives_server_read_policy: 1
+  launch_permissions_preserve_server_owned_constrained_profile: 1
+
+New HTTP integration uses a real loopback MCP endpoint, real isolated embedded
+app-server and a temporary canonical store. It holds a store-lock barrier until
+both authenticated MAIN/SIDE requests are admitted, proving overlap rather than
+merely starting two requests together. It checks same-revision write conflicts,
+caller metadata disagreement, replay rejection and surviving unrelated reads.
+Separate lock-barrier tests establish overlapping snapshots and independent
+writes to different ticket comment streams. Approval tests resolve colliding IDs
+on MAIN/SIDE in either order and reject wrong-thread resolution. Retry tests cover
+concurrent finish/claim, cancellation cleanup, bounds and duplicate admission.
+
+Reconnect fixtures were missing Ticket 13's effectiveReadPolicy and correctly
+failed closed. The mocks now supply the policy; production policy checks were
+not weakened. SIDE command-list and clipboard expectations were updated for the
+new ticket commands and the inherited conversation-role status line.
+
+The transport scenarios use isolated app-server fixtures, not the user's live
+production daemon. Tests cover the components and scenarios above, not every
+Cartesian combination of states or a model quality/cost comparison. The broad
+repository test suite is not represented as passing by this targeted matrix.
+
+Delivery
+Checksummed staged package only. Reuse the existing code-mode host/resources
+with recorded hashes: their sources and lockfile are unchanged by this ticket.
+Promotion is always a manual operator action after closing Codex sessions.
+The promotion script is tested with a fake daemon launcher in a temporary home:
+validation is non-mutating, a busy install lock fails promptly, an existing
+entrypoint symlink is accepted, and fd 9 is not inherited by the update launcher.
+No production installation or daemon restart is part of validation.

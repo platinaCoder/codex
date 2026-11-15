@@ -4,6 +4,38 @@ use crate::bottom_pane::slash_commands::ServiceTierCommand;
 use pretty_assertions::assert_eq;
 use serial_test::serial;
 
+#[tokio::test]
+async fn ticket_host_commands_bypass_model_turns_in_main_and_side_while_busy() {
+    for side in [false, true] {
+        for busy in [false, true] {
+            let (mut chat, mut events, mut ops) = make_chatwidget_manual(None).await;
+            chat.set_side_conversation_active(side);
+            chat.bottom_pane.set_task_running(busy);
+            while events.try_recv().is_ok() {}
+            while ops.try_recv().is_ok() {}
+            submit_composer_text(&mut chat, "/tickets");
+            assert!(
+                std::iter::from_fn(|| events.try_recv().ok())
+                    .any(|event| matches!(event, AppEvent::OpenTicketInbox))
+            );
+            assert!(
+                ops.try_recv().is_err(),
+                "ticket inbox must not submit a model turn"
+            );
+            submit_composer_text(&mut chat, "/ticket 93");
+            assert!(
+                std::iter::from_fn(|| events.try_recv().ok())
+                    .any(|event| matches!(event, AppEvent::OpenTicket { ticket_id: 93 }))
+            );
+            assert!(
+                ops.try_recv().is_err(),
+                "opening a ticket must not submit a model turn"
+            );
+            assert_eq!(chat.bottom_pane.is_task_running(), busy);
+        }
+    }
+}
+
 fn force_pet_image_support(chat: &mut ChatWidget) {
     chat.set_pet_image_support_for_tests(crate::pets::PetImageSupport::Supported(
         crate::pets::ImageProtocol::Kitty,
@@ -1881,6 +1913,7 @@ async fn slash_copy_picker_copies_status_fields_and_preserves_source_after_copyi
     let expected = [
         ("Whole status", whole_status.as_str()),
         ("Model", "gpt-5.5"),
+        ("Conversation role", "Standard"),
         ("Directory", directory.as_str()),
         ("Thread name", "Clipboard example"),
         ("Session ID", session_id),

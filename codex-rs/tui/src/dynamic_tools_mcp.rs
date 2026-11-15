@@ -503,6 +503,14 @@ impl ServerHandler for DynamicToolMcpHandler {
             tool: request.name.into_owned(),
             arguments: Value::Object(request.arguments.unwrap_or_default()),
         };
+        if params.thread_id.len() > 128 || params.turn_id.len() > 256 || params.call_id.len() > 256
+        {
+            return Err(McpError::invalid_params(
+                "task caller metadata exceeds its bounded size",
+                None,
+            ));
+        }
+        let ticket_call = dynamic_tools::TICKET_TOOLS.contains(&params.tool.as_str());
         let caller = CallerKey {
             thread_id: params.thread_id.clone(),
             turn_id: params.turn_id.clone(),
@@ -572,7 +580,10 @@ impl ServerHandler for DynamicToolMcpHandler {
             result = operation => result?,
             _ = context.ct.cancelled() => return Err(McpError::internal_error(
                 "task call cancelled; a submitted mutation may already have committed; inspect canonical state", None)),
-            _ = tokio::time::sleep(std::time::Duration::from_secs(300)) => return Err(McpError::internal_error(
+            _ = async {
+                if ticket_call { tokio::time::sleep(std::time::Duration::from_secs(300)).await; }
+                else { std::future::pending::<()>().await; }
+            } => return Err(McpError::internal_error(
                 "task call timed out; inspect canonical state before retrying a mutation", None)),
         };
         let content = response

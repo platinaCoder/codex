@@ -11,6 +11,7 @@ expression: "whole_status.replace(&directory,\n\"[[workspace]]\").replace(crate:
   Model provider:      openai
   Directory:           [[workspace]]
   Permissions:         Read Only (Ask for approval)
+  Conversation role:   Standard · managed, role, and user permission policy applied
   Agents.md:           <none>
   Thread name:         Clipboard example
   Collaboration mode:  Default

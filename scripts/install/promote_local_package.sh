@@ -166,7 +166,9 @@ fi
 
 mkdir -p "$releases_dir" "$bin_dir"
 exec 9>"$standalone_root/install.lock"
-flock -x 9
+if ! flock -xn 9; then
+  die "standalone install lock is held; close sessions, stop the daemon manually if it inherited an old installer lock, then retry"
+fi
 
 cleanup() {
   if [[ -n "$staging_dir" && -d "$staging_dir" ]]; then
@@ -199,7 +201,12 @@ else
     cd "$staging_dir"
     sha256sum --strict --check "$checksums_file"
   )
-  ln -s "bin/codex" "$staging_dir/codex"
+  if [[ -e "$staging_dir/codex" || -L "$staging_dir/codex" ]]; then
+    [[ -L "$staging_dir/codex" && "$(readlink "$staging_dir/codex")" == "bin/codex" ]] || \
+      die "candidate has an invalid entrypoint symlink"
+  else
+    ln -s "bin/codex" "$staging_dir/codex"
+  fi
   mv "$staging_dir" "$release_dir"
   staging_dir=""
 fi
@@ -239,7 +246,7 @@ if [[ -f "$standalone_root/auto-update-version" ]]; then
   mv "$standalone_root/auto-update-version" "$auto_update_backup"
 fi
 
-"$visible_codex" --version >/dev/null
+"$visible_codex" --version 9>&- >/dev/null
 
 timestamp="$(date -u +%Y%m%d%H%M%S)"
 unit="codex-ai-lab-promotion-$timestamp-$$"
@@ -249,7 +256,7 @@ systemd-run \
   --description="Promote AI Lab Codex package $release_name" \
   --on-active=3s \
   --setenv="CODEX_HOME=$codex_home_dir" \
-  "$release_dir/bin/codex" app-server daemon update --from-cli --yes
+  "$release_dir/bin/codex" app-server daemon update --from-cli --yes 9>&-
 
 printf '\nStandalone package selected successfully.\n'
 printf 'Daemon promotion is scheduled as %s.service and may disconnect active sessions.\n' "$unit"

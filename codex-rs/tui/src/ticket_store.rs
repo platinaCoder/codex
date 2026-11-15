@@ -891,7 +891,13 @@ impl TicketStore {
             ));
         }
         if assignment.delivery_attempted_at.is_some() {
-            return Ok((docs[index].clone(), false));
+            // Count reconciliation attempts without appending unbounded history
+            // entries while the assignee remains busy. The event ID stays fixed.
+            assignment.delivery_attempted_at = Some(Utc::now());
+            assignment.delivery_attempt_count = assignment.delivery_attempt_count.saturating_add(1);
+            let document = docs[index].clone();
+            self.transactional_replace(std::slice::from_ref(&document))?;
+            return Ok((document, false));
         }
         let now = Utc::now();
         assignment.delivery_attempted_at = Some(now);
@@ -1748,7 +1754,19 @@ impl TicketStore {
         let mut records = Vec::new();
         for entry in io_at(std::fs::read_dir(&dir), "reading comments directory", &dir)? {
             let entry = io_at(entry, "reading comment entry", &dir)?;
-            let kind = io_at(entry.file_type(), "reading comment type", &entry.path())?;
+            let kind = match entry.file_type() {
+                Ok(kind) => kind,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::NotFound
+                        && entry
+                            .file_name()
+                            .to_str()
+                            .is_some_and(|name| name.starts_with(".tmp-")) =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(io_error("reading comment type", &entry.path(), error)),
+            };
             if kind.is_symlink() || !kind.is_file() {
                 return Err(Error::Unsafe(entry.path().display().to_string()));
             }
@@ -2929,19 +2947,62 @@ mod tests {
         let store = TicketStore::test(lab.path());
         let ticket = store.create(input("ready recovery", vec![])).unwrap();
         let source = ticket.ticket.source.clone();
-        // Use the exact normal lifecycle fixture, then emulate a committed ready
-        // transition whose notification has not yet been acknowledged.
-        let accepted = advance_to_accepted(&store, ticket.ticket.id, &source);
-        let mut ready = accepted;
-        ready.ticket.status = Status::AwaitingReview;
-        ready.ticket.assignment.as_mut().unwrap().side_notification_turn_id = None;
-        { let _lock = Lock::acquire(&store.root).unwrap(); store.transactional_replace(&[ready]).unwrap(); }
+        let pending = match store
+            .implement(
+                ticket.ticket.id,
+                1,
+                source,
+                "main".into(),
+                "approved".into(),
+            )
+            .unwrap()
+        {
+            ImplementCheck::Pending(document) => document,
+            ImplementCheck::Delivered(_) => unreachable!(),
+        };
+        store
+            .bind_assignment_delivery(
+                ticket.ticket.id,
+                &pending.ticket.assignment.unwrap().notification_id,
+                "main",
+                "main-implementation-turn",
+            )
+            .unwrap();
+        for (expected, category) in [
+            (0, CommentCategory::ImplementationUpdate),
+            (1, CommentCategory::Validation),
+        ] {
+            store
+                .append_comment(
+                    ticket.ticket.id,
+                    expected,
+                    Source {
+                        thread_id: "main".into(),
+                        turn_id: "main-implementation-turn".into(),
+                        role: ActorRole::Main,
+                    },
+                    1,
+                    category,
+                    "completed fixture".into(),
+                )
+                .unwrap();
+        }
+        store
+            .report_implementation_ready("main", "main-implementation-turn")
+            .unwrap();
         let reopened = TicketStore::test(lab.path());
         let pending = reopened.pending_notifications().unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].ticket.id, ticket.ticket.id);
-        reopened.record_ready_notification("main", "main-implementation-turn", "side-ready-event").unwrap();
-        assert!(TicketStore::test(lab.path()).pending_notifications().unwrap().is_empty());
+        reopened
+            .record_ready_notification("main", "main-implementation-turn", "side-ready-event")
+            .unwrap();
+        assert!(
+            TicketStore::test(lab.path())
+                .pending_notifications()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -3305,6 +3366,16 @@ mod tests {
                 .begin_delivery_attempt(created.ticket.id, &assignment.notification_id, "main")
                 .unwrap()
                 .1
+        );
+        assert_eq!(
+            store
+                .read(created.ticket.id)
+                .unwrap()
+                .ticket
+                .assignment
+                .unwrap()
+                .delivery_attempt_count,
+            2
         );
         store
             .bind_assignment_delivery(

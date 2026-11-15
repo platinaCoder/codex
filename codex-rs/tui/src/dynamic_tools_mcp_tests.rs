@@ -135,10 +135,40 @@ async fn concurrent_ticket_calls() -> color_eyre::Result<()> {
                 }
             }}))
     };
-    let (a, b) = tokio::join!(
-        call(1, main, "read_ticket", json!({"ticketId":doc.ticket.id})).send(),
-        call(2, side, "read_ticket", json!({"ticketId":doc.ticket.id})).send()
-    );
+    // Hold the canonical store lock until both authenticated calls have been
+    // admitted. A serialized endpoint or a blocking filesystem operation on
+    // the async executor would fail this barrier instead of merely running
+    // two reads sequentially and calling that concurrency.
+    #[cfg(unix)]
+    let held = {
+        use std::os::fd::AsRawFd;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(lab.path().join(".agents/tickets/.lock"))?;
+        assert_eq!(unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) }, 0);
+        file
+    };
+    let first =
+        tokio::spawn(call(1, main, "read_ticket", json!({"ticketId":doc.ticket.id})).send());
+    let second =
+        tokio::spawn(call(2, side, "read_ticket", json!({"ticketId":doc.ticket.id})).send());
+    #[cfg(unix)]
+    {
+        let overlapped = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while bridge.workflow.active_call_count() != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        drop(held);
+        assert!(
+            overlapped.is_ok(),
+            "both callers must be in flight before either read finishes"
+        );
+    }
+    let a = first.await?;
+    let b = second.await?;
     for response in [a?, b?] {
         let body = response.text().await?;
         assert!(body.contains("concurrency fixture"), "{body}");
@@ -180,7 +210,11 @@ async fn concurrent_ticket_calls() -> color_eyre::Result<()> {
     );
     assert!(bad?.text().await?.contains("conflicting threadId"));
     assert!(good?.text().await?.contains("concurrency fixture"));
-    let replay = call(6, side, "read_ticket", json!({"ticketId":doc.ticket.id})).send().await?.text().await?;
+    let replay = call(6, side, "read_ticket", json!({"ticketId":doc.ticket.id}))
+        .send()
+        .await?
+        .text()
+        .await?;
     assert!(replay.contains("already consumed"), "{replay}");
     assert_eq!(bridge.workflow.active_call_count(), 0);
     drop(bridge);

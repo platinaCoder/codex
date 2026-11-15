@@ -128,6 +128,8 @@ async fn reconnect_restores_history_permissions_and_resumes_unsent_input() -> Re
             "id": id, "sessionId": id, "preview": "only once", "ephemeral": false,
             "modelProvider": "test-provider", "createdAt": 1, "updatedAt": 2,
             "status": {"type": "idle"}, "cwd": cwd, "cliVersion": "0.0.0", "source": "cli",
+            "extra": {"effectiveReadPolicy": {"fullDiskReadAccess": true,
+                "readableRoots": [], "unreadableRoots": [], "unreadableGlobs": []}},
             "turns": [test_turn("accepted", TurnStatus::Completed, vec![ThreadItem::UserMessage {
                 id: "input-1".into(), client_id: None, content: vec![UserInput::Text { text: "only once".into(), text_elements: Vec::new() }],
             }])]
@@ -538,7 +540,9 @@ async fn reconnect_reconciles_offscreen_pending_profile_before_restoring_permiss
                 "id": id, "sessionId": id, "preview": "task", "ephemeral": false,
                 "modelProvider": "test-provider", "createdAt": 1, "updatedAt": 2,
                 "status": {"type": "idle"}, "cwd": cwd, "cliVersion": "0.0.0",
-                "source": "cli", "turns": []
+                "source": "cli",
+            "extra": {"effectiveReadPolicy": {"fullDiskReadAccess": true,
+                "readableRoots": [], "unreadableRoots": [], "unreadableGlobs": []}}, "turns": []
             });
             std::future::ready(Some(match request.method.as_str() {
                 "thread/resume" => {

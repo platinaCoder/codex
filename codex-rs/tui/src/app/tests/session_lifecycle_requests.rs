@@ -1759,7 +1759,14 @@ async fn local_daemon_registers_approval_gated_mcp_tools_for_both_start_paths_sc
             }))
     };
     let call_side_tool = |id: u32, tool: &'static str, arguments: serde_json::Value| {
-        call_tool_for(id, &side_source.to_string(), "side-read-turn", &format!("side-read-{id}"), tool, arguments)
+        call_tool_for(
+            id,
+            &side_source.to_string(),
+            "side-read-turn",
+            &format!("side-read-{id}"),
+            tool,
+            arguments,
+        )
     };
     let external = tempdir()?;
     let external_note = external.path().join("bridge-receipt.txt");
